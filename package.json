@@ -6,5 +6,10 @@
   "type": "native",
   "dependencies": {
     "com.arisen.core.native": "1.0.0"
+  },
+  "nativeRuntimes": {
+    "win-x64": [
+      "RHI.Vulkan.dll"
+    ]
   }
 }
