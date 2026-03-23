@@ -1,1 +1,1 @@
-add_subdirectory(Source/RHI.Vulkan)
+add_subdirectory(RHI.Vulkan)
