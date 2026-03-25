@@ -1,6 +1,6 @@
 #pragma once
 
-#include "./Base/FoundationMinimal.h"
+#include "Base/FoundationMinimal.h"
 #include <vulkan/vulkan_core.h>
 
 #ifdef _DEBUG

@@ -1,7 +1,7 @@
 #pragma once
 #include <vulkan/vulkan_core.h>
 #include "RHI/Handles/RHIHandle.h"
-#include "../../Core.RHI/RHI/Core/RHICommon.h"
+#include "RHI/Core/RHICommon.h"
 
 namespace ArisenEngine::RHI
 {

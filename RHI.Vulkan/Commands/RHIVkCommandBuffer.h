@@ -1,7 +1,7 @@
 #pragma once
 //#include "Presentation/RHIVkFrameBuffer.h"
-#include "../../Core.RHI/RHI/Commands/RHICommandBuffer.h"
-#include "../../Core.RHI/RHI/Commands/RHICommandDefs.h"
+#include "RHI/Commands/RHICommandBuffer.h"
+#include "RHI/Commands/RHICommandDefs.h"
 #include "Definitions/RHIVkCommon.h"
 #include "RHI/Enums/Pipeline/EIndexType.h"
 #include "RHI/Enums/Subpass/EDependencyFlag.h"

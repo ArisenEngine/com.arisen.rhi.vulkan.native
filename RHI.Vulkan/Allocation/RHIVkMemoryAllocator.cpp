@@ -3,7 +3,7 @@
 #include "Profiler.h"
 #include "Core/RHIVkDevice.h"
 #include "Logger/Logger.h"
-#include "../../Core.RHI/RHI/Core/RHIInspector.h"
+#include "RHI/Core/RHIInspector.h"
 
 
 namespace ArisenEngine::RHI

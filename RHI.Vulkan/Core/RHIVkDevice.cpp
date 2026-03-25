@@ -18,7 +18,7 @@
 #include "Pipeline/RHIVkGPUPipeline.h"
 #include "Pipeline/RHIVkGPUPipelineStateObject.h"
 #include "Commands/RHIVkCommandBuffer.h"
-#include "../../Core.RHI/RHI/Core/RHIInspector.h"
+#include "RHI/Core/RHIInspector.h"
 #include "Descriptors/RHIVkDescriptorHeap.h"
 #include "Descriptors/RHIVkBindlessDescriptorTable.h"
 #include "Profiler.h"

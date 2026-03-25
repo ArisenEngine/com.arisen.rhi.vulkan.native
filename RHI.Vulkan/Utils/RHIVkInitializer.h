@@ -1,5 +1,5 @@
 #pragma once
-#include "../../Core.RHI/RHI/Core/RHICommon.h"
+#include "RHI/Core/RHICommon.h"
 #include "RHI/Enums/Pipeline/EDescriptorType.h"
 #include "RHI/Enums/Image/EImageTiling.h"
 #include "RHI/Enums/Image/EImageType.h"
