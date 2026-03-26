@@ -1,15 +1,15 @@
 {
-  "name": "com.arisen.rhi.vulkan.native",
-  "version": "1.0.0",
-  "displayName": "Vulkan RHI Native Provider",
-  "description": "C++ payload for the Vulkan rendering hardware interface driver backend.",
-  "type": "native",
-  "dependencies": {
-    "com.arisen.core.native": "1.0.0"
-  },
-  "nativeRuntimes": {
-    "win-x64": [
-      "RHI.Vulkan.dll"
-    ]
-  }
+    "description":  "C++ payload for the Vulkan rendering hardware interface driver backend.",
+    "type":  "native",
+    "nativeRuntimes":  {
+                           "win-x64":  [
+                                           "RHI.Vulkan.dll"
+                                       ]
+                       },
+    "version":  "1.0.0",
+    "name":  "com.arisen.rhi.vulkan.native",
+    "dependencies":  {
+                         "com.arisen.core.native":  "1.0.0"
+                     },
+    "displayName":  "Vulkan RHI Native Provider"
 }
