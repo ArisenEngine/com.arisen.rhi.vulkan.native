@@ -9,6 +9,11 @@ target_include_directories(RHI.Vulkan PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# Prefer System Vulkan SDK if available, fallback to local 3rdparty
+if(DEFINED ENV{VULKAN_SDK})
+    target_include_directories(RHI.Vulkan PRIVATE "$ENV{VULKAN_SDK}/Include")
+endif()
+
 target_include_directories(RHI.Vulkan PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/vulkan/Include"
 )
@@ -25,6 +30,11 @@ target_include_directories(RHI.Vulkan PRIVATE
 )
 
 target_compile_definitions(RHI.Vulkan PRIVATE RHIVULKAN_EXPORTS)
+
+# Prefer System Vulkan SDK if available, fallback to local 3rdparty
+if(DEFINED ENV{VULKAN_SDK})
+    target_link_directories(RHI.Vulkan PUBLIC "$ENV{VULKAN_SDK}/Lib")
+endif()
 
 target_link_directories(RHI.Vulkan PUBLIC 
     "${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty/vulkan/Lib"
