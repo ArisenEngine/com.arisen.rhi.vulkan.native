@@ -33,7 +33,9 @@ namespace ArisenEngine::RHI
             VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
             VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME,
             VK_KHR_MAINTENANCE_2_EXTENSION_NAME,
-            VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME
+            VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
+            VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+            "VK_KHR_external_memory_win32"
         };
         return settings;
     }

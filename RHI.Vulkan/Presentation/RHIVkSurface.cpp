@@ -14,13 +14,24 @@ using namespace ArisenEngine;
 ArisenEngine::RHI::RHIVkSurface::~RHIVkSurface() noexcept
 {
     delete m_SwapChain;
-    vkDestroySurfaceKHR(static_cast<VkInstance>(m_Instance->GetHandle()), m_VkSurface, nullptr);
+    if (m_VkSurface != VK_NULL_HANDLE)
+    {
+        vkDestroySurfaceKHR(static_cast<VkInstance>(m_Instance->GetHandle()), m_VkSurface, nullptr);
+    }
     LOG_INFO("[RHIVkSurface::~RHIVkSurface]: Destroy Vulkan Surface");
 }
 
 ArisenEngine::RHI::RHIVkSurface::RHIVkSurface(UInt32&& id, RHIInstance* instance):
     RHISurface(std::move(id), instance), m_SwapChainSupportDetail({}), m_SwapChain(nullptr)
 {
+    // B101: Virtual/Headless surface support
+    if (m_RenderWindowId == 0xFFFFFFFF || m_RenderWindowId == 0)
+    {
+        m_VkSurface = VK_NULL_HANDLE;
+        LOG_INFO("[RHIVkSurface::RHIVkSurface]: Created Virtual Surface (No Native Window)");
+        return;
+    }
+
     VkWin32SurfaceCreateInfoKHR createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
     createInfo.hwnd = HAL::GetWindowHandle(id);
@@ -39,6 +50,11 @@ void RHI::RHIVkSurface::InitSwapChain()
 
     if (m_VkSurface == VK_NULL_HANDLE)
     {
+        if (m_RenderWindowId == 0xFFFFFFFF)
+        {
+            LOG_INFO("[RHIVkSurface::InitSwapChain]: Skipping swapchain for Virtual Surface.");
+            return;
+        }
         LOG_FATAL_AND_THROW("[RHIVkSurface::InitSwapChain]: Should init VkSurfachKHR first.");
     }
 

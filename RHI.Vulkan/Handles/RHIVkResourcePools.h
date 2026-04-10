@@ -64,6 +64,7 @@ namespace ArisenEngine::RHI
         VkImage image{VK_NULL_HANDLE};
         VmaAllocator allocator{VK_NULL_HANDLE};
         VmaAllocation allocation{VK_NULL_HANDLE};
+        VkDeviceMemory manualMemory{VK_NULL_HANDLE};
 
         ~RHIVkImageState()
         {
@@ -74,6 +75,10 @@ namespace ArisenEngine::RHI
             if (allocator != VK_NULL_HANDLE && allocation != VK_NULL_HANDLE)
             {
                 vmaFreeMemory(allocator, allocation);
+            }
+            if (device != VK_NULL_HANDLE && manualMemory != VK_NULL_HANDLE)
+            {
+                vkFreeMemory(device, manualMemory, nullptr);
             }
         }
     };
@@ -124,6 +129,7 @@ namespace ArisenEngine::RHI
         bool needDestroy{false};
         VkImageLayout currentLayout{VK_IMAGE_LAYOUT_UNDEFINED};
         ERHIMemoryUsage memoryUsage;
+        bool bExportSharedWin32Handle{false};
         RHIResourceHandle registryHandle;
     };
 

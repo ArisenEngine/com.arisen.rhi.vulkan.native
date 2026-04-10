@@ -22,6 +22,8 @@
 #include "Descriptors/RHIVkDescriptorHeap.h"
 #include "Descriptors/RHIVkBindlessDescriptorTable.h"
 #include "Profiler.h"
+#include <windows.h>
+#include <vulkan/vulkan_win32.h>
 
 using namespace ArisenEngine::RHI;
 
@@ -794,6 +796,15 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImage(RHIImageHandle handle, RHIImageD
         desc.queueFamilyIndexCount,
         (const uint32_t*)desc.pQueueFamilyIndices);
 
+    VkExternalMemoryImageCreateInfo externalInfo{};
+    if (desc.bExportSharedWin32Handle)
+    {
+        externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        externalInfo.pNext = imageInfo.pNext;
+        imageInfo.pNext = &externalInfo;
+    }
+
     if (vkCreateImage(m_VkDevice, &imageInfo, nullptr, &image->image) != VK_SUCCESS)
     {
         LOG_ERROR("[RHIVkDevice::AllocImage]: failed to create image!");
@@ -805,6 +816,7 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImage(RHIImageHandle handle, RHIImageD
     image->mipLevels = desc.mipLevels;
     image->currentLayout = static_cast<VkImageLayout>(desc.imageLayout);
     image->needDestroy = true;
+    image->bExportSharedWin32Handle = desc.bExportSharedWin32Handle;
 
     // Register for deferred deletion using a shared state object
     image->state = new RHIVkImageState();
@@ -823,6 +835,37 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageDeviceMemory(RHIImageHandle handl
     ARISEN_PROFILE_ZONE("Vk::AllocImageMemory");
     auto* image = m_ImagePool->Get(handle);
     if (!image || image->image == VK_NULL_HANDLE || !image->state) return false;
+
+    if (image->bExportSharedWin32Handle)
+    {
+        // Allocate raw memory and bypass VMA for Windows shared handle
+        VkMemoryRequirements memReqs;
+        vkGetImageMemoryRequirements(m_VkDevice, image->image, &memReqs);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = FindMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        VkExportMemoryAllocateInfo exportInfo{};
+        exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        
+        allocInfo.pNext = &exportInfo;
+
+        VkDeviceMemory manualMemory = VK_NULL_HANDLE;
+        if (vkAllocateMemory(m_VkDevice, &allocInfo, nullptr, &manualMemory) != VK_SUCCESS)
+        {
+            LOG_ERROR("[RHIVkDevice::AllocImageDeviceMemory]: Failed to allocate shared memory!");
+            return false;
+        }
+
+        vkBindImageMemory(m_VkDevice, image->image, manualMemory, 0);
+
+        image->state->manualMemory = manualMemory;
+        image->allocation = VK_NULL_HANDLE;
+        return true;
+    }
 
     // NOTE: Use explicit VMA_MEMORY_USAGE_* flags to avoid assertions in manual allocation paths.
     VmaMemoryUsage usage = VMA_MEMORY_USAGE_GPU_ONLY;
@@ -1715,5 +1758,29 @@ namespace ArisenEngine::RHI
     RHIBindlessDescriptorTable* RHIVkDevice::CreateBindlessDescriptorTable(RHIDescriptorHeap* heap)
     {
         return new RHIVkBindlessDescriptorTable(this, static_cast<RHIVkDescriptorHeap*>(heap));
+    }
+
+    void* RHIVkDevice::GetSharedWin32Handle(RHIImageHandle handle)
+    {
+        auto* image = m_ImagePool->Get(handle);
+        if (!image || image->image == VK_NULL_HANDLE || !image->bExportSharedWin32Handle) return nullptr;
+        if (!image->state || image->state->manualMemory == VK_NULL_HANDLE) return nullptr;
+
+        auto vkGetMemoryWin32HandleKHRProc = (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(m_VkDevice, "vkGetMemoryWin32HandleKHR");
+        if (!vkGetMemoryWin32HandleKHRProc) return nullptr;
+
+        VkMemoryGetWin32HandleInfoKHR handleInfo{};
+        handleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
+        handleInfo.memory = image->state->manualMemory;
+        handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+        HANDLE win32Handle = nullptr;
+        if (vkGetMemoryWin32HandleKHRProc(m_VkDevice, &handleInfo, &win32Handle) != VK_SUCCESS)
+        {
+            LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: Failed to get Win32 handle from memory!");
+            return nullptr;
+        }
+
+        return (void*)win32Handle;
     }
 }

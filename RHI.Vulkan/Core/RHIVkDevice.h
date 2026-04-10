@@ -130,6 +130,9 @@ namespace ArisenEngine::RHI
         // Debug & Naming
         void SetObjectName(ERHIObjectType type, UInt64 handle, const char* name) override;
 
+        // Shared API
+        void* GetSharedWin32Handle(RHIImageHandle imageHandle);
+
     private:
         RHIVkBindlessManager* GetBindlessManager() const { return m_BindlessManager; }
         UInt32 GetGraphicsFamilyIndex() const { return m_GraphicsFamilyIndex; }
