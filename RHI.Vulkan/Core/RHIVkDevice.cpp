@@ -654,7 +654,7 @@ void ArisenEngine::RHI::RHIVkDevice::BufferMemoryCopy(RHIBufferHandle handle, co
     else
     {
         // Device-local: use TransferManager (ring-buffer staging + batched submit)
-        m_TransferManager->EnqueueBufferCopy(buffer->buffer, src, size, offset, m_GraphicsFamilyIndex);
+        m_TransferManager->EnqueueBufferCopy(handle, src, size, offset, m_GraphicsFamilyIndex);
         RHIGpuTicket ticket = m_TransferManager->Flush();
         if (ticket > 0)
         {
@@ -677,7 +677,7 @@ RHIGpuTicket ArisenEngine::RHI::RHIVkDevice::BufferMemoryCopyAsync(RHIBufferHand
 
     if (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
     {
-        // Direct mapping — inherently synchronous, no ticket needed
+        // Direct mapping - inherently synchronous, no ticket needed
         void* mappedData;
         if (vmaMapMemory(m_MemoryAllocator->GetVmaAllocator(), buffer->allocation, &mappedData) == VK_SUCCESS)
         {
@@ -697,7 +697,7 @@ RHIGpuTicket ArisenEngine::RHI::RHIVkDevice::BufferMemoryCopyAsync(RHIBufferHand
     {
         // Device-local: enqueue via TransferManager and flush (non-blocking return)
         // Issue ownership transfer to the immediate Graphics Queue for usage
-        m_TransferManager->EnqueueBufferCopy(buffer->buffer, src, size, offset, m_GraphicsFamilyIndex);
+        m_TransferManager->EnqueueBufferCopy(handle, src, size, offset, m_GraphicsFamilyIndex);
         return m_TransferManager->Flush();
     }
 }

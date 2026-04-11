@@ -50,7 +50,7 @@ namespace ArisenEngine::RHI
          * @brief Enqueue a buffer copy from CPU memory to a GPU buffer.
          * Does NOT submit to the GPU yet — call Flush() after batching.
          */
-        void EnqueueBufferCopy(VkBuffer dstBuffer, const void* srcData,
+        void EnqueueBufferCopy(RHIBufferHandle dstBuffer, const void* srcData,
                                UInt64 size, UInt64 dstOffset, uint32_t dstQueueFamilyIndex = ~0u);
 
         /**
@@ -88,8 +88,8 @@ namespace ArisenEngine::RHI
 
         struct PendingCopy
         {
-            VkBuffer srcBuffer;   // ring buffer
-            VkBuffer dstBuffer;
+            RHIBufferHandle srcHandle;   // ring buffer handle
+            RHIBufferHandle dstHandle;
             VkBufferCopy region;
             uint32_t dstQueueFamilyIndex;
         };

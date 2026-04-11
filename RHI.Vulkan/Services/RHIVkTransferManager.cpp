@@ -29,7 +29,7 @@ RHIVkTransferManager::RHIVkTransferManager(RHIVkDevice* device, const RHITransfe
 
     // Create staging ring buffer
     m_RingBuffer = std::make_unique<RHIVkStagingRingBuffer>(
-        static_cast<VkDevice>(device->GetHandle()),
+        device,
         static_cast<RHIVkMemoryAllocator*>(device->GetMemoryAllocator()),
         config.ringBufferCapacity);
 
@@ -98,7 +98,7 @@ void RHIVkTransferManager::EnsureCommandBufferReady()
     m_CommandBufferRecording = true;
 }
 
-void RHIVkTransferManager::EnqueueBufferCopy(VkBuffer dstBuffer, const void* srcData,
+void RHIVkTransferManager::EnqueueBufferCopy(RHIBufferHandle dstBuffer, const void* srcData,
                                               UInt64 size, UInt64 dstOffset, uint32_t dstQueueFamilyIndex)
 {
     ARISEN_PROFILE_ZONE("TransferManager::EnqueueBufferCopy");
@@ -144,7 +144,7 @@ void RHIVkTransferManager::EnqueueBufferCopy(VkBuffer dstBuffer, const void* src
     copyRegion.dstOffset = dstOffset;
     copyRegion.size = size;
 
-    m_PendingCopies.push_back({staging->buffer, dstBuffer, copyRegion, dstQueueFamilyIndex});
+    m_PendingCopies.push_back({m_RingBuffer->GetRHIHandle(), dstBuffer, copyRegion, dstQueueFamilyIndex});
 }
 
 RHIGpuTicket RHIVkTransferManager::Flush()
@@ -173,7 +173,7 @@ RHIGpuTicket RHIVkTransferManager::Flush()
 
     for (const auto& copy : m_PendingCopies)
     {
-        vkCmdCopyBuffer(rawCmdBuf, copy.srcBuffer, copy.dstBuffer, 1, &copy.region);
+        commandBuffer->CopyBuffer(copy.srcHandle, copy.region.srcOffset, copy.dstHandle, copy.region.dstOffset, copy.region.size);
 
         if (copy.dstQueueFamilyIndex != ~0u && copy.dstQueueFamilyIndex != transferFamily)
         {
@@ -185,7 +185,7 @@ RHIGpuTicket RHIVkTransferManager::Flush()
             barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
             barrier.srcQueueFamilyIndex = transferFamily;
             barrier.dstQueueFamilyIndex = copy.dstQueueFamilyIndex;
-            barrier.buffer = copy.dstBuffer;
+            barrier.buffer = m_Device->GetBufferPool()->Get(copy.dstHandle)->buffer;
             barrier.offset = 0;
             barrier.size = VK_WHOLE_SIZE;
 

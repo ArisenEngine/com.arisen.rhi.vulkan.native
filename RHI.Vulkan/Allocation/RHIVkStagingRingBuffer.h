@@ -5,9 +5,12 @@
 #include <vma/vk_mem_alloc.h>
 #include <optional>
 #include <memory>
+#include "RHI/Handles/RHIHandle.h"
+#include "RHI/Resources/RHIDeferredDeletionQueue.h"
 
 namespace ArisenEngine::RHI
 {
+    class RHIVkDevice;
     class RHIVkMemoryAllocator;
 
     /**
@@ -21,8 +24,10 @@ namespace ArisenEngine::RHI
     public:
         NO_COPY_NO_MOVE_NO_DEFAULT(RHIVkStagingRingBuffer)
 
-        RHIVkStagingRingBuffer(VkDevice device, RHIVkMemoryAllocator* allocator, UInt64 capacity);
+        RHIVkStagingRingBuffer(RHIVkDevice* device, RHIVkMemoryAllocator* allocator, UInt64 capacity);
         ~RHIVkStagingRingBuffer();
+
+        RHIBufferHandle GetRHIHandle() const { return m_RHIHandle; }
 
         struct Allocation
         {
@@ -51,10 +56,12 @@ namespace ArisenEngine::RHI
         UInt64 GetAvailableSpace() const { return m_RingAllocator.GetAvailableSpace(); }
 
     private:
+        RHIVkDevice* m_DevicePointer{nullptr};
         VkDevice m_Device{VK_NULL_HANDLE};
         VmaAllocator m_VmaAllocator{VK_NULL_HANDLE};
 
         VkBuffer m_Buffer{VK_NULL_HANDLE};
+        RHIBufferHandle m_RHIHandle;
         VmaAllocation m_Allocation{VK_NULL_HANDLE};
         void* m_MappedBase{nullptr};
 

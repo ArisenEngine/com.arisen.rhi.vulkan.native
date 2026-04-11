@@ -52,93 +52,129 @@ ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
 
 void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDescriptor desc)
 {
-    ARISEN_PROFILE_ZONE("RHI::VulkanCreateSwapChain");
     m_Desc = desc;
-
-    VkSwapchainCreateInfoKHR createInfo{};
-    createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-    createInfo.pNext = VK_NULL_HANDLE;
-    createInfo.flags = static_cast<VkSwapchainCreateFlagsKHR>(m_Desc.swapChainCreateFlags);
-    createInfo.surface = m_VkSurface;
-    createInfo.minImageCount = m_Desc.imageCount;
-    createInfo.imageFormat = static_cast<VkFormat>(m_Desc.colorFormat);
-    createInfo.imageColorSpace = static_cast<VkColorSpaceKHR>(m_Desc.colorSpace);
-    createInfo.imageExtent = {m_Desc.width, m_Desc.height};
-    createInfo.imageArrayLayers = m_Desc.imageArrayLayers;
-    createInfo.imageUsage = m_Desc.imageUsageFlagBits;
-    createInfo.imageSharingMode = static_cast<VkSharingMode>(m_Desc.sharingMode);
-    createInfo.queueFamilyIndexCount = m_Desc.queueFamilyIndexCount;
-    auto queueSurfaceFamilyIndices = m_Surface->GetQueueFamilyIndices();
-    uint32_t queueFamilyIndices[] = {
-        queueSurfaceFamilyIndices.graphicsFamily.value(), queueSurfaceFamilyIndices.presentFamily.value()
-    };
-    createInfo.pQueueFamilyIndices = queueFamilyIndices;
-    createInfo.preTransform = static_cast<VkSurfaceTransformFlagBitsKHR>(m_Desc.surfaceTransformFlagBits);
-    createInfo.compositeAlpha = static_cast<VkCompositeAlphaFlagBitsKHR>(m_Desc.compositeAlphaFlagBits);
-    createInfo.presentMode = static_cast<VkPresentModeKHR>(m_Desc.presentMode);
-    createInfo.clipped = static_cast<VkBool32>(m_Desc.clipped);
-    createInfo.oldSwapchain = VK_NULL_HANDLE;
-
-    // Zero-Stall: Check if we have an old swapchain passed via customData
-    if (m_Desc.customData != nullptr)
-    {
-        createInfo.oldSwapchain = (VkSwapchainKHR)m_Desc.customData;
-    }
-
-    if (vkCreateSwapchainKHR(m_VkDevice, &createInfo, nullptr, &m_VkSwapChain) != VK_SUCCESS)
-    {
-        LOG_FATAL_AND_THROW("[RHIVkSwapChain::CreateSwapChainWithDesc]: failed to create swap chain!");
-    }
-
-    LOG_DEBUG("[RHIVkSwapChain::CreateSwapChainWithDesc]: vkSwapchain Created .");
-
-    UInt32 actualImageCount = 0;
-    Containers::Vector<VkImage> images;
-
-    if (vkGetSwapchainImagesKHR(m_VkDevice, m_VkSwapChain, &actualImageCount, nullptr) != VK_SUCCESS)
-    {
-        LOG_FATAL_AND_THROW("[RHIVkSwapChain::CreateSwapChainWithDesc]: failed to query image count !");
-    }
-
-    m_ImageHandles.resize(actualImageCount);
-    m_ImageViewHandles.resize(actualImageCount);
-    images.resize(actualImageCount);
-
-    if (vkGetSwapchainImagesKHR(m_VkDevice, m_VkSwapChain, &actualImageCount, images.data()) != VK_SUCCESS)
-    {
-        LOG_FATAL_AND_THROW("[RHIVkSwapChain::CreateSwapChainWithDesc]: failed to query images !");
-    }
-
     auto* factory = m_Device->GetFactory();
     auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
 
-    for (int i = 0; i < images.size(); ++i)
+    if (m_VkSurface != VK_NULL_HANDLE)
     {
-        // For RHISwapChain images, we manually allocate a handle since they are not created via factory
-        m_ImageHandles[i] = vkDevice->GetImagePool()->Allocate([&images, i, this](RHIVkImagePoolItem* imageItem)
+        VkSwapchainCreateInfoKHR createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        createInfo.pNext = VK_NULL_HANDLE;
+        createInfo.flags = static_cast<VkSwapchainCreateFlagsKHR>(m_Desc.swapChainCreateFlags);
+        createInfo.surface = m_VkSurface;
+        createInfo.minImageCount = m_Desc.imageCount;
+        createInfo.imageFormat = static_cast<VkFormat>(m_Desc.colorFormat);
+        createInfo.imageColorSpace = static_cast<VkColorSpaceKHR>(m_Desc.colorSpace);
+        createInfo.imageExtent = {m_Desc.width, m_Desc.height};
+        createInfo.imageArrayLayers = m_Desc.imageArrayLayers;
+        createInfo.imageUsage = m_Desc.imageUsageFlagBits;
+        createInfo.imageSharingMode = static_cast<VkSharingMode>(m_Desc.sharingMode);
+        createInfo.queueFamilyIndexCount = m_Desc.queueFamilyIndexCount;
+        auto queueSurfaceFamilyIndices = m_Surface->GetQueueFamilyIndices();
+        uint32_t queueFamilyIndices[] = {
+            queueSurfaceFamilyIndices.graphicsFamily.value(), queueSurfaceFamilyIndices.presentFamily.value()
+        };
+        createInfo.pQueueFamilyIndices = queueFamilyIndices;
+        createInfo.preTransform = static_cast<VkSurfaceTransformFlagBitsKHR>(m_Desc.surfaceTransformFlagBits);
+        createInfo.compositeAlpha = static_cast<VkCompositeAlphaFlagBitsKHR>(m_Desc.compositeAlphaFlagBits);
+        createInfo.presentMode = static_cast<VkPresentModeKHR>(m_Desc.presentMode);
+        createInfo.clipped = static_cast<VkBool32>(m_Desc.clipped);
+        createInfo.oldSwapchain = VK_NULL_HANDLE;
+
+        // Zero-Stall: Check if we have an old swapchain passed via customData
+        if (m_Desc.customData != nullptr)
         {
-            *imageItem = RHIVkImagePoolItem();
-            imageItem->image = images[i];
-            imageItem->width = m_Desc.width;
-            imageItem->height = m_Desc.height;
-            std::cout << "[RHIVkSwapChain] Setting image pool width=" << m_Desc.width << " height=" << m_Desc.height <<
-                std::endl;
-            imageItem->name = String::Format("SwapChainImage_%d", i);
-            imageItem->needDestroy = false; // RHISwapChain owns these images
-        });
+            createInfo.oldSwapchain = (VkSwapchainKHR)m_Desc.customData;
+        }
 
-        RHIImageViewDesc viewDesc;
-        viewDesc.viewType = IMAGE_VIEW_TYPE_2D;
-        viewDesc.format = m_Desc.colorFormat;
-        viewDesc.aspectMask = IMAGE_ASPECT_COLOR_BIT;
-        viewDesc.baseMipLevel = 0;
-        viewDesc.levelCount = 1;
-        viewDesc.baseArrayLayer = 0;
-        viewDesc.layerCount = 1;
-        viewDesc.width = m_Desc.width;
-        viewDesc.height = m_Desc.height;
+        if (vkCreateSwapchainKHR(m_VkDevice, &createInfo, nullptr, &m_VkSwapChain) != VK_SUCCESS)
+        {
+            LOG_FATAL_AND_THROW("[RHIVkSwapChain::CreateSwapChainWithDesc]: failed to create swap chain!");
+        }
 
-        m_ImageViewHandles[i] = factory->CreateImageView(m_ImageHandles[i], std::move(viewDesc));
+        LOG_DEBUG("[RHIVkSwapChain::CreateSwapChainWithDesc]: vkSwapchain Created .");
+
+        UInt32 actualImageCount = 0;
+        Containers::Vector<VkImage> images;
+
+        if (vkGetSwapchainImagesKHR(m_VkDevice, m_VkSwapChain, &actualImageCount, nullptr) != VK_SUCCESS)
+        {
+            LOG_FATAL_AND_THROW("[RHIVkSwapChain::CreateSwapChainWithDesc]: failed to query image count !");
+        }
+
+        m_ImageHandles.resize(actualImageCount);
+        m_ImageViewHandles.resize(actualImageCount);
+        images.resize(actualImageCount);
+
+        if (vkGetSwapchainImagesKHR(m_VkDevice, m_VkSwapChain, &actualImageCount, images.data()) != VK_SUCCESS)
+        {
+            LOG_FATAL_AND_THROW("[RHIVkSwapChain::CreateSwapChainWithDesc]: failed to query images !");
+        }
+
+        for (int i = 0; i < images.size(); ++i)
+        {
+            // For RHISwapChain images, we manually allocate a handle since they are not created via factory
+            m_ImageHandles[i] = vkDevice->GetImagePool()->Allocate([&images, i, this](RHIVkImagePoolItem* imageItem)
+            {
+                *imageItem = RHIVkImagePoolItem();
+                imageItem->image = images[i];
+                imageItem->width = m_Desc.width;
+                imageItem->height = m_Desc.height;
+                imageItem->name = String::Format("SwapChainImage_%d", i);
+                imageItem->needDestroy = false; // RHISwapChain owns these images
+            });
+
+            RHIImageViewDesc viewDesc;
+            viewDesc.viewType = IMAGE_VIEW_TYPE_2D;
+            viewDesc.format = m_Desc.colorFormat;
+            viewDesc.aspectMask = IMAGE_ASPECT_COLOR_BIT;
+            viewDesc.baseMipLevel = 0;
+            viewDesc.levelCount = 1;
+            viewDesc.baseArrayLayer = 0;
+            viewDesc.layerCount = 1;
+            viewDesc.width = m_Desc.width;
+            viewDesc.height = m_Desc.height;
+
+            m_ImageViewHandles[i] = factory->CreateImageView(m_ImageHandles[i], std::move(viewDesc));
+        }
+    }
+    else
+    {
+        // Virtual SwapChain logic - Allocate shared images manually
+        LOG_INFO("[RHIVkSwapChain::CreateSwapChainWithDesc]: Creating Virtual SwapChain (Allocating shared images)");
+        UInt32 actualImageCount = m_Desc.imageCount;
+        m_ImageHandles.resize(actualImageCount);
+        m_ImageViewHandles.resize(actualImageCount);
+        
+        for (int i = 0; i < actualImageCount; ++i)
+        {
+            RHIImageDescriptor imgDesc{};
+            imgDesc.width = m_Desc.width;
+            imgDesc.height = m_Desc.height;
+            imgDesc.format = m_Desc.colorFormat;
+            imgDesc.usage = m_Desc.imageUsageFlagBits;
+            imgDesc.imageType = IMAGE_TYPE_2D;
+            imgDesc.sampleCount = SAMPLE_COUNT_1_BIT;
+            imgDesc.tiling = IMAGE_TILING_OPTIMAL;
+            imgDesc.sharingMode = m_Desc.sharingMode;
+            imgDesc.bExportSharedWin32Handle = true; // Enable interop
+
+            m_ImageHandles[i] = factory->CreateImage(std::move(imgDesc));
+
+            RHIImageViewDesc viewDesc;
+            viewDesc.viewType = IMAGE_VIEW_TYPE_2D;
+            viewDesc.format = m_Desc.colorFormat;
+            viewDesc.aspectMask = IMAGE_ASPECT_COLOR_BIT;
+            viewDesc.baseMipLevel = 0;
+            viewDesc.levelCount = 1;
+            viewDesc.baseArrayLayer = 0;
+            viewDesc.layerCount = 1;
+            viewDesc.width = m_Desc.width;
+            viewDesc.height = m_Desc.height;
+
+            m_ImageViewHandles[i] = factory->CreateImageView(m_ImageHandles[i], std::move(viewDesc));
+        }
     }
 }
 
@@ -174,6 +210,16 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
 {
     ARISEN_PROFILE_ZONE("RHI::VulkanAcquireImage");
     auto currentFrame = frameIndex % m_MaxFramesInFlight;
+
+    if (m_VkSurface == VK_NULL_HANDLE)
+    {
+        // In virtual mode, we just rotate through images. 
+        // We pick an index based on frameIndex to simulate swapchain behavior.
+        uint32_t imageIndex = frameIndex % m_ImageHandles.size();
+        m_AcquiredImageIndices[currentFrame] = imageIndex;
+        return m_ImageHandles[imageIndex];
+    }
+
     auto hSem = m_ImageAvailableSemaphores[currentFrame];
     auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(hSem);
     VkSemaphore vkSem = semItem ? semItem->semaphore : VK_NULL_HANDLE;
@@ -234,6 +280,12 @@ void ArisenEngine::RHI::RHIVkSwapChain::Cleanup()
 void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
 {
     ARISEN_PROFILE_ZONE("RHI::VulkanPresent");
+    if (m_VkSurface == VK_NULL_HANDLE)
+    {
+        // Headless swapchain doesn't present to a surface
+        return;
+    }
+
     auto currentFrame = frameIndex % m_MaxFramesInFlight;
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -251,6 +303,21 @@ void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
     presentInfo.pImageIndices = &m_AcquiredImageIndices[currentFrame];
 
     vkQueuePresentKHR(m_VkPresentQueue, &presentInfo);
+}
+
+void ArisenEngine::RHI::RHIVkSwapChain::SetResolution(UInt32 width, UInt32 height)
+{
+    if (m_Desc.width == width && m_Desc.height == height) return;
+    m_Desc.width = width;
+    m_Desc.height = height;
+    RecreateSwapChainIfNeeded();
+}
+
+void* ArisenEngine::RHI::RHIVkSwapChain::GetSharedWin32Handle(UInt32 index)
+{
+    if (index >= m_ImageHandles.size()) return nullptr;
+    auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+    return vkDevice->GetSharedWin32Handle(m_ImageHandles[index]);
 }
 
 void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()

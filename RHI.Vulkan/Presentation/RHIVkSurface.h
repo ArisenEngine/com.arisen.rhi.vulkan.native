@@ -22,6 +22,7 @@ namespace ArisenEngine::RHI
         NO_COPY_NO_MOVE_NO_DEFAULT(RHIVkSurface);
         ~RHIVkSurface() noexcept override;
         explicit RHIVkSurface(UInt32&& id, RHIInstance* instance);
+        void SetVirtualResolution(UInt32 width, UInt32 height) { m_Width = width; m_Height = height; }
         [[nodiscard]] void* GetHandle() const override { return m_VkSurface; }
 
         void InitSwapChain() override;
@@ -53,5 +54,7 @@ namespace ArisenEngine::RHI
 
         RHIVkSwapChain* m_SwapChain;
         VkQueueFamilyIndices m_QueueFamilyIndices;
+        UInt32 m_Width = 0;
+        UInt32 m_Height = 0;
     };
 }

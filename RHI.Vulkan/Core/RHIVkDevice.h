@@ -147,6 +147,9 @@ namespace ArisenEngine::RHI
         RHIResourceRegistry* GetResourceRegistry() const { return m_ResourceRegistry.get(); } // Made private
 
         friend class RHIVkInstance;
+        friend class RHIVkFactory;
+        friend class RHIVkTransferManager;
+        friend class RHIVkStagingRingBuffer;
         RHIVkGPUPipelineManager* m_GPUPipelineManager;
         RHIVkDescriptorPool* m_DescriptorPool;
         RHIDescriptorPoolHandle m_DescriptorPoolHandle;
@@ -196,8 +199,8 @@ namespace ArisenEngine::RHI
         m_AccelerationStructurePool;
         std::unique_ptr<RHIResourcePool<RHIDescriptorPoolHandle, RHIVkDescriptorPoolPoolItem>> m_DescriptorPoolPool;
 
-        // TODO(Design-P2): public: 立即跟随 private: 段，导致内外部接口边界模糊。
-        // 考虑将 Pool Accessor 统一为一个 internal 访问级别，通过内部接口类暴露。
+        // TODO(Design-P2): public: immediately follows private: section, causing fuzzy boundaries between internal and external interfaces.
+        // Consider unifying Pool Accessors into an internal access level exposed via an internal interface class.
     public:
         // Handle-based operations
     private:
@@ -269,7 +272,6 @@ namespace ArisenEngine::RHI
 
     public:
         // Pool Accessors (Restricted)
-    private:
         RHIResourcePool<RHIBufferHandle, RHIVkBufferPoolItem>* GetBufferPool() const { return m_BufferPool.get(); }
         RHIResourcePool<RHIImageHandle, RHIVkImagePoolItem>* GetImagePool() const { return m_ImagePool.get(); }
 

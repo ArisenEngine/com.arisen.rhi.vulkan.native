@@ -475,6 +475,11 @@ const ArisenEngine::RHI::VkSwapChainSupportDetail ArisenEngine::RHI::RHIVkInstan
 {
     ArisenEngine::RHI::VkSwapChainSupportDetail details{};
 
+    if (surface == VK_NULL_HANDLE)
+    {
+        return details;
+    }
+
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(m_CurrentPhysicsDevice, surface, &details.capabilities);
 
     uint32_t formatCount;
@@ -631,10 +636,18 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
 
     // Queue Create Info 
     Containers::Vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-    Containers::Set<uint32_t> uniqueQueueFamilies = {
-        indices.graphicsFamily.value(),
-        indices.presentFamily.value()
-    };
+    Containers::Set<uint32_t> uniqueQueueFamilies;
+
+    if (indices.graphicsFamily.has_value())
+    {
+        uniqueQueueFamilies.insert(indices.graphicsFamily.value());
+    }
+
+    if (indices.presentFamily.has_value())
+    {
+        uniqueQueueFamilies.insert(indices.presentFamily.value());
+    }
+
     if (indices.computeFamily.has_value())
     {
         uniqueQueueFamilies.insert(indices.computeFamily.value());
@@ -1118,10 +1131,18 @@ void ArisenEngine::RHI::RHIVkInstance::CheckSwapChainCapabilities()
         RHIVkSurface* rhiSurface = surfacePair.second.get();
         auto vkSurface = static_cast<VkSurfaceKHR>(
             rhiSurface->GetHandle());
-        auto swapChainSupportDetail = QuerySwapChainSupport(vkSurface);
 
-        rhiSurface->SetSwapChainSupportDetail(std::move(swapChainSupportDetail));
-        rhiSurface->SetQueueFamilyIndices(std::move(FindQueueFamilies(vkSurface)));
+        if (vkSurface != VK_NULL_HANDLE)
+        {
+            auto swapChainSupportDetail = QuerySwapChainSupport(vkSurface);
+
+            rhiSurface->SetSwapChainSupportDetail(std::move(swapChainSupportDetail));
+            rhiSurface->SetQueueFamilyIndices(std::move(FindQueueFamilies(vkSurface)));
+        }
+        else
+        {
+            LOG_DEBUG(String::Format(" window: {%d}'s surface handle is VK_NULL_HANDLE, skipping CheckSwapChainCapabilities", windowId));
+        }
     }
 }
 

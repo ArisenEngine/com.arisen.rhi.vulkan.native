@@ -25,7 +25,7 @@ ArisenEngine::RHI::RHIVkSurface::RHIVkSurface(UInt32&& id, RHIInstance* instance
     RHISurface(std::move(id), instance), m_SwapChainSupportDetail({}), m_SwapChain(nullptr)
 {
     // B101: Virtual/Headless surface support
-    if (m_RenderWindowId == 0xFFFFFFFF || m_RenderWindowId == 0)
+    if (m_RenderWindowId == 0xFFFFFFFF)
     {
         m_VkSurface = VK_NULL_HANDLE;
         LOG_INFO("[RHIVkSurface::RHIVkSurface]: Created Virtual Surface (No Native Window)");
@@ -48,39 +48,45 @@ void RHI::RHIVkSurface::InitSwapChain()
 {
     LOG_DEBUG("[RHIVkSurface::InitSwapChain]: InitSwapChain");
 
-    if (m_VkSurface == VK_NULL_HANDLE)
-    {
-        if (m_RenderWindowId == 0xFFFFFFFF)
-        {
-            LOG_INFO("[RHIVkSurface::InitSwapChain]: Skipping swapchain for Virtual Surface.");
-            return;
-        }
-        LOG_FATAL_AND_THROW("[RHIVkSurface::InitSwapChain]: Should init VkSurfachKHR first.");
-    }
-
     auto rhiInstance = static_cast<RHIVkInstance*>(m_Instance);
     m_SwapChain = new RHIVkSwapChain(rhiInstance->GetLogicalDevice(std::move(m_RenderWindowId)),
                                      this, rhiInstance->GetMaxFramesInFlight());
-    auto width = HAL::GetWindowWidth(m_RenderWindowId);
-    auto height = HAL::GetWindowHeight(m_RenderWindowId);
+    
+    UInt32 width, height, imageCount;
+    VkSurfaceFormatKHR formats;
+    VkPresentModeKHR presentMode;
+    VkSurfaceTransformFlagBitsKHR transform;
 
-    LOG_INFOF("[RHIVkSurface::InitSwapChain]: WindowID={0} HALWidth={1} HALHeight={2}", m_RenderWindowId, width,
-              height);
-    m_SwapChain->SetResolution(width, height);
-
-    auto imageCount = m_SwapChainSupportDetail.capabilities.minImageCount + 1;
-    if (m_SwapChainSupportDetail.capabilities.maxImageCount > 0
-        && imageCount > m_SwapChainSupportDetail.capabilities.maxImageCount)
+    if (m_RenderWindowId == 0xFFFFFFFF)
     {
-        imageCount = m_SwapChainSupportDetail.capabilities.maxImageCount;
+        width = m_Width;
+        height = m_Height;
+        imageCount = 3;
+        formats = { VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+        presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    }
+    else
+    {
+        width = HAL::GetWindowWidth(m_RenderWindowId);
+        height = HAL::GetWindowHeight(m_RenderWindowId);
+        imageCount = m_SwapChainSupportDetail.capabilities.minImageCount + 1;
+        if (m_SwapChainSupportDetail.capabilities.maxImageCount > 0
+            && imageCount > m_SwapChainSupportDetail.capabilities.maxImageCount)
+        {
+            imageCount = m_SwapChainSupportDetail.capabilities.maxImageCount;
+        }
+        formats = GetDefaultSurfaceFormat();
+        presentMode = GetDefaultSwapPresentMode();
+        width = std::clamp(width, m_SwapChainSupportDetail.capabilities.minImageExtent.width,
+                           m_SwapChainSupportDetail.capabilities.maxImageExtent.width);
+        height = std::clamp(height, m_SwapChainSupportDetail.capabilities.minImageExtent.height,
+                            m_SwapChainSupportDetail.capabilities.maxImageExtent.height);
+        transform = static_cast<VkSurfaceTransformFlagBitsKHR>(m_SwapChainSupportDetail.capabilities.currentTransform);
     }
 
-    auto formats = GetDefaultSurfaceFormat();
-    auto presentMode = GetDefaultSwapPresentMode();
-    width = std::clamp(width, m_SwapChainSupportDetail.capabilities.minImageExtent.width,
-                       m_SwapChainSupportDetail.capabilities.maxImageExtent.width);
-    height = std::clamp(height, m_SwapChainSupportDetail.capabilities.minImageExtent.height,
-                        m_SwapChainSupportDetail.capabilities.maxImageExtent.height);
+    LOG_INFOF("[RHIVkSurface::InitSwapChain]: WindowID={0} Width={1} Height={2}", m_RenderWindowId, width, height);
+    m_SwapChain->SetResolution(width, height);
 
     UInt32 queueFamilyIndexCount;
     ESharingMode sharingMode;
@@ -108,7 +114,7 @@ void RHI::RHIVkSurface::InitSwapChain()
     desc.sharingMode = sharingMode;
     desc.presentMode = static_cast<EPresentMode>(presentMode);
     desc.clipped = true;
-    desc.surfaceTransformFlagBits = static_cast<UInt32>(m_SwapChainSupportDetail.capabilities.currentTransform);
+    desc.surfaceTransformFlagBits = static_cast<UInt32>(transform);
     desc.compositeAlphaFlagBits = COMPOSITE_ALPHA_OPAQUE_BIT;
 
     m_SwapChain->CreateSwapChainWithDesc(desc);
