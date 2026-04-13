@@ -43,6 +43,6 @@ namespace ArisenEngine::RHI
         Containers::Vector<RHISemaphoreHandle> m_RenderFinishSemaphores;
         Containers::Vector<uint32_t> m_AcquiredImageIndices;
         VkQueue m_VkPresentQueue;
-        RHISwapChainDescriptor m_Desc;
+        RHISwapChainDescriptor m_Desc{};
     };
 }

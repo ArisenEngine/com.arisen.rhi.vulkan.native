@@ -86,7 +86,6 @@ void RHI::RHIVkSurface::InitSwapChain()
     }
 
     LOG_INFOF("[RHIVkSurface::InitSwapChain]: WindowID={0} Width={1} Height={2}", m_RenderWindowId, width, height);
-    m_SwapChain->SetResolution(width, height);
 
     UInt32 queueFamilyIndexCount;
     ESharingMode sharingMode;

@@ -7,6 +7,7 @@ using namespace ArisenEngine;
 #include "Core/RHIVkFactory.h"
 #include "RHI/Enums/Image/ECompositeAlphaFlagBits.h"
 #include "RHI/Enums/Image/EImageAspectFlagBits.h"
+#include "Core/RHIVkInstance.h"
 
 ArisenEngine::RHI::RHIVkSwapChain::RHIVkSwapChain(RHIDevice* device, const RHIVkSurface* surface,
                                                   UInt32 maxFramesInFlight):
@@ -23,7 +24,14 @@ ArisenEngine::RHI::RHIVkSwapChain::RHIVkSwapChain(RHIDevice* device, const RHIVk
     }
 
     auto indices = surface->GetQueueFamilyIndices();
-    vkGetDeviceQueue(m_VkDevice, indices.presentFamily.value(), 0, &m_VkPresentQueue);
+    if (indices.presentFamily.has_value())
+    {
+        vkGetDeviceQueue(m_VkDevice, indices.presentFamily.value(), 0, &m_VkPresentQueue);
+    }
+    else
+    {
+        m_VkPresentQueue = VK_NULL_HANDLE;
+    }
 }
 
 ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
@@ -58,6 +66,28 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
 
     if (m_VkSurface != VK_NULL_HANDLE)
     {
+        auto* vkInstance = static_cast<RHIVkInstance*>(vkDevice->GetInstance());
+        VkSurfaceCapabilitiesKHR surfaceCapabilities;
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vkInstance->GetPhysicalDevice(), m_VkSurface, &surfaceCapabilities);
+
+        VkExtent2D swapchainExtent = surfaceCapabilities.currentExtent;
+        if (swapchainExtent.width == 0xFFFFFFFF)
+        {
+            swapchainExtent.width = std::clamp(m_Desc.width, surfaceCapabilities.minImageExtent.width,
+                                               surfaceCapabilities.maxImageExtent.width);
+            swapchainExtent.height = std::clamp(m_Desc.height, surfaceCapabilities.minImageExtent.height,
+                                                surfaceCapabilities.maxImageExtent.height);
+        }
+
+        // Synchronize: Ensure the descriptor reflects the actual physical dimensions used for recreation.
+        // This ensures the engine's viewport/scissor (which likely use m_Desc) match the swapchain.
+        m_Desc.width = swapchainExtent.width;
+        m_Desc.height = swapchainExtent.height;
+
+        LOG_INFOF(
+            "[RHIVkSwapChain::CreateSwapChainWithDesc]: Swapping to {0}x{1} (Physical: {2}x{3})",
+            m_Desc.width, m_Desc.height, swapchainExtent.width, swapchainExtent.height);
+
         VkSwapchainCreateInfoKHR createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         createInfo.pNext = VK_NULL_HANDLE;
@@ -66,7 +96,7 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
         createInfo.minImageCount = m_Desc.imageCount;
         createInfo.imageFormat = static_cast<VkFormat>(m_Desc.colorFormat);
         createInfo.imageColorSpace = static_cast<VkColorSpaceKHR>(m_Desc.colorSpace);
-        createInfo.imageExtent = {m_Desc.width, m_Desc.height};
+        createInfo.imageExtent = swapchainExtent; // ALWAYS use the actual physical extent from surface capabilities
         createInfo.imageArrayLayers = m_Desc.imageArrayLayers;
         createInfo.imageUsage = m_Desc.imageUsageFlagBits;
         createInfo.imageSharingMode = static_cast<VkSharingMode>(m_Desc.sharingMode);
@@ -142,7 +172,7 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
     else
     {
         // Virtual SwapChain logic - Allocate shared images manually
-        LOG_INFO("[RHIVkSwapChain::CreateSwapChainWithDesc]: Creating Virtual SwapChain (Allocating shared images)");
+        LOG_INFOF("[RHIVkSwapChain::CreateSwapChainWithDesc]: Creating Virtual SwapChain ({0}x{1}, {2} images)", m_Desc.width, m_Desc.height, m_Desc.imageCount);
         UInt32 actualImageCount = m_Desc.imageCount;
         m_ImageHandles.resize(actualImageCount);
         m_ImageViewHandles.resize(actualImageCount);
@@ -152,6 +182,9 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
             RHIImageDescriptor imgDesc{};
             imgDesc.width = m_Desc.width;
             imgDesc.height = m_Desc.height;
+            imgDesc.depth = 1;
+            imgDesc.mipLevels = 1;
+            imgDesc.arrayLayers = m_Desc.imageArrayLayers > 0 ? m_Desc.imageArrayLayers : 1;
             imgDesc.format = m_Desc.colorFormat;
             imgDesc.usage = m_Desc.imageUsageFlagBits;
             imgDesc.imageType = IMAGE_TYPE_2D;
@@ -308,6 +341,12 @@ void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
 void ArisenEngine::RHI::RHIVkSwapChain::SetResolution(UInt32 width, UInt32 height)
 {
     if (m_Desc.width == width && m_Desc.height == height) return;
+    
+    // If we are already running at this physical resolution (pushed back from surface), skip.
+    // This prevents redundant recreations during rapid OS resizes where the window size
+    // hasn't actually crossed a physical pixel boundary.
+    if (width == m_Desc.width && height == m_Desc.height) return;
+
     m_Desc.width = width;
     m_Desc.height = height;
     RecreateSwapChainIfNeeded();
@@ -323,14 +362,24 @@ void* ArisenEngine::RHI::RHIVkSwapChain::GetSharedWin32Handle(UInt32 index)
 void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
 {
     ARISEN_PROFILE_ZONE("RHI::VulkanRecreateSwapChain");
-    if (m_VkSurface == VK_NULL_HANDLE || m_VkSwapChain == VK_NULL_HANDLE)
+    if (m_VkSurface != VK_NULL_HANDLE && m_VkSwapChain == VK_NULL_HANDLE)
     {
-        // currently we not init a swap chain 
+        // For native surfaces, we need an active swapchain to recreate.
+        // For virtual surfaces, we re-allocate images even without a VkSwapchainKHR.
         return;
     }
 
+    LOG_INFOF("[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Resizing SwapChain to {0}x{1}", m_Desc.width, m_Desc.height);
     // Zero-Stall: Do NOT wait idle.
-    // m_Device->DeviceWaitIdle();
+    // Handle minimized or zero-sized windows
+    if (m_Desc.width == 0 || m_Desc.height == 0)
+    {
+        return;
+    }
+
+    // Zero-Stall: Do not call DeviceWaitIdle() here.
+    // We recreate the swapchain using the 'oldSwapchain' parameter and defer the destruction 
+    // of the old one until the GPU is done with it.
 
     VkSwapchainKHR oldSwapchain = m_VkSwapChain;
     m_VkSwapChain = VK_NULL_HANDLE; // Prevent Cleanup from destroying the old swapchain immediately

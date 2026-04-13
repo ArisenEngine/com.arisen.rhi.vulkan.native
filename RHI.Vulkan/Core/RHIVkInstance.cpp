@@ -620,9 +620,11 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
 
     RHISurface* rhiSurface = nullptr;
     VkSurfaceKHR vkSurface = VK_NULL_HANDLE;
-    if (windowId != ~0u)
+
+    auto it = m_Surfaces.find(windowId);
+    if (it != m_Surfaces.end())
     {
-        rhiSurface = &GetSurface(windowId);
+        rhiSurface = it->second.get();
         vkSurface = static_cast<VkSurfaceKHR>(rhiSurface->GetHandle());
     }
 
@@ -700,9 +702,26 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
     {
         for (const char* extensionName : extensionList)
         {
-            // Skip swapchain if headless
+            // Skip swapchain only if it's a truly headless non-interop device (windowId == ~0u but not virtual)
             if (windowId == ~0u && strcmp(extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0)
             {
+                bool foundInAvailable = false;
+                for (const auto& ext : availableExtensions)
+                {
+                    if (strcmp(extensionName, ext.extensionName) == 0)
+                    {
+                        foundInAvailable = true;
+                        break;
+                    }
+                }
+
+                if (foundInAvailable)
+                {
+                    enabledExtensions.push_back(extensionName);
+                    continue;
+                }
+
+                LOG_INFO("[RHIVkInstance::CreateLogicDevice]: Skipping VK_KHR_swapchain for headless device as it is not available.");
                 continue;
             }
 
@@ -737,6 +756,27 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
 
     checkAndEnable(m_Settings.mandatoryDeviceExtensions, true);
     checkAndEnable(m_Settings.optionalDeviceExtensions, false);
+
+    // Mandatory Check for Virtual Viewport Interop
+    if (windowId == 0xFFFFFFFF || windowId == ~0u)
+    {
+        bool hasExternalMemory = false;
+        bool hasExternalMemoryWin32 = false;
+        for (const char* ext : enabledExtensions)
+        {
+            if (strcmp(ext, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME) == 0) hasExternalMemory = true;
+            if (strcmp(ext, "VK_KHR_external_memory_win32") == 0) hasExternalMemoryWin32 = true;
+        }
+
+        if (!hasExternalMemory || !hasExternalMemoryWin32)
+        {
+            LOG_FATAL("[RHIVkInstance::CreateLogicDevice]: Physical Device does not support VK_KHR_external_memory_win32! Headless interop will fail.");
+        }
+        else
+        {
+            LOG_INFO("[RHIVkInstance::CreateLogicDevice]: Win32 External Memory Interop validated for virtual surface.");
+        }
+    }
 
     // Set Device Features
     VkPhysicalDeviceFeatures features{};
