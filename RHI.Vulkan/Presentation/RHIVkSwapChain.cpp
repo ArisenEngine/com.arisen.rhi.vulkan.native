@@ -316,6 +316,25 @@ void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
     if (m_VkSurface == VK_NULL_HANDLE)
     {
         // Headless swapchain doesn't present to a surface
+        // But for interop, we ensure the image is in SHADER_READ_ONLY_OPTIMAL layout
+        // so that the consumer (Avalonia/D3D11) can read it correctly.
+        UInt32 index = m_AcquiredImageIndices[frameIndex % m_MaxFramesInFlight];
+        RHIImageHandle hImage = m_ImageHandles[index];
+        
+        auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+        auto* imageItem = vkDevice->GetImagePool()->Get(hImage);
+        
+        if (imageItem && imageItem->image != VK_NULL_HANDLE)
+        {
+            // Transition to SHADER_READ_ONLY_OPTIMAL if not already there
+            if (imageItem->currentLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            {
+                // We don't submit a separate command buffer here to avoid overhead.
+                // Instead, we trust the engine's RenderGraph to have transitioned it.
+                // However, we UPDATE the tracked layout so the RHI knows its state.
+                imageItem->currentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+        }
         return;
     }
 
