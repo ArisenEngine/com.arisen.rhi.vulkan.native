@@ -348,8 +348,15 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDevice::FindMemoryType(UInt32 typeF
 
 void ArisenEngine::RHI::RHIVkDevice::SetResolution(UInt32 width, UInt32 height)
 {
+    if (!m_Surface) return;
+
     m_Instance->UpdateSurfaceCapabilities(m_Surface);
-    m_Surface->GetSwapChain()->SetResolution(width, height);
+
+    auto* swapChain = m_Surface->GetSwapChain();
+    if (swapChain)
+    {
+        swapChain->SetResolution(width, height);
+    }
 }
 
 ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDevice::RegisterBindlessResource(RHIImageViewHandle image)
