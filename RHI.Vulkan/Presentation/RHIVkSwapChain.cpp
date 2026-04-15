@@ -21,6 +21,7 @@ ArisenEngine::RHI::RHIVkSwapChain::RHIVkSwapChain(RHIDevice* device, const RHIVk
         m_ImageAvailableSemaphores.emplace_back(factory->CreateSemaphore());
         m_RenderFinishSemaphores.emplace_back(factory->CreateSemaphore());
         m_AcquiredImageIndices.push_back(0);
+        m_AcquisitionResults.push_back(VK_NOT_READY); // Initialize to NOT_READY until first successful acquisition
     }
 
     auto indices = surface->GetQueueFamilyIndices();
@@ -32,6 +33,10 @@ ArisenEngine::RHI::RHIVkSwapChain::RHIVkSwapChain(RHIDevice* device, const RHIVk
     {
         m_VkPresentQueue = VK_NULL_HANDLE;
     }
+
+    // Modern Refinement: Honor proactively set dimensions from the surface
+    m_Desc.width = surface->GetWidth();
+    m_Desc.height = surface->GetHeight();
 }
 
 ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
@@ -112,6 +117,14 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
         createInfo.clipped = static_cast<VkBool32>(m_Desc.clipped);
         createInfo.oldSwapchain = VK_NULL_HANDLE;
 
+        // Bulletproof Guard: Final check for zero extent before talking to Vulkan.
+        // VUID-VkSwapchainCreateInfoKHR-imageExtent-01689 requires width and height to be non-zero.
+        if (swapchainExtent.width == 0 || swapchainExtent.height == 0)
+        {
+            LOG_WARN("[RHIVkSwapChain::CreateSwapChainWithDesc]: Skipping SwapChain creation due to zero physical extent.");
+            return;
+        }
+
         // Zero-Stall: Check if we have an old swapchain passed via customData
         if (m_Desc.customData != nullptr)
         {
@@ -135,6 +148,7 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
 
         m_ImageHandles.resize(actualImageCount);
         m_ImageViewHandles.resize(actualImageCount);
+        m_SharedHandles.resize(actualImageCount, nullptr);
         images.resize(actualImageCount);
 
         if (vkGetSwapchainImagesKHR(m_VkDevice, m_VkSwapChain, &actualImageCount, images.data()) != VK_SUCCESS)
@@ -176,6 +190,7 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
         UInt32 actualImageCount = m_Desc.imageCount;
         m_ImageHandles.resize(actualImageCount);
         m_ImageViewHandles.resize(actualImageCount);
+        m_SharedHandles.resize(actualImageCount, nullptr);
         
         for (int i = 0; i < actualImageCount; ++i)
         {
@@ -248,9 +263,40 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
     {
         // In virtual mode, we just rotate through images. 
         // We pick an index based on frameIndex to simulate swapchain behavior.
-        uint32_t imageIndex = frameIndex % m_ImageHandles.size();
+        uint32_t imageIndex = (uint32_t)(frameIndex % m_ImageHandles.size());
         m_AcquiredImageIndices[currentFrame] = imageIndex;
+        m_AcquisitionResults[currentFrame] = VK_SUCCESS;
         return m_ImageHandles[imageIndex];
+    }
+
+    // Bulletproof Guard: If the window is minimized or collapsed, don't even try to talk to Vulkan.
+    if (m_Desc.width == 0 || m_Desc.height == 0)
+    {
+        m_AcquisitionResults[currentFrame] = VK_NOT_READY;
+        return RHIImageHandle::Invalid();
+    }
+
+    // Modern Refinement: First-time lazy allocation
+    if (m_VkSwapChain == VK_NULL_HANDLE && m_VkSurface != VK_NULL_HANDLE)
+    {
+        RecreateSwapChainIfNeeded();
+        if (m_VkSwapChain == VK_NULL_HANDLE)
+        {
+            m_AcquisitionResults[currentFrame] = VK_NOT_READY;
+            return RHIImageHandle::Invalid();
+        }
+    }
+
+    // Bulletproof Recovery: If we are already out of date, try to recreate before anything else.
+    if (m_SwapChainIsOutDate)
+    {
+        RecreateSwapChainIfNeeded();
+        // If recreation didn't solve the OutDate (e.g. still 0 size or driver stall), bail immediately.
+        if (m_SwapChainIsOutDate)
+        {
+            m_AcquisitionResults[currentFrame] = VK_ERROR_OUT_OF_DATE_KHR;
+            return RHIImageHandle::Invalid();
+        }
     }
 
     auto hSem = m_ImageAvailableSemaphores[currentFrame];
@@ -258,25 +304,35 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
     VkSemaphore vkSem = semItem ? semItem->semaphore : VK_NULL_HANDLE;
 
     uint32_t imageIndex_local = 0;
-    VkResult result = vkAcquireNextImageKHR(m_VkDevice, m_VkSwapChain, UINT64_MAX, vkSem,
+    // Spec-Compliance: Use a finite timeout (1 second) instead of UINT64_MAX. 
+    // This is required when forward progress cannot be guaranteed (VUID-vkAcquireNextImageKHR-surface-07783).
+    VkResult result = vkAcquireNextImageKHR(m_VkDevice, m_VkSwapChain, 1000000000ULL, vkSem,
                                             VK_NULL_HANDLE, &imageIndex_local);
+
+    m_AcquisitionResults[currentFrame] = result;
 
     if (result == VK_ERROR_OUT_OF_DATE_KHR)
     {
-        // LOG_INFO("[RHIVkSwapChain::AcquireCurrentImage]: Out of date, triggering recreation");
-        // We can't easily trigger recreation here without risk of recursion or synchronization issues in the middle of BeginFrame.
-        // But we must signal that acquisition failed.
+        m_SwapChainIsOutDate = true;
+        // Proactive Recovery: Recreate swapchain immediately so next frame has a chance to succeed.
+        RecreateSwapChainIfNeeded();
         return RHIImageHandle::Invalid();
     }
 
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
     {
-        String msg = String::Format(
-            "[RHIVkSwapChain::AcquireCurrentImage]: failed to acquire next image (frame %d) result: %d", frameIndex,
-            result);
-        LOG_ERROR(msg);
+        // Only log serious failures, skip logging for expected timeout/not-ready during transitions.
+        if (result != VK_TIMEOUT && result != VK_NOT_READY)
+        {
+            String msg = String::Format(
+                "[RHIVkSwapChain::AcquireCurrentImage]: failed to acquire next image (frame %d) result: %d", frameIndex,
+                result);
+            LOG_ERROR(msg);
+        }
         return RHIImageHandle::Invalid();
     }
+
+    m_AcquisitionResults[currentFrame] = result;
     m_AcquiredImageIndices[currentFrame] = imageIndex_local;
     return m_ImageHandles[imageIndex_local];
 }
@@ -299,6 +355,12 @@ void ArisenEngine::RHI::RHIVkSwapChain::Cleanup()
     }
     m_ImageHandles.clear();
     m_ImageViewHandles.clear();
+
+    for (auto h : m_SharedHandles)
+    {
+        if (h) CloseHandle((HANDLE)h);
+    }
+    m_SharedHandles.clear();
 
     // Do NOT destroy semaphores here. They are reused across Valid/Recreated swapchains.
     // They should be destroyed in Destructor.
@@ -339,6 +401,15 @@ void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
     }
 
     auto currentFrame = frameIndex % m_MaxFramesInFlight;
+
+    // Bulletproof Guard: If acquisition failed for this frame (e.g. out of date), 
+    // we MUST NOT attempt to present or we will trigger validation errors.
+    VkResult acquireResult = m_AcquisitionResults[currentFrame];
+    if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR)
+    {
+        return;
+    }
+
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 
@@ -355,6 +426,14 @@ void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
     presentInfo.pImageIndices = &m_AcquiredImageIndices[currentFrame];
 
     vkQueuePresentKHR(m_VkPresentQueue, &presentInfo);
+}
+
+bool ArisenEngine::RHI::RHIVkSwapChain::HasAcquiredImage(UInt32 frameIndex) const
+{
+    if (m_VkSurface == VK_NULL_HANDLE) return true;
+    auto currentFrame = frameIndex % m_MaxFramesInFlight;
+    VkResult res = m_AcquisitionResults[currentFrame];
+    return res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR;
 }
 
 void ArisenEngine::RHI::RHIVkSwapChain::SetResolution(UInt32 width, UInt32 height)
@@ -374,18 +453,33 @@ void ArisenEngine::RHI::RHIVkSwapChain::SetResolution(UInt32 width, UInt32 heigh
 void* ArisenEngine::RHI::RHIVkSwapChain::GetSharedWin32Handle(UInt32 index)
 {
     if (index >= m_ImageHandles.size()) return nullptr;
-    auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
-    return vkDevice->GetSharedWin32Handle(m_ImageHandles[index]);
+    
+    // Cache the handle if we haven't already. 
+    // vkGetMemoryWin32HandleKHR returns a NEW reference that must be closed.
+    if (m_SharedHandles[index] == nullptr)
+    {
+        auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+        m_SharedHandles[index] = vkDevice->GetSharedWin32Handle(m_ImageHandles[index]);
+    }
+    
+    return m_SharedHandles[index];
 }
 
 void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
 {
     ARISEN_PROFILE_ZONE("RHI::VulkanRecreateSwapChain");
-    if (m_VkSurface != VK_NULL_HANDLE && m_VkSwapChain == VK_NULL_HANDLE)
+    if (m_VkSurface == VK_NULL_HANDLE && m_ImageHandles.empty())
     {
-        // For native surfaces, we need an active swapchain to recreate.
-        // For virtual surfaces, we re-allocate images even without a VkSwapchainKHR.
-        return;
+        // For virtual surfaces that haven't been allocated yet, we proceed to allocation.
+    }
+    else if (m_VkSurface != VK_NULL_HANDLE && m_VkSwapChain == VK_NULL_HANDLE)
+    {
+        // For native surfaces, if we have a surface but no swapchain, this is THE moment to create it.
+        LOG_INFO("[RHIVkSwapChain::RecreateSwapChainIfNeeded]: First-time SwapChain creation.");
+    }
+    else if (m_VkSwapChain == VK_NULL_HANDLE && !m_ImageHandles.empty())
+    {
+        // Already virtual and allocated, nothing to do unless size changes.
     }
 
     LOG_INFOF("[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Resizing SwapChain to {0}x{1}", m_Desc.width, m_Desc.height);
@@ -393,7 +487,18 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
     // Handle minimized or zero-sized windows
     if (m_Desc.width == 0 || m_Desc.height == 0)
     {
-        return;
+        if (m_VkSurface == VK_NULL_HANDLE)
+        {
+            // For virtual/headless, force 1x1 to keep the pipeline alive.
+            m_Desc.width = (std::max)(m_Desc.width, 1u);
+            m_Desc.height = (std::max)(m_Desc.height, 1u);
+            LOG_WARN("[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Virtual swapchain 0 size detected, forcing 1x1.");
+        }
+        else
+        {
+            // For physical windows, it's safer to skip recreation and skip frames.
+            return;
+        }
     }
 
     // Zero-Stall: Do not call DeviceWaitIdle() here.
@@ -403,29 +508,63 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
     VkSwapchainKHR oldSwapchain = m_VkSwapChain;
     m_VkSwapChain = VK_NULL_HANDLE; // Prevent Cleanup from destroying the old swapchain immediately
 
-    Cleanup();
+    // For virtual swapchains, we manually capture and defer the destruction of images 
+    // to ensure the external consumer (Avalonia) has enough time to switch to the new texture.
+    Containers::Vector<RHIImageHandle> oldImages = std::move(m_ImageHandles);
+    Containers::Vector<RHIImageViewHandle> oldImageViews = std::move(m_ImageViewHandles);
+    Containers::Vector<void*> oldSharedHandles = std::move(m_SharedHandles);
 
-    // Reset acquired indices to prevent using stale indices from the old swapchain
+    Cleanup(); // This now operates on empty vectors for images/views/handles, but cleans up other state.
+
+    // Reset tracking state to prevent using stale data from the old swapchain
     for (auto& idx : m_AcquiredImageIndices) idx = 0;
+    // VERY IMPORTANT: Initialize to NOT_READY or OUT_OF_DATE during recreation. 
+    // This ensures that HasAcquiredImage() correctly returns false until the NEW swapchain acquires something.
+    for (auto& res : m_AcquisitionResults) res = VK_NOT_READY; 
 
     // Pass old swapchain to Create functions
     m_Desc.customData = (void*)oldSwapchain;
     CreateSwapChainWithDesc(m_Desc);
     m_Desc.customData = nullptr; // Clear after use
 
-    // Defer destroy oldSwapchain
+    // Transition State: If we have a valid swapchain again, we are no longer out of date.
+    if (m_VkSwapChain != VK_NULL_HANDLE)
+    {
+        m_SwapChainIsOutDate = false;
+    }
+
+    // Defer destroy oldSwapchain and images
     auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+    auto* factory = m_Device->GetFactory();
+    
     // Use the latest ticket from graphics queue as synchronization point
-    // This ensures that we only destroy the old swapchain after all commands submitted UP TO NOW have finished.
-    // Add delay to ensure presentation engine is done with the old swapchain
+    // This ensures that we only destroy the old swapchain and images after all commands submitted UP TO NOW have finished.
+    // Add delay (MaxFramesInFlight) to ensure presentation engine and external consumers (Avalonia) are done.
     auto* graphicsQueue = vkDevice->GetQueue(RHIQueueType::Graphics);
     auto ticket = graphicsQueue ? graphicsQueue->GetLatestTicket() + m_Device->GetMaxFramesInFlight() : m_Device->GetMaxFramesInFlight();
+    
     RHIDeletionDependencies deps;
     deps.tickets[(int)RHIQueueType::Graphics] = ticket;
-    vkDevice->EnqueueDeferredDestroy(deps,
-                                     [dev = m_VkDevice, sw = oldSwapchain]()
-                                     {
-                                         // LOG_INFO("[RHIVkSwapChain] Destroying Old Swapchain (Deferred)");
-                                         vkDestroySwapchainKHR(dev, sw, nullptr);
-                                     });
+    
+    // 1. Defer SwapChain destruction
+    if (oldSwapchain != VK_NULL_HANDLE)
+    {
+        vkDevice->EnqueueDeferredDestroy(deps,
+                                         [dev = m_VkDevice, sw = oldSwapchain]()
+                                         {
+                                             vkDestroySwapchainKHR(dev, sw, nullptr);
+                                         });
+    }
+
+    // 2. Defer Virtual Images and Views destruction
+    if (!oldImages.empty())
+    {
+        vkDevice->EnqueueDeferredDestroy(deps,
+                                         [factory, images = std::move(oldImages), views = std::move(oldImageViews), handles = std::move(oldSharedHandles)]()
+                                         {
+                                             for (auto h : views) factory->ReleaseImageView(h);
+                                             for (auto h : images) factory->ReleaseImage(h);
+                                             for (auto h : handles) { if (h) CloseHandle((HANDLE)h); }
+                                         });
+    }
 }

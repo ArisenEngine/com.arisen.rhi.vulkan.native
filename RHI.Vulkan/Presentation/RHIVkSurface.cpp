@@ -59,6 +59,12 @@ void RHI::RHIVkSurface::InitSwapChain()
 
     if (m_RenderWindowId == 0xFFFFFFFF)
     {
+        if (m_Width == 0 || m_Height == 0)
+        {
+            LOG_WARN("[RHIVkSurface::InitSwapChain]: Virtual surface dimensions are zero! Falling back to 1920x1080.");
+            m_Width = 1920;
+            m_Height = 1080;
+        }
         width = m_Width;
         height = m_Height;
         imageCount = 3;
@@ -121,6 +127,10 @@ void RHI::RHIVkSurface::InitSwapChain()
 
 RHI::RHISwapChain* RHI::RHIVkSurface::GetSwapChain()
 {
+    if (m_SwapChain == nullptr)
+    {
+        InitSwapChain();
+    }
     return m_SwapChain;
 }
 

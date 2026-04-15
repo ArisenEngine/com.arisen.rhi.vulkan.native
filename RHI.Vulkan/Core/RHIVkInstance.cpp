@@ -1256,7 +1256,8 @@ void ArisenEngine::RHI::RHIVkInstance::InitLogicDevices()
         }
 
         CreateLogicDevice(windowId);
-        surfacePair.second.get()->InitSwapChain();
+        // Modern Refinement: Swapchains are now lazily initialized on the first frame.
+        // surfacePair.second.get()->InitSwapChain();
     }
 
     LOG_INFO("[RHIVkInstance::InitLogicDevices]: All Logical Devices Init! ");

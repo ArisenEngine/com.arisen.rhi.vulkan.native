@@ -24,6 +24,7 @@ namespace ArisenEngine::RHI
         RHIImageViewHandle GetImageView(UInt32 frameIndex) const override;
         void Cleanup() override;
         void Present(UInt32 frameIndex) override;
+        bool HasAcquiredImage(UInt32 frameIndex) const;
         void* GetSharedWin32Handle(UInt32 index) override;
         void SetResolution(UInt32 width, UInt32 height) override;
 
@@ -38,11 +39,14 @@ namespace ArisenEngine::RHI
         const RHIVkSurface* m_Surface;
         Containers::Vector<RHIImageHandle> m_ImageHandles;
         Containers::Vector<RHIImageViewHandle> m_ImageViewHandles;
+        Containers::Vector<void*> m_SharedHandles;
 
         Containers::Vector<RHISemaphoreHandle> m_ImageAvailableSemaphores;
         Containers::Vector<RHISemaphoreHandle> m_RenderFinishSemaphores;
         Containers::Vector<uint32_t> m_AcquiredImageIndices;
+        Containers::Vector<VkResult> m_AcquisitionResults;
         VkQueue m_VkPresentQueue;
         RHISwapChainDescriptor m_Desc{};
+        bool m_SwapChainIsOutDate{false};
     };
 }

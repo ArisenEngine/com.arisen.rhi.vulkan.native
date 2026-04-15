@@ -79,31 +79,37 @@ ArisenEngine::RHI::RHIGpuTicket ArisenEngine::RHI::RHIVkQueue::Submit(RHICommand
 
         if (descriptor->WaitSwapChain)
         {
-            auto semHandle = static_cast<RHIVkSwapChain*>(descriptor->WaitSwapChain)->GetImageAvailableSemaphore(
-                frameIndex);
-            if (semHandle.IsValid())
+            auto* vkSwapChain = static_cast<RHIVkSwapChain*>(descriptor->WaitSwapChain);
+            if (vkSwapChain->HasAcquiredImage(frameIndex))
             {
-                auto* semItem = vkDevice->GetSemaphorePool()->Get(semHandle);
-                if (semItem)
+                auto semHandle = vkSwapChain->GetImageAvailableSemaphore(frameIndex);
+                if (semHandle.IsValid())
                 {
-                    waitSems.push_back(semItem->semaphore);
-                    waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-                    waitValues.push_back(0);
+                    auto* semItem = vkDevice->GetSemaphorePool()->Get(semHandle);
+                    if (semItem)
+                    {
+                        waitSems.push_back(semItem->semaphore);
+                        waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                        waitValues.push_back(0);
+                    }
                 }
             }
         }
 
         if (descriptor->SignalSwapChain)
         {
-            auto semHandle = static_cast<RHIVkSwapChain*>(descriptor->SignalSwapChain)->GetRenderFinishSemaphore(
-                frameIndex);
-            if (semHandle.IsValid())
+            auto* vkSwapChain = static_cast<RHIVkSwapChain*>(descriptor->SignalSwapChain);
+            if (vkSwapChain->HasAcquiredImage(frameIndex))
             {
-                auto* semItem = vkDevice->GetSemaphorePool()->Get(semHandle);
-                if (semItem)
+                auto semHandle = vkSwapChain->GetRenderFinishSemaphore(frameIndex);
+                if (semHandle.IsValid())
                 {
-                    signalSems.push_back(semItem->semaphore);
-                    signalValues.push_back(0);
+                    auto* semItem = vkDevice->GetSemaphorePool()->Get(semHandle);
+                    if (semItem)
+                    {
+                        signalSems.push_back(semItem->semaphore);
+                        signalValues.push_back(0);
+                    }
                 }
             }
         }

@@ -24,6 +24,7 @@
 #include "Profiler.h"
 #include <windows.h>
 #include <vulkan/vulkan_win32.h>
+#include "Presentation/RHIVkSurface.h"
 
 using namespace ArisenEngine::RHI;
 
@@ -349,6 +350,14 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDevice::FindMemoryType(UInt32 typeF
 void ArisenEngine::RHI::RHIVkDevice::SetResolution(UInt32 width, UInt32 height)
 {
     if (!m_Surface) return;
+
+    // Proactive Propagation: Update the surface's intended dimensions.
+    // This allows lazy swapchain creation to pick up the correct size even if called before allocation.
+    if (m_Surface->GetHandle() == VK_NULL_HANDLE) // Virtual/Headless check
+    {
+        auto* vkSurface = static_cast<RHIVkSurface*>(m_Surface);
+        vkSurface->SetVirtualResolution(width, height);
+    }
 
     m_Instance->UpdateSurfaceCapabilities(m_Surface);
 

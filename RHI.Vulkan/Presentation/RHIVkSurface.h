@@ -23,6 +23,8 @@ namespace ArisenEngine::RHI
         ~RHIVkSurface() noexcept override;
         explicit RHIVkSurface(UInt32&& id, RHIInstance* instance);
         void SetVirtualResolution(UInt32 width, UInt32 height) { m_Width = width; m_Height = height; }
+        [[nodiscard]] UInt32 GetWidth() const { return m_Width; }
+        [[nodiscard]] UInt32 GetHeight() const { return m_Height; }
         [[nodiscard]] void* GetHandle() const override { return m_VkSurface; }
 
         void InitSwapChain() override;
