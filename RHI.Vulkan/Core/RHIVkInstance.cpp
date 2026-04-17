@@ -544,10 +544,14 @@ void ArisenEngine::RHI::RHIVkInstance::DisposeDebugMessager()
     DestroyDebugUtilsMessengerEXT(m_VkInstance, m_VkDebugMessenger, nullptr);
 }
 
-void ArisenEngine::RHI::RHIVkInstance::CreateSurface(UInt32 windowId)
+void ArisenEngine::RHI::RHIVkInstance::CreateSurface(UInt32 windowId, UInt32 width, UInt32 height)
 {
-    UInt32 key = windowId;
-    m_Surfaces.insert({key, std::make_unique<RHIVkSurface>(std::move(windowId), this)});
+    if (m_Surfaces.find(windowId) != m_Surfaces.end())
+    {
+        return;
+    }
+
+    m_Surfaces.insert({windowId, std::make_unique<RHIVkSurface>(std::move(windowId), this, width, height)});
 }
 
 void ArisenEngine::RHI::RHIVkInstance::DestroySurface(UInt32 windowId)
@@ -757,8 +761,8 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
     checkAndEnable(m_Settings.mandatoryDeviceExtensions, true);
     checkAndEnable(m_Settings.optionalDeviceExtensions, false);
 
-    // Mandatory Check for Virtual Viewport Interop
-    if (windowId == 0xFFFFFFFF || windowId == ~0u)
+    // Mandatory Check for Virtual Viewport Interop (identified by bit-flag 0x80000000)
+    if ((windowId & 0x80000000) || windowId == ~0u)
     {
         bool hasExternalMemory = false;
         bool hasExternalMemoryWin32 = false;

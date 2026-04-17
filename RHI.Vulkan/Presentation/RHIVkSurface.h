@@ -21,8 +21,9 @@ namespace ArisenEngine::RHI
     public:
         NO_COPY_NO_MOVE_NO_DEFAULT(RHIVkSurface);
         ~RHIVkSurface() noexcept override;
-        explicit RHIVkSurface(UInt32&& id, RHIInstance* instance);
+        explicit RHIVkSurface(UInt32&& id, RHIInstance* instance, UInt32 width = 0, UInt32 height = 0);
         void SetVirtualResolution(UInt32 width, UInt32 height) { m_Width = width; m_Height = height; }
+        void SetResolution(UInt32 width, UInt32 height) override;
         [[nodiscard]] UInt32 GetWidth() const { return m_Width; }
         [[nodiscard]] UInt32 GetHeight() const { return m_Height; }
         [[nodiscard]] void* GetHandle() const override { return m_VkSurface; }

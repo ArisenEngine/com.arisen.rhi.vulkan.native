@@ -21,14 +21,16 @@ ArisenEngine::RHI::RHIVkSurface::~RHIVkSurface() noexcept
     LOG_INFO("[RHIVkSurface::~RHIVkSurface]: Destroy Vulkan Surface");
 }
 
-ArisenEngine::RHI::RHIVkSurface::RHIVkSurface(UInt32&& id, RHIInstance* instance):
-    RHISurface(std::move(id), instance), m_SwapChainSupportDetail({}), m_SwapChain(nullptr)
+ArisenEngine::RHI::RHIVkSurface::RHIVkSurface(UInt32&& id, RHIInstance* instance, UInt32 width, UInt32 height) :
+    RHISurface(std::move(id), instance), m_SwapChainSupportDetail({}), m_SwapChain(nullptr),
+    m_Width(width), m_Height(height)
 {
-    // B101: Virtual/Headless surface support
-    if (m_RenderWindowId == 0xFFFFFFFF)
+    // B101: Virtual/Headless surface support (identified by bit-flag 0x80000000)
+    if (m_RenderWindowId & 0x80000000)
     {
         m_VkSurface = VK_NULL_HANDLE;
-        LOG_INFO("[RHIVkSurface::RHIVkSurface]: Created Virtual Surface (No Native Window)");
+        LOG_INFOF("[RHIVkSurface::RHIVkSurface]: Created Virtual Surface 0x{0:X} with initial size {1}x{2}", 
+                 m_RenderWindowId, m_Width, m_Height);
         return;
     }
 
@@ -46,10 +48,18 @@ ArisenEngine::RHI::RHIVkSurface::RHIVkSurface(UInt32&& id, RHIInstance* instance
 
 void RHI::RHIVkSurface::InitSwapChain()
 {
-    LOG_DEBUG("[RHIVkSurface::InitSwapChain]: InitSwapChain");
+    // LOG_DEBUG("[RHIVkSurface::InitSwapChain]: InitSwapChain");
+
+    if (m_SwapChain != nullptr)
+    {
+        // Fix Memory Leak: If we already have a swapchain, just ensure it's resized correctly.
+        // This is professional behavior for virtual surfaces that might be re-initialized.
+        SetResolution(m_Width, m_Height);
+        return;
+    }
 
     auto rhiInstance = static_cast<RHIVkInstance*>(m_Instance);
-    m_SwapChain = new RHIVkSwapChain(rhiInstance->GetLogicalDevice(std::move(m_RenderWindowId)),
+    m_SwapChain = new RHIVkSwapChain(rhiInstance->GetLogicalDevice(m_RenderWindowId),
                                      this, rhiInstance->GetMaxFramesInFlight());
     
     UInt32 width, height, imageCount;
@@ -57,13 +67,13 @@ void RHI::RHIVkSurface::InitSwapChain()
     VkPresentModeKHR presentMode;
     VkSurfaceTransformFlagBitsKHR transform;
 
-    if (m_RenderWindowId == 0xFFFFFFFF)
+    if (m_RenderWindowId & 0x80000000)
     {
         if (m_Width == 0 || m_Height == 0)
         {
-            LOG_WARN("[RHIVkSurface::InitSwapChain]: Virtual surface dimensions are zero! Falling back to 1920x1080.");
-            m_Width = 1920;
-            m_Height = 1080;
+            LOG_WARN("[RHIVkSurface::InitSwapChain]: Virtual surface dimensions are zero! Falling back to 1024x1024.");
+            m_Width = 1024;
+            m_Height = 1024;
         }
         width = m_Width;
         height = m_Height;
@@ -132,6 +142,19 @@ RHI::RHISwapChain* RHI::RHIVkSurface::GetSwapChain()
         InitSwapChain();
     }
     return m_SwapChain;
+}
+
+void RHI::RHIVkSurface::SetResolution(UInt32 width, UInt32 height)
+{
+    if (m_Width == width && m_Height == height && m_SwapChain != nullptr) return;
+
+    m_Width = width;
+    m_Height = height;
+
+    if (m_SwapChain)
+    {
+        m_SwapChain->SetResolution(width, height);
+    }
 }
 
 VkSurfaceFormatKHR RHI::RHIVkSurface::GetDefaultSurfaceFormat()

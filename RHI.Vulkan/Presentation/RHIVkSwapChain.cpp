@@ -263,9 +263,15 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
     {
         // In virtual mode, we just rotate through images. 
         // We pick an index based on frameIndex to simulate swapchain behavior.
-        uint32_t imageIndex = (uint32_t)(frameIndex % m_ImageHandles.size());
+        uint32_t imageCount = (uint32_t)m_ImageHandles.size();
+        if (imageCount == 0) return RHIImageHandle::Invalid();
+
+        uint32_t imageIndex = (uint32_t)(frameIndex % imageCount);
         m_AcquiredImageIndices[currentFrame] = imageIndex;
         m_AcquisitionResults[currentFrame] = VK_SUCCESS;
+        
+        LOG_DEBUG(String::Format("[RHIVkSwapChain::AcquireCurrentImage]: Virtual Acquire - Frame %d -> Image %d", frameIndex, imageIndex));
+        
         return m_ImageHandles[imageIndex];
     }
 
