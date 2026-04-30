@@ -78,7 +78,7 @@ void RHI::RHIVkSurface::InitSwapChain()
         width = m_Width;
         height = m_Height;
         imageCount = 3;
-        formats = { VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+        formats = { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
         presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
         transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     }
@@ -122,7 +122,7 @@ void RHI::RHIVkSurface::InitSwapChain()
     desc.imageCount = imageCount;
     desc.imageArrayLayers = 1;
     desc.imageUsageFlagBits = IMAGE_USAGE_COLOR_ATTACHMENT_BIT | IMAGE_USAGE_TRANSFER_SRC_BIT |
-        IMAGE_USAGE_TRANSFER_DST_BIT;
+        IMAGE_USAGE_TRANSFER_DST_BIT | IMAGE_USAGE_SAMPLED_BIT;
     desc.queueFamilyIndexCount = queueFamilyIndexCount;
     desc.colorFormat = static_cast<EFormat>(formats.format);
     desc.colorSpace = static_cast<EColorSpace>(formats.colorSpace);

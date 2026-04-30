@@ -867,6 +867,12 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageDeviceMemory(RHIImageHandle handl
         exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
         exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
         
+        VkMemoryDedicatedAllocateInfo dedicatedInfo{};
+        dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        dedicatedInfo.image = image->image;
+        dedicatedInfo.buffer = VK_NULL_HANDLE;
+
+        exportInfo.pNext = &dedicatedInfo;
         allocInfo.pNext = &exportInfo;
 
         VkDeviceMemory manualMemory = VK_NULL_HANDLE;
@@ -1779,11 +1785,18 @@ namespace ArisenEngine::RHI
     void* RHIVkDevice::GetSharedWin32Handle(RHIImageHandle handle)
     {
         auto* image = m_ImagePool->Get(handle);
-        if (!image || image->image == VK_NULL_HANDLE || !image->bExportSharedWin32Handle) return nullptr;
-        if (!image->state || image->state->manualMemory == VK_NULL_HANDLE) return nullptr;
+        if (!image) { LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: Image is null!"); return nullptr; }
+        if (image->image == VK_NULL_HANDLE) { LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: VkImage is null!"); return nullptr; }
+        if (!image->bExportSharedWin32Handle) { LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: bExportSharedWin32Handle is false!"); return nullptr; }
+        if (!image->state) { LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: Image state is null!"); return nullptr; }
+        if (image->state->manualMemory == VK_NULL_HANDLE) { LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: manualMemory is null!"); return nullptr; }
 
         auto vkGetMemoryWin32HandleKHRProc = (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(m_VkDevice, "vkGetMemoryWin32HandleKHR");
-        if (!vkGetMemoryWin32HandleKHRProc) return nullptr;
+        if (!vkGetMemoryWin32HandleKHRProc) 
+        {
+             LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: vkGetMemoryWin32HandleKHR proc not found!");
+             return nullptr;
+        }
 
         VkMemoryGetWin32HandleInfoKHR handleInfo{};
         handleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
@@ -1791,9 +1804,10 @@ namespace ArisenEngine::RHI
         handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 
         HANDLE win32Handle = nullptr;
-        if (vkGetMemoryWin32HandleKHRProc(m_VkDevice, &handleInfo, &win32Handle) != VK_SUCCESS)
+        VkResult res = vkGetMemoryWin32HandleKHRProc(m_VkDevice, &handleInfo, &win32Handle);
+        if (res != VK_SUCCESS)
         {
-            LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: Failed to get Win32 handle from memory!");
+            LOG_ERROR(String::Format("[RHIVkDevice::GetSharedWin32Handle]: Failed to get Win32 handle from memory! Result: %d", (int)res));
             return nullptr;
         }
 
