@@ -384,7 +384,7 @@ namespace ArisenEngine::RHI
     private:
         // Internal low-level destruction (Vulkan/Memory only, via Registry)
         void FreeBufferInternal(RHIBufferHandle handle);
-        void FreeImageInternal(RHIImageHandle handle);
+        void FreeImageInternal(RHIVkImagePoolItem* image);
         void FreeImageViewInternal(RHIImageViewHandle handle);
         void FreeSamplerInternal(RHISamplerHandle handle);
         void FreeSemaphoreInternal(RHISemaphoreHandle handle);

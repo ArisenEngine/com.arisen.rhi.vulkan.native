@@ -65,6 +65,7 @@ ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
 
 void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDescriptor desc)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     m_Desc = desc;
     auto* factory = m_Device->GetFactory();
     auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
@@ -181,6 +182,12 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
             viewDesc.height = m_Desc.height;
 
             m_ImageViewHandles[i] = factory->CreateImageView(m_ImageHandles[i], std::move(viewDesc));
+            
+            // Pre-populate if necessary for interop
+            if (m_Desc.bExportSharedWin32Handle)
+            {
+                m_SharedHandles[i] = vkDevice->GetSharedWin32Handle(m_ImageHandles[i]);
+            }
         }
     }
     else
@@ -222,6 +229,8 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
             viewDesc.height = m_Desc.height;
 
             m_ImageViewHandles[i] = factory->CreateImageView(m_ImageHandles[i], std::move(viewDesc));
+            
+            m_SharedHandles[i] = vkDevice->GetSharedWin32Handle(m_ImageHandles[i]);
         }
     }
 }
@@ -250,12 +259,15 @@ ArisenEngine::RHI::RHISemaphoreHandle ArisenEngine::RHI::RHIVkSwapChain::GetRend
 
 ArisenEngine::RHI::RHIImageViewHandle ArisenEngine::RHI::RHIVkSwapChain::GetImageView(UInt32 frameIndex) const
 {
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     auto currentFrame = frameIndex % m_MaxFramesInFlight;
+    if (m_AcquiredImageIndices[currentFrame] >= m_ImageViewHandles.size()) return RHIImageViewHandle::Invalid();
     return m_ImageViewHandles[m_AcquiredImageIndices[currentFrame]];
 }
 
 ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurrentImage(UInt32 frameIndex)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     ARISEN_PROFILE_ZONE("RHI::VulkanAcquireImage");
     auto currentFrame = frameIndex % m_MaxFramesInFlight;
 
@@ -380,6 +392,7 @@ void ArisenEngine::RHI::RHIVkSwapChain::Cleanup()
 
 void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     ARISEN_PROFILE_ZONE("RHI::VulkanPresent");
     if (m_VkSurface == VK_NULL_HANDLE)
     {
@@ -444,6 +457,7 @@ bool ArisenEngine::RHI::RHIVkSwapChain::HasAcquiredImage(UInt32 frameIndex) cons
 
 void ArisenEngine::RHI::RHIVkSwapChain::SetResolution(UInt32 width, UInt32 height)
 {
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     if (m_Desc.width == width && m_Desc.height == height) return;
     
     // If we are already running at this physical resolution (pushed back from surface), skip.
@@ -458,11 +472,15 @@ void ArisenEngine::RHI::RHIVkSwapChain::SetResolution(UInt32 width, UInt32 heigh
 
 void* ArisenEngine::RHI::RHIVkSwapChain::GetSharedWin32Handle(UInt32 index)
 {
-    if (index >= m_ImageHandles.size()) return nullptr;
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    if (m_SharedHandles.empty()) return nullptr;
+    
+    // Support passing frameIndex by applying modulo internally.
+    index = index % (UInt32)m_SharedHandles.size();
     
     // Cache the handle if we haven't already. 
     // vkGetMemoryWin32HandleKHR returns a NEW reference that must be closed.
-    if (m_SharedHandles[index] == nullptr)
+    if (m_SharedHandles[index] == nullptr && index < m_ImageHandles.size())
     {
         auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
         m_SharedHandles[index] = vkDevice->GetSharedWin32Handle(m_ImageHandles[index]);
@@ -545,9 +563,9 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
     
     // Use the latest ticket from graphics queue as synchronization point
     // This ensures that we only destroy the old swapchain and images after all commands submitted UP TO NOW have finished.
-    // Add delay (MaxFramesInFlight) to ensure presentation engine and external consumers (Avalonia) are done.
+    // Add delay (e.g. 6 frames) to ensure presentation engine and external consumers (Avalonia) are done.
     auto* graphicsQueue = vkDevice->GetQueue(RHIQueueType::Graphics);
-    auto ticket = graphicsQueue ? graphicsQueue->GetLatestTicket() + m_Device->GetMaxFramesInFlight() : m_Device->GetMaxFramesInFlight();
+    auto ticket = graphicsQueue ? graphicsQueue->GetLatestTicket() + 6 : 6;
     
     RHIDeletionDependencies deps;
     deps.tickets[(int)RHIQueueType::Graphics] = ticket;

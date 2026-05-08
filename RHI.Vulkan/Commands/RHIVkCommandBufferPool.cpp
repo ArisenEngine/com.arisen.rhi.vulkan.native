@@ -14,6 +14,7 @@ ArisenEngine::RHI::RHIVkCommandBufferPool::RHIVkCommandBufferPool(RHIVkDevice* d
     : RHICommandBufferPool(device, maxFramesInFlight, queueType)
 {
     m_VkDevice = static_cast<VkDevice>(device->GetHandle());
+    m_QueueFamilyIndex = (queueType == RHIQueueType::Compute) ? device->GetComputeFamilyIndex() : device->GetGraphicsFamilyIndex();
 
     (void)maxFramesInFlight;
 }

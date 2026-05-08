@@ -51,6 +51,8 @@ namespace ArisenEngine::RHI
                                                 ECommandBufferLevel level = COMMAND_BUFFER_LEVEL_PRIMARY) override;
         void ReleaseCommandBuffer(UInt32 currentFrameIndex, RHICommandBufferHandle handle) override;
 
+        UInt32 GetQueueFamilyIndex() const { return m_QueueFamilyIndex; }
+
     private:
         void FlushPendingBuffers(ThreadSlot& slot);
         void ConsumeMailbox(ThreadSlot& slot);
@@ -61,6 +63,7 @@ namespace ArisenEngine::RHI
         void InternalRecycle(RHICommandBufferHandle handle) override;
 
         VkDevice m_VkDevice;
+        UInt32 m_QueueFamilyIndex{0};
 
         // Fixed-size slots for bounded resource management
         static constexpr size_t MAX_THREADS = ThreadRegistry::MAX_THREADS;

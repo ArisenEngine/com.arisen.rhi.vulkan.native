@@ -71,6 +71,8 @@ namespace ArisenEngine::RHI
         void PipelineBarrier(const RHICmdPipelineBarrier& cmd, const RHIMemoryBarrier* pMem,
                              const RHIImageMemoryBarrier* pImg, const RHIBufferMemoryBarrier* pBuf) override;
         void TransitionImageLayout(RHIImageHandle image, EImageLayout oldLayout, EImageLayout targetLayout) override;
+        void TransitionImageLayout(RHIImageHandle image, EImageLayout oldLayout, EImageLayout targetLayout,
+                                   UInt32 srcQueueFamilyIndex, UInt32 dstQueueFamilyIndex) override;
         void CopyImage(RHIImageHandle src, EImageLayout srcLayout, RHIImageHandle dst, EImageLayout dstLayout,
                        UInt32 regionCount, const RHIImageCopy* pRegions) override;
         void GenerateMipmaps(RHIImageHandle image) override;
@@ -831,6 +833,10 @@ namespace ArisenEngine::RHI
         {
             vkDevice->vkCmdPipelineBarrier2KHR(cmd->m_VkCommandBuffer, &dependencyInfo);
         }
+        else
+        {
+            LOG_ERROR("[RHIVkExecutor::DoPipelineBarrier]: vkCmdPipelineBarrier2KHR (or core vkCmdPipelineBarrier2) not found! Image layouts will not be transitioned properly.");
+        }
     }
 
     void RHIVkExecutor::PipelineBarrier(const RHICmdPipelineBarrier& command, const RHIMemoryBarrier* pMem,
@@ -844,23 +850,45 @@ namespace ArisenEngine::RHI
 
     void RHIVkExecutor::TransitionImageLayout(RHIImageHandle image, EImageLayout oldLayout, EImageLayout targetLayout)
     {
-        if (oldLayout == targetLayout) return;
+        TransitionImageLayout(image, oldLayout, targetLayout,
+                              RHI_QUEUE_FAMILY_IGNORED, RHI_QUEUE_FAMILY_IGNORED);
+    }
+
+    void RHIVkExecutor::TransitionImageLayout(RHIImageHandle image, EImageLayout oldLayout, EImageLayout targetLayout,
+                                              UInt32 srcQueueFamilyIndex, UInt32 dstQueueFamilyIndex)
+    {
+        // Ownership-transfer release/acquire does NOT require layout change; skip the same-layout early-out
+        // only when src != dst family.
+        const bool isOwnershipTransfer = (srcQueueFamilyIndex != dstQueueFamilyIndex) &&
+                                         (srcQueueFamilyIndex != RHI_QUEUE_FAMILY_IGNORED ||
+                                          dstQueueFamilyIndex != RHI_QUEUE_FAMILY_IGNORED);
+        if (oldLayout == targetLayout && !isOwnershipTransfer) return;
 
         RHIImageMemoryBarrier barrier{};
         barrier.image = image;
         barrier.oldLayout = oldLayout;
         barrier.newLayout = targetLayout;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.subresourceRange = {IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}; // Default to color, 1 level, 1 layer
 
-        // Automatic inference of stages and access masks
+        // Auto-resolve IGNORED to current queue family if an ownership transfer to/from EXTERNAL is requested.
+        // Vulkan spec requires explicit family indices for ownership transfer (srcFamily != dstFamily and neither is IGNORED).
+        if (srcQueueFamilyIndex == RHI_QUEUE_FAMILY_IGNORED && dstQueueFamilyIndex == RHI_QUEUE_FAMILY_EXTERNAL)
+        {
+            srcQueueFamilyIndex = static_cast<RHIVkCommandBufferPool*>(cmd->GetOwner())->GetQueueFamilyIndex();
+        }
+        else if (dstQueueFamilyIndex == RHI_QUEUE_FAMILY_IGNORED && srcQueueFamilyIndex == RHI_QUEUE_FAMILY_EXTERNAL)
+        {
+            dstQueueFamilyIndex = static_cast<RHIVkCommandBufferPool*>(cmd->GetOwner())->GetQueueFamilyIndex();
+        }
+
+        barrier.srcQueueFamilyIndex = srcQueueFamilyIndex;
+        barrier.dstQueueFamilyIndex = dstQueueFamilyIndex;
+        barrier.subresourceRange = {IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
         barrier.srcStageMask = PIPELINE_STAGE_ALL_COMMANDS_BIT;
         barrier.dstStageMask = PIPELINE_STAGE_ALL_COMMANDS_BIT;
         barrier.srcAccess = static_cast<EAccessFlag>(ACCESS_MEMORY_READ_BIT | ACCESS_MEMORY_WRITE_BIT);
         barrier.dstAccess = static_cast<EAccessFlag>(ACCESS_MEMORY_READ_BIT | ACCESS_MEMORY_WRITE_BIT);
 
-        // Common transition refinements
         if (oldLayout == IMAGE_LAYOUT_UNDEFINED)
         {
             barrier.srcStageMask = PIPELINE_STAGE_TOP_OF_PIPE_BIT;
@@ -881,8 +909,8 @@ namespace ArisenEngine::RHI
         }
         else if (targetLayout == IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
         {
-            barrier.dstStageMask = PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-            barrier.dstAccess = ACCESS_SHADER_READ_BIT;
+            barrier.dstStageMask = PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+            barrier.dstAccess = static_cast<EAccessFlag>(ACCESS_SHADER_READ_BIT | ACCESS_MEMORY_READ_BIT);
         }
         else if (targetLayout == IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
         {
@@ -893,6 +921,21 @@ namespace ArisenEngine::RHI
         {
             barrier.dstStageMask = PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
             barrier.dstAccess = ACCESS_NONE;
+        }
+
+        // Queue-family release (dst=EXTERNAL): destination access mask is ignored by the spec;
+        // stages must still be valid, so we conservatively drain to BOTTOM_OF_PIPE.
+        if (dstQueueFamilyIndex == RHI_QUEUE_FAMILY_EXTERNAL)
+        {
+            barrier.dstStageMask = PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+            barrier.dstAccess = ACCESS_NONE;
+        }
+        // Queue-family acquire (src=EXTERNAL): source access mask is ignored by the spec;
+        // start from TOP_OF_PIPE to represent "anything from the external API may have happened".
+        if (srcQueueFamilyIndex == RHI_QUEUE_FAMILY_EXTERNAL)
+        {
+            barrier.srcStageMask = PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            barrier.srcAccess = ACCESS_NONE;
         }
 
         DoPipelineBarrier(barrier.srcStageMask, barrier.dstStageMask, 0, nullptr, 0, &barrier, 1, nullptr, 0);

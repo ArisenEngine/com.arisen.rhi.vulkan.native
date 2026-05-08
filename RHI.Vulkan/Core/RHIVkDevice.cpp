@@ -51,10 +51,18 @@ ArisenEngine::RHI::RHIVkDevice::RHIVkDevice(RHIInstance* instance, RHISurface* s
     m_DescriptorPool = new RHIVkDescriptorPool(this);
 
     // Cache function pointers for Sync 2.0 and Dynamic Rendering
-    vkCmdPipelineBarrier2KHR = (PFN_vkCmdPipelineBarrier2KHR)
-        vkGetDeviceProcAddr(m_VkDevice, "vkCmdPipelineBarrier2KHR");
+    vkCmdPipelineBarrier2KHR = (PFN_vkCmdPipelineBarrier2KHR)vkGetDeviceProcAddr(m_VkDevice, "vkCmdPipelineBarrier2KHR");
+    if (!vkCmdPipelineBarrier2KHR)
+        vkCmdPipelineBarrier2KHR = (PFN_vkCmdPipelineBarrier2KHR)vkGetDeviceProcAddr(m_VkDevice, "vkCmdPipelineBarrier2");
+
     vkCmdBeginRenderingKHR = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(m_VkDevice, "vkCmdBeginRenderingKHR");
+    if (!vkCmdBeginRenderingKHR)
+        vkCmdBeginRenderingKHR = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(m_VkDevice, "vkCmdBeginRendering");
+
     vkCmdEndRenderingKHR = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(m_VkDevice, "vkCmdEndRenderingKHR");
+    if (!vkCmdEndRenderingKHR)
+        vkCmdEndRenderingKHR = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(m_VkDevice, "vkCmdEndRendering");
+
     vkCmdDrawMeshTasksEXT = (PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(m_VkDevice, "vkCmdDrawMeshTasksEXT");
 
     // Debug Utils
@@ -819,6 +827,7 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImage(RHIImageHandle handle, RHIImageD
         externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
         externalInfo.pNext = imageInfo.pNext;
         imageInfo.pNext = &externalInfo;
+        imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
 
     if (vkCreateImage(m_VkDevice, &imageInfo, nullptr, &image->image) != VK_SUCCESS)
@@ -866,12 +875,13 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageDeviceMemory(RHIImageHandle handl
         VkExportMemoryAllocateInfo exportInfo{};
         exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
         exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-        
+
         VkMemoryDedicatedAllocateInfo dedicatedInfo{};
         dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
         dedicatedInfo.image = image->image;
         dedicatedInfo.buffer = VK_NULL_HANDLE;
 
+        // Opaque handles do not use pAttributes or dwAccess; pNext chain is just dedicatedInfo.
         exportInfo.pNext = &dedicatedInfo;
         allocInfo.pNext = &exportInfo;
 
@@ -936,10 +946,13 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageDeviceMemory(RHIImageHandle handl
     return true;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::FreeImageInternal(RHIImageHandle handle)
+void ArisenEngine::RHI::RHIVkDevice::FreeImageInternal(RHIVkImagePoolItem* image)
 {
-    auto* image = m_ImagePool->Get(handle);
-    if (!image) return;
+    if (image->sharedHandle != nullptr)
+    {
+        ::CloseHandle((HANDLE)image->sharedHandle);
+        image->sharedHandle = nullptr;
+    }
 
     if (image->image != VK_NULL_HANDLE && image->needDestroy)
     {
@@ -955,7 +968,7 @@ void ArisenEngine::RHI::RHIVkDevice::FreeImageInternal(RHIImageHandle handle)
 
 void ArisenEngine::RHI::RHIVkDevice::ReleaseImage(RHIImageHandle handle)
 {
-    FreeImageInternal(handle);
+    FreeImageInternal(m_ImagePool->Get(handle));
     if (!m_ImagePool->Deallocate(handle))
     {
         LOG_WARN("[RHIVkDevice::ReleaseImage]: Failed to deallocate handle (invalid or stale)!");
@@ -1791,11 +1804,16 @@ namespace ArisenEngine::RHI
         if (!image->state) { LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: Image state is null!"); return nullptr; }
         if (image->state->manualMemory == VK_NULL_HANDLE) { LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: manualMemory is null!"); return nullptr; }
 
-        auto vkGetMemoryWin32HandleKHRProc = (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(m_VkDevice, "vkGetMemoryWin32HandleKHR");
-        if (!vkGetMemoryWin32HandleKHRProc) 
+        auto vkGetMemoryWin32HandleKHR = (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(m_VkDevice, "vkGetMemoryWin32HandleKHR");
+        if (!vkGetMemoryWin32HandleKHR) 
         {
              LOG_ERROR("[RHIVkDevice::GetSharedWin32Handle]: vkGetMemoryWin32HandleKHR proc not found!");
              return nullptr;
+        }
+
+        if (image->sharedHandle != nullptr)
+        {
+            return image->sharedHandle;
         }
 
         VkMemoryGetWin32HandleInfoKHR handleInfo{};
@@ -1804,13 +1822,14 @@ namespace ArisenEngine::RHI
         handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 
         HANDLE win32Handle = nullptr;
-        VkResult res = vkGetMemoryWin32HandleKHRProc(m_VkDevice, &handleInfo, &win32Handle);
-        if (res != VK_SUCCESS)
+        if (vkGetMemoryWin32HandleKHR(m_VkDevice, &handleInfo, &win32Handle) != VK_SUCCESS)
         {
-            LOG_ERROR(String::Format("[RHIVkDevice::GetSharedWin32Handle]: Failed to get Win32 handle from memory! Result: %d", (int)res));
+            LOG_ERRORF("[RHIVkDevice::GetSharedWin32Handle]: Failed to get Win32 handle for image {0}", image->name.c_str());
             return nullptr;
         }
 
-        return (void*)win32Handle;
+        image->sharedHandle = win32Handle;
+        LOG_INFOF("[RHIVkDevice::GetSharedWin32Handle]: Exported NT handle {0} for image {1} (Cached)", (void*)win32Handle, image->name.c_str());
+        return win32Handle;
     }
 }

@@ -130,6 +130,7 @@ namespace ArisenEngine::RHI
         VkImageLayout currentLayout{VK_IMAGE_LAYOUT_UNDEFINED};
         ERHIMemoryUsage memoryUsage;
         bool bExportSharedWin32Handle{false};
+        void* sharedHandle{nullptr};
         RHIResourceHandle registryHandle;
     };
 

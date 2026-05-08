@@ -1,4 +1,5 @@
 #pragma once
+#include <mutex>
 #include "Presentation/RHIVkSurface.h"
 #include "RHI/Handles/RHIHandle.h"
 #include "RHI/Presentation/RHISwapChain.h"
@@ -48,5 +49,6 @@ namespace ArisenEngine::RHI
         VkQueue m_VkPresentQueue;
         RHISwapChainDescriptor m_Desc{};
         bool m_SwapChainIsOutDate{false};
+        mutable std::recursive_mutex m_Mutex;
     };
 }
