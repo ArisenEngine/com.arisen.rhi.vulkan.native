@@ -15,16 +15,19 @@ ArisenEngine::RHI::RHIVkSwapChain::RHIVkSwapChain(RHIDevice* device, const RHIVk
         m_Device->GetHandle())),
     m_VkSurface(static_cast<VkSurfaceKHR>(surface->GetHandle())), m_Surface(surface)
 {
-    auto* factory = m_Device->GetFactory();
+        auto* factory = m_Device->GetFactory();
     for (int i = 0; i < (int)m_MaxFramesInFlight; ++i)
+
     {
         m_ImageAvailableSemaphores.emplace_back(factory->CreateSemaphore());
         m_RenderFinishSemaphores.emplace_back(factory->CreateSemaphore());
+        m_RenderFinishSemaphoreSharedHandles.emplace_back(nullptr);
         m_AcquiredImageIndices.push_back(0);
         m_AcquisitionResults.push_back(VK_NOT_READY); // Initialize to NOT_READY until first successful acquisition
     }
 
     auto indices = surface->GetQueueFamilyIndices();
+
     if (indices.presentFamily.has_value())
     {
         vkGetDeviceQueue(m_VkDevice, indices.presentFamily.value(), 0, &m_VkPresentQueue);
@@ -45,14 +48,24 @@ ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
 
     m_Surface = nullptr;
 
-    // Release semaphores here as they persist across SwapChain recreation
+        // Release semaphores here as they persist across SwapChain recreation
+
     auto* factory = m_Device->GetFactory();
     for (auto h : m_ImageAvailableSemaphores) factory->ReleaseSemaphore(h);
     for (auto h : m_RenderFinishSemaphores) factory->ReleaseSemaphore(h);
+    for (auto h : m_RenderFinishSemaphoreSharedHandles) { if (h) CloseHandle((HANDLE)h); }
+    for (auto& pair : m_ConsumedSemaphoreSharedHandles)
+    {
+        if (pair.first) CloseHandle((HANDLE)pair.first);
+        if (pair.second.IsValid()) factory->ReleaseSemaphore(pair.second);
+    }
     m_ImageAvailableSemaphores.clear();
     m_RenderFinishSemaphores.clear();
+        m_RenderFinishSemaphoreSharedHandles.clear();
+    m_ConsumedSemaphoreSharedHandles.clear();
 
     // Safety wait to ensure GPU is not using the swapchain
+
     // TODO: maybe we dont need to WaitForDevice,    // Targeted wait for presentation related work
     if (m_Device)
     {
@@ -396,9 +409,12 @@ void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
     ARISEN_PROFILE_ZONE("RHI::VulkanPresent");
     if (m_VkSurface == VK_NULL_HANDLE)
     {
-        // Headless swapchain doesn't present to a surface
-        // But for interop, we ensure the image is in SHADER_READ_ONLY_OPTIMAL layout
-        // so that the consumer (Avalonia/D3D11) can read it correctly.
+                        // Headless swapchain doesn't present to a surface. Avalonia's Vulkan
+        // compositor imports the external memory as a transfer source (matching
+        // the official Avalonia Vulkan interop sample), so the RenderGraph must
+        // leave the image in TRANSFER_SRC_OPTIMAL before this point.
+
+
         UInt32 index = m_AcquiredImageIndices[frameIndex % m_MaxFramesInFlight];
         RHIImageHandle hImage = m_ImageHandles[index];
         
@@ -407,15 +423,17 @@ void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
         
         if (imageItem && imageItem->image != VK_NULL_HANDLE)
         {
-            // Transition to SHADER_READ_ONLY_OPTIMAL if not already there
-            if (imageItem->currentLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                                    // Track the layout that the RenderGraph exported for Avalonia.
+            if (imageItem->currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+
             {
                 // We don't submit a separate command buffer here to avoid overhead.
                 // Instead, we trust the engine's RenderGraph to have transitioned it.
                 // However, we UPDATE the tracked layout so the RHI knows its state.
-                imageItem->currentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                                imageItem->currentLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             }
         }
+
         return;
     }
 
@@ -489,7 +507,124 @@ void* ArisenEngine::RHI::RHIVkSwapChain::GetSharedWin32Handle(UInt32 index)
     return m_SharedHandles[index];
 }
 
+UInt64 ArisenEngine::RHI::RHIVkSwapChain::GetSharedMemorySize(UInt32 index)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    if (m_ImageHandles.empty()) return 0;
+
+    index = index % (UInt32)m_ImageHandles.size();
+
+    auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+    auto* imageItem = vkDevice ? vkDevice->GetImagePool()->Get(m_ImageHandles[index]) : nullptr;
+    return imageItem ? imageItem->size : 0;
+}
+
+void* ArisenEngine::RHI::RHIVkSwapChain::GetRenderFinishedSemaphoreWin32Handle(UInt32 frameIndex)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    if (m_RenderFinishSemaphores.empty()) return nullptr;
+
+    UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+    if (currentFrame >= m_RenderFinishSemaphores.size()) return nullptr;
+
+    if (currentFrame >= m_RenderFinishSemaphoreSharedHandles.size())
+    {
+        m_RenderFinishSemaphoreSharedHandles.resize(m_RenderFinishSemaphores.size(), nullptr);
+    }
+
+    if (m_RenderFinishSemaphoreSharedHandles[currentFrame])
+    {
+        return m_RenderFinishSemaphoreSharedHandles[currentFrame];
+    }
+
+    auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(m_RenderFinishSemaphores[currentFrame]);
+    if (!semItem || semItem->semaphore == VK_NULL_HANDLE) return nullptr;
+
+    auto vkGetSemaphoreWin32HandleKHR =
+        (PFN_vkGetSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(m_VkDevice, "vkGetSemaphoreWin32HandleKHR");
+    if (!vkGetSemaphoreWin32HandleKHR)
+    {
+        LOG_ERROR("[RHIVkSwapChain::GetRenderFinishedSemaphoreWin32Handle]: vkGetSemaphoreWin32HandleKHR proc not found!");
+        return nullptr;
+    }
+
+    VkSemaphoreGetWin32HandleInfoKHR handleInfo{};
+    handleInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
+    handleInfo.semaphore = semItem->semaphore;
+    handleInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+    HANDLE win32Handle = nullptr;
+    if (vkGetSemaphoreWin32HandleKHR(m_VkDevice, &handleInfo, &win32Handle) != VK_SUCCESS)
+    {
+        LOG_ERROR("[RHIVkSwapChain::GetRenderFinishedSemaphoreWin32Handle]: Failed to export render-finished semaphore handle.");
+        return nullptr;
+    }
+
+    m_RenderFinishSemaphoreSharedHandles[currentFrame] = win32Handle;
+    return win32Handle;
+}
+
+void* ArisenEngine::RHI::RHIVkSwapChain::CreateConsumedSemaphoreWin32Handle(UInt32 frameIndex)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+
+    auto* factory = m_Device->GetFactory();
+    auto semHandle = factory->CreateSemaphore();
+    if (!semHandle.IsValid()) return nullptr;
+
+    auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(semHandle);
+    if (!semItem || semItem->semaphore == VK_NULL_HANDLE)
+    {
+        factory->ReleaseSemaphore(semHandle);
+        return nullptr;
+    }
+
+    auto vkGetSemaphoreWin32HandleKHR =
+        (PFN_vkGetSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(m_VkDevice, "vkGetSemaphoreWin32HandleKHR");
+    if (!vkGetSemaphoreWin32HandleKHR)
+    {
+        LOG_ERROR("[RHIVkSwapChain::CreateConsumedSemaphoreWin32Handle]: vkGetSemaphoreWin32HandleKHR proc not found!");
+        factory->ReleaseSemaphore(semHandle);
+        return nullptr;
+    }
+
+    VkSemaphoreGetWin32HandleInfoKHR handleInfo{};
+    handleInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
+    handleInfo.semaphore = semItem->semaphore;
+    handleInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+    HANDLE win32Handle = nullptr;
+    if (vkGetSemaphoreWin32HandleKHR(m_VkDevice, &handleInfo, &win32Handle) != VK_SUCCESS)
+    {
+        LOG_ERROR("[RHIVkSwapChain::CreateConsumedSemaphoreWin32Handle]: Failed to export consumed semaphore handle.");
+        factory->ReleaseSemaphore(semHandle);
+        return nullptr;
+    }
+
+    m_ConsumedSemaphoreSharedHandles.emplace_back((void*)win32Handle, semHandle);
+    return win32Handle;
+}
+
+void ArisenEngine::RHI::RHIVkSwapChain::ReleaseConsumedSemaphoreWin32Handle(void* handle)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    if (!handle) return;
+
+    auto* factory = m_Device->GetFactory();
+    for (auto it = m_ConsumedSemaphoreSharedHandles.begin(); it != m_ConsumedSemaphoreSharedHandles.end(); ++it)
+    {
+        if (it->first == handle)
+        {
+            CloseHandle((HANDLE)it->first);
+            if (it->second.IsValid()) factory->ReleaseSemaphore(it->second);
+            m_ConsumedSemaphoreSharedHandles.erase(it);
+            return;
+        }
+    }
+}
+
 void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
+
 {
     ARISEN_PROFILE_ZONE("RHI::VulkanRecreateSwapChain");
     if (m_VkSurface == VK_NULL_HANDLE && m_ImageHandles.empty())

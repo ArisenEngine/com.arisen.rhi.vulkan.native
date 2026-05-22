@@ -863,12 +863,14 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageDeviceMemory(RHIImageHandle handl
 
     if (image->bExportSharedWin32Handle)
     {
-        // Allocate raw memory and bypass VMA for Windows shared handle
+                // Allocate raw memory and bypass VMA for Windows shared handle
         VkMemoryRequirements memReqs;
         vkGetImageMemoryRequirements(m_VkDevice, image->image, &memReqs);
+        image->size = memReqs.size;
 
         VkMemoryAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+
         allocInfo.allocationSize = memReqs.size;
         allocInfo.memoryTypeIndex = FindMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 

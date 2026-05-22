@@ -1,5 +1,6 @@
 #pragma once
 #include <mutex>
+#include <utility>
 #include "Presentation/RHIVkSurface.h"
 #include "RHI/Handles/RHIHandle.h"
 #include "RHI/Presentation/RHISwapChain.h"
@@ -27,7 +28,12 @@ namespace ArisenEngine::RHI
         void Present(UInt32 frameIndex) override;
         bool HasAcquiredImage(UInt32 frameIndex) const;
         void* GetSharedWin32Handle(UInt32 index) override;
+        UInt64 GetSharedMemorySize(UInt32 index) override;
+        void* GetRenderFinishedSemaphoreWin32Handle(UInt32 frameIndex) override;
+        void* CreateConsumedSemaphoreWin32Handle(UInt32 frameIndex) override;
+        void ReleaseConsumedSemaphoreWin32Handle(void* handle) override;
         void SetResolution(UInt32 width, UInt32 height) override;
+
 
     protected:
         void RecreateSwapChainIfNeeded() override;
@@ -44,6 +50,8 @@ namespace ArisenEngine::RHI
 
         Containers::Vector<RHISemaphoreHandle> m_ImageAvailableSemaphores;
         Containers::Vector<RHISemaphoreHandle> m_RenderFinishSemaphores;
+        Containers::Vector<void*> m_RenderFinishSemaphoreSharedHandles;
+        Containers::Vector<std::pair<void*, RHISemaphoreHandle>> m_ConsumedSemaphoreSharedHandles;
         Containers::Vector<uint32_t> m_AcquiredImageIndices;
         Containers::Vector<VkResult> m_AcquisitionResults;
         VkQueue m_VkPresentQueue;

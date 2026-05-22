@@ -32,11 +32,14 @@ namespace ArisenEngine::RHI
             VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
             VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
             VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME,
-            VK_KHR_MAINTENANCE_2_EXTENSION_NAME,
+                        VK_KHR_MAINTENANCE_2_EXTENSION_NAME,
             VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
             VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-            "VK_KHR_external_memory_win32"
+            "VK_KHR_external_memory_win32",
+            VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+            "VK_KHR_external_semaphore_win32"
         };
+
         return settings;
     }
 }
@@ -743,18 +746,19 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
             {
                 enabledExtensions.push_back(extensionName);
             }
-            else if (mandatory)
+                        else if (mandatory)
             {
-        LOG_WARN(
+                LOG_WARN(
                     String::Format("[RHIVkInstance::CreateLogicDevice]: mandatory device extension not supported: %s",
                         extensionName));
             }
             else
             {
-        LOG_INFO(
+                LOG_INFO(
                     String::Format("[RHIVkInstance::CreateLogicDevice]: optional device extension not supported: %s",
                         extensionName));
             }
+
         }
     };
 
@@ -762,25 +766,31 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
     checkAndEnable(m_Settings.optionalDeviceExtensions, false);
 
     // Mandatory Check for Virtual Viewport Interop (identified by bit-flag 0x80000000)
-    if ((windowId & 0x80000000) || windowId == ~0u)
+        if ((windowId & 0x80000000) || windowId == ~0u)
     {
         bool hasExternalMemory = false;
+
         bool hasExternalMemoryWin32 = false;
+        bool hasExternalSemaphore = false;
+        bool hasExternalSemaphoreWin32 = false;
         for (const char* ext : enabledExtensions)
         {
             if (strcmp(ext, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME) == 0) hasExternalMemory = true;
             if (strcmp(ext, "VK_KHR_external_memory_win32") == 0) hasExternalMemoryWin32 = true;
+            if (strcmp(ext, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME) == 0) hasExternalSemaphore = true;
+            if (strcmp(ext, "VK_KHR_external_semaphore_win32") == 0) hasExternalSemaphoreWin32 = true;
         }
 
-        if (!hasExternalMemory || !hasExternalMemoryWin32)
+        if (!hasExternalMemory || !hasExternalMemoryWin32 || !hasExternalSemaphore || !hasExternalSemaphoreWin32)
         {
-            LOG_FATAL("[RHIVkInstance::CreateLogicDevice]: Physical Device does not support VK_KHR_external_memory_win32! Headless interop will fail.");
+            LOG_FATAL("[RHIVkInstance::CreateLogicDevice]: Physical Device does not support Win32 external memory/semaphore interop! Headless interop will fail.");
         }
         else
         {
-            LOG_INFO("[RHIVkInstance::CreateLogicDevice]: Win32 External Memory Interop validated for virtual surface.");
+                        LOG_INFO("[RHIVkInstance::CreateLogicDevice]: Win32 External Memory/Semaphore Interop validated for virtual surface.");
         }
     }
+
 
     // Set Device Features
     VkPhysicalDeviceFeatures features{};

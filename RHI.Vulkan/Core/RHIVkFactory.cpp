@@ -247,22 +247,29 @@ namespace ArisenEngine::RHI
         m_Device->ReleaseSampler(samplerHandle);
     }
 
-    RHISemaphoreHandle RHIVkFactory::CreateSemaphore()
+        RHISemaphoreHandle RHIVkFactory::CreateSemaphore()
+
     {
         return m_Device->GetSemaphorePool()->Allocate([this](RHIVkSemaphorePoolItem* sem)
         {
             *sem = RHIVkSemaphorePoolItem();
             ARISEN_PROFILE_ZONE("Vk::CreateSemaphore");
+            VkExportSemaphoreCreateInfo exportInfo{};
+            exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+            exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
             VkSemaphoreCreateInfo createInfo{};
             createInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            createInfo.pNext = &exportInfo;
 
-            if (vkCreateSemaphore(static_cast<VkDevice>(m_Device->GetHandle()),
+                        if (vkCreateSemaphore(static_cast<VkDevice>(m_Device->GetHandle()),
                                   &createInfo, nullptr,
                                   &sem->semaphore) != VK_SUCCESS)
             {
                 LOG_ERROR("[RHIVkFactory::CreateSemaphore]: failed to create "
                     "semaphore!");
             }
+
 
             struct DeferredVkSemaphore
             {
