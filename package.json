@@ -1,14 +1,35 @@
 {
   "id": "com.arisen.rhi.vulkan.native",
-  "name": "",
+  "name": "Arisen Vulkan RHI Backend",
   "version": "1.0.0",
   "layer": "driver",
   "description": "C\u002B\u002B payload for the Vulkan rendering hardware interface driver backend.",
-  "type": "native",
+  "type": "hybrid",
   "entry": {
-    "assembly": "Com.Arisen.Rhi.Vulkan.Native.dll"
+    "assembly": "Com.Arisen.Rhi.Vulkan.Native.dll",
+    "class": "ArisenEngine.RHI.Vulkan.Native.VulkanRHIPackage"
+  },
+  "services": {
+    "provides": [
+      {
+        "interface": "ArisenKernel.Contracts.IRHIBackend",
+        "priority": 100,
+        "capabilities": [
+          "vulkan"
+        ]
+      },
+      {
+        "interface": "ArisenKernel.Contracts.IRHIDevice",
+        "priority": 100,
+        "capabilities": [
+          "vulkan"
+        ],
+        "deferred": true
+      }
+    ]
   },
   "dependencies": {
+    "com.arisen.core": "1.0.0",
     "com.arisen.core.native": "1.0.0"
   },
   "nativeRuntimes": {

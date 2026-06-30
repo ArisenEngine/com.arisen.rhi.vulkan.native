@@ -1,5 +1,6 @@
 {
   "entry": {
-    "assembly": "Com.Arisen.Rhi.Vulkan.Native.dll"
+    "assembly": "Com.Arisen.Rhi.Vulkan.Native.dll",
+    "class": "ArisenEngine.RHI.Vulkan.Native.VulkanRHIPackage"
   }
 }
