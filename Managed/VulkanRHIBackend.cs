@@ -60,33 +60,41 @@ public sealed class VulkanRHIBackend : IRHIBackend
         }
 
         var windowInfo = windowProvider.GetWindowInfo();
-        if (windowInfo.SurfaceKind != WindowSurfaceKind.Win32 || windowInfo.NativeHandle == IntPtr.Zero)
+        if (windowInfo.SurfaceKind != WindowSurfaceKind.Win32 ||
+            windowInfo.NativeHandle == IntPtr.Zero)
         {
             KernelLog.ErrorFormat(
-                "[VulkanRHIBackend] Runtime Vulkan initialization requires a Win32 native window. SurfaceKind={0}, Handle=0x{1:X}",
+                "[VulkanRHIBackend] Runtime Vulkan initialization requires a Win32 native window. SurfaceKind={0}, Handle=0x{1:X}, SurfaceId=0x{2:X}",
                 windowInfo.SurfaceKind,
-                windowInfo.NativeHandle.ToInt64());
+                windowInfo.NativeHandle.ToInt64(),
+                windowInfo.NativeSurfaceId);
             return false;
         }
 
         KernelLog.InfoFormat(
-            "[VulkanRHIBackend] Runtime Win32 window ready. Handle=0x{0:X}, Size={1}x{2}, DpiScale={3:F2}",
+            "[VulkanRHIBackend] Runtime Win32 window ready. Handle=0x{0:X}, SurfaceId=0x{1:X}, Size={2}x{3}, DpiScale={4:F2}",
             windowInfo.NativeHandle.ToInt64(),
+            windowInfo.NativeSurfaceId,
             windowInfo.Width,
             windowInfo.Height,
             windowInfo.DpiScale);
 
-        // TODO: Replace the temporary device-only bootstrap with native Win32 surface and
-        // swapchain creation once the managed RHI surface contract is finalized.
         return InitializeDeviceOnlyBackend(
             services,
-            RHISystem.DefaultVirtualSurfaceID,
+            windowInfo.NativeSurfaceId,
             Math.Max(1, windowInfo.Width),
             Math.Max(1, windowInfo.Height),
-            mode: "RuntimeWin32WindowValidated");
+            mode: "RuntimeWin32Swapchain",
+            initializeSwapChain: true);
     }
 
-    private bool InitializeDeviceOnlyBackend(IServiceRegistry services, uint surfaceId, int width, int height, string mode)
+    private bool InitializeDeviceOnlyBackend(
+        IServiceRegistry services,
+        uint surfaceId,
+        int width,
+        int height,
+        string mode,
+        bool initializeSwapChain = false)
     {
         try
         {
@@ -98,6 +106,21 @@ public sealed class VulkanRHIBackend : IRHIBackend
 
             var rhiDevice = RHISystem.GetOrCreateDevice(surfaceId, (uint)width, (uint)height);
             rhiDevice.SetResolution((uint)width, (uint)height);
+            LogInstanceDiagnostics(rhiDevice.GetInstance(), mode);
+
+            if (initializeSwapChain)
+            {
+                var rhiSurface = rhiDevice.GetSurface();
+                var swapChain = rhiSurface.GetSwapChain();
+                if (!swapChain.IsValid)
+                {
+                    KernelLog.ErrorFormat("[VulkanRHIBackend] Swapchain initialization failed. Mode={0}, Surface=0x{1:X}", mode, surfaceId);
+                    return false;
+                }
+
+                KernelLog.InfoFormat("[VulkanRHIBackend] Runtime swapchain initialized. Surface=0x{0:X}, Size={1}x{2}", surfaceId, width, height);
+                LogSwapChainDiagnostics(rhiDevice.GetInstance(), surfaceId);
+            }
 
             using var registrationScope = services is ServiceRegistry registry
                 ? registry.BeginPackageRegistration(VulkanRHIPackage.PackageId)
@@ -118,6 +141,42 @@ public sealed class VulkanRHIBackend : IRHIBackend
             KernelLog.ErrorFormat("[VulkanRHIBackend] Device initialization failed. Mode={0}, Error={1}", mode, e.Message);
             return false;
         }
+    }
+
+    private static void LogInstanceDiagnostics(RHIInstance instance, string mode)
+    {
+        if (!instance.IsValid)
+        {
+            KernelLog.WarningFormat("[VulkanRHIBackend] RHI instance diagnostics unavailable. Mode={0}", mode);
+            return;
+        }
+
+        KernelLog.InfoFormat(
+            "[VulkanRHIBackend] RHI instance ready. Mode={0}, Validation={1}, MaxFramesInFlight={2}, PhysicalDeviceAvailable={3}, SurfacesAvailable={4}",
+            mode,
+            instance.IsValidationEnabled,
+            instance.MaxFramesInFlight,
+            instance.IsPhysicalDeviceAvailable,
+            instance.AreSurfacesAvailable);
+    }
+
+    private static void LogSwapChainDiagnostics(RHIInstance instance, uint surfaceId)
+    {
+        if (!instance.IsValid)
+        {
+            KernelLog.WarningFormat("[VulkanRHIBackend] Swapchain diagnostics unavailable. Surface=0x{0:X}", surfaceId);
+            return;
+        }
+
+        var format = instance.GetSuitableSwapChainFormat(surfaceId);
+        var presentMode = instance.GetSuitablePresentMode(surfaceId);
+        KernelLog.InfoFormat(
+            "[VulkanRHIBackend] Runtime swapchain diagnostics. Surface=0x{0:X}, Format={1}, PresentMode={2}, LinearColorSpace={3}, FifoSupported={4}",
+            surfaceId,
+            format,
+            presentMode,
+            instance.IsLinearColorSpaceSupported(surfaceId),
+            instance.IsPresentModeSupported(surfaceId, EPresentMode.PRESENT_MODE_FIFO));
     }
 
     public void Shutdown()
