@@ -27,13 +27,77 @@ public sealed class VulkanRHIBackend : IRHIBackend
         {
             PreloadRenderDoc();
 
+#if ARISEN_ENGINE_EDITOR
+            return InitializeEditorBackend(services);
+#else
+            return InitializeRuntimeBackend(services);
+#endif
+        }
+        catch (Exception e)
+        {
+            KernelLog.ErrorFormat("[VulkanRHIBackend] Graphics init failed: {0}", e.Message);
+            return false;
+        }
+    }
+
+    private bool InitializeEditorBackend(IServiceRegistry services)
+    {
+        KernelLog.Info("[VulkanRHIBackend] Initializing Vulkan for editor build. Standalone native window is not required.");
+        return InitializeDeviceOnlyBackend(
+            services,
+            RHISystem.DefaultVirtualSurfaceID,
+            width: 1920,
+            height: 1080,
+            mode: "EditorVirtualSurface");
+    }
+
+    private bool InitializeRuntimeBackend(IServiceRegistry services)
+    {
+        if (!services.TryGetService<IWindowProvider>(out var windowProvider))
+        {
+            KernelLog.Error("[VulkanRHIBackend] Runtime Vulkan initialization requires IWindowProvider, but none is registered.");
+            return false;
+        }
+
+        var windowInfo = windowProvider.GetWindowInfo();
+        if (windowInfo.SurfaceKind != WindowSurfaceKind.Win32 || windowInfo.NativeHandle == IntPtr.Zero)
+        {
+            KernelLog.ErrorFormat(
+                "[VulkanRHIBackend] Runtime Vulkan initialization requires a Win32 native window. SurfaceKind={0}, Handle=0x{1:X}",
+                windowInfo.SurfaceKind,
+                windowInfo.NativeHandle.ToInt64());
+            return false;
+        }
+
+        KernelLog.InfoFormat(
+            "[VulkanRHIBackend] Runtime Win32 window ready. Handle=0x{0:X}, Size={1}x{2}, DpiScale={3:F2}",
+            windowInfo.NativeHandle.ToInt64(),
+            windowInfo.Width,
+            windowInfo.Height,
+            windowInfo.DpiScale);
+
+        // TODO: Replace the temporary device-only bootstrap with native Win32 surface and
+        // swapchain creation once the managed RHI surface contract is finalized.
+        return InitializeDeviceOnlyBackend(
+            services,
+            RHISystem.DefaultVirtualSurfaceID,
+            Math.Max(1, windowInfo.Width),
+            Math.Max(1, windowInfo.Height),
+            mode: "RuntimeWin32WindowValidated");
+    }
+
+    private bool InitializeDeviceOnlyBackend(IServiceRegistry services, uint surfaceId, int width, int height, string mode)
+    {
+        try
+        {
             if (!RHISystem.Initialize(GraphicsAPI.Vulkan, validationLayer: true))
             {
+                KernelLog.ErrorFormat("[VulkanRHIBackend] RHISystem.Initialize failed. Mode={0}", mode);
                 return false;
             }
 
-            var rhiDevice = RHISystem.GetOrCreateDevice(RHISystem.DefaultVirtualSurfaceID);
-            rhiDevice.SetResolution(1920, 1080);
+            var rhiDevice = RHISystem.GetOrCreateDevice(surfaceId, (uint)width, (uint)height);
+            rhiDevice.SetResolution((uint)width, (uint)height);
 
             using var registrationScope = services is ServiceRegistry registry
                 ? registry.BeginPackageRegistration(VulkanRHIPackage.PackageId)
@@ -41,11 +105,17 @@ public sealed class VulkanRHIBackend : IRHIBackend
 
             services.RegisterService<IRHIDevice>(new VulkanRHIDevice(rhiDevice.Handle));
             IsInitialized = true;
+            KernelLog.InfoFormat(
+                "[VulkanRHIBackend] Registered IRHIDevice. Mode={0}, Surface=0x{1:X}, Size={2}x{3}",
+                mode,
+                surfaceId,
+                width,
+                height);
             return true;
         }
         catch (Exception e)
         {
-            KernelLog.ErrorFormat("[VulkanRHIBackend] Graphics init failed: {0}", e.Message);
+            KernelLog.ErrorFormat("[VulkanRHIBackend] Device initialization failed. Mode={0}, Error={1}", mode, e.Message);
             return false;
         }
     }
