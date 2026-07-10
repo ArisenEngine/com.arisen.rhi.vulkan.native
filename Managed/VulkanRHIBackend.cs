@@ -100,7 +100,10 @@ public sealed class VulkanRHIBackend : IRHIBackend
         {
             if (!RHISystem.Initialize(GraphicsAPI.Vulkan, validationLayer: true))
             {
-                KernelLog.ErrorFormat("[VulkanRHIBackend] RHISystem.Initialize failed. Mode={0}", mode);
+                KernelLog.ErrorFormat(
+                    "[VulkanRHIBackend] RHISystem.Initialize failed. Mode={0}, Reason={1}",
+                    mode,
+                    FormatDiagnosticReason(RHISystem.LastInitializationError));
                 return false;
             }
 
@@ -138,9 +141,18 @@ public sealed class VulkanRHIBackend : IRHIBackend
         }
         catch (Exception e)
         {
-            KernelLog.ErrorFormat("[VulkanRHIBackend] Device initialization failed. Mode={0}, Error={1}", mode, e.Message);
+            KernelLog.ErrorFormat(
+                "[VulkanRHIBackend] Device initialization failed. Mode={0}, Error={1}, NativeReason={2}",
+                mode,
+                e.Message,
+                FormatDiagnosticReason(RHISystem.LastInitializationError));
             return false;
         }
+    }
+
+    private static string FormatDiagnosticReason(string? value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? "<none>" : value;
     }
 
     private static void LogInstanceDiagnostics(RHIInstance instance, string mode)
@@ -158,6 +170,20 @@ public sealed class VulkanRHIBackend : IRHIBackend
             instance.MaxFramesInFlight,
             instance.IsPhysicalDeviceAvailable,
             instance.AreSurfacesAvailable);
+        KernelLog.InfoFormat(
+            "[VulkanRHIBackend] Selected adapter. Name={0}, Type={1}, {2}",
+            instance.AdapterName,
+            instance.AdapterTypeName,
+            instance.AdapterDriverInfo);
+        KernelLog.InfoFormat(
+            "[VulkanRHIBackend] Enabled instance extensions: {0}",
+            instance.EnabledInstanceExtensions);
+        KernelLog.InfoFormat(
+            "[VulkanRHIBackend] Enabled device extensions: {0}",
+            instance.EnabledDeviceExtensions);
+        KernelLog.InfoFormat(
+            "[VulkanRHIBackend] Missing device extensions: {0}",
+            instance.MissingDeviceExtensions);
     }
 
     private static void LogSwapChainDiagnostics(RHIInstance instance, uint surfaceId)

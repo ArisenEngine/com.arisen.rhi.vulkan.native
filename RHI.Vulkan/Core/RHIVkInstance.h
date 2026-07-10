@@ -52,6 +52,12 @@ namespace ArisenEngine::RHI
         {
             return String::Format("vulkan%d.%d", m_VulkanVersion.major, m_VulkanVersion.minor);
         };
+        String GetAdapterName() const override;
+        String GetAdapterTypeName() const override;
+        String GetAdapterDriverInfo() const override;
+        String GetEnabledInstanceExtensions() const override;
+        String GetEnabledDeviceExtensions() const override;
+        String GetMissingDeviceExtensions() const override;
 
         VkInstance GetVkInstance() const { return m_VkInstance; }
         VkPhysicalDevice GetPhysicalDevice() const { return m_CurrentPhysicsDevice; }
@@ -80,6 +86,10 @@ namespace ArisenEngine::RHI
         // devices
         VkPhysicalDevice m_CurrentPhysicsDevice{VK_NULL_HANDLE};
         VkPhysicalDeviceProperties m_DeviceProperties{};
+        Containers::Vector<String> m_EnabledInstanceExtensions;
+        Containers::Vector<String> m_EnabledDeviceExtensions;
+        Containers::Vector<String> m_MissingMandatoryDeviceExtensions;
+        Containers::Vector<String> m_MissingOptionalDeviceExtensions;
 
         VulkanVersion m_VulkanVersion;
 

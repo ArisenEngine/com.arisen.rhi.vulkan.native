@@ -801,8 +801,21 @@ namespace ArisenEngine::RHI
                                                                 ? barrier.dstStageMask
                                                                 : dstStage);
             vkBarrier.dstAccessMask = MapAccessFlags2(barrier.dstAccess);
-            vkBarrier.srcQueueFamilyIndex = barrier.srcQueueFamilyIndex;
-            vkBarrier.dstQueueFamilyIndex = barrier.dstQueueFamilyIndex;
+            auto srcQueueFamilyIndex = barrier.srcQueueFamilyIndex;
+            auto dstQueueFamilyIndex = barrier.dstQueueFamilyIndex;
+            if (srcQueueFamilyIndex == RHI_QUEUE_FAMILY_IGNORED &&
+                dstQueueFamilyIndex == RHI_QUEUE_FAMILY_EXTERNAL)
+            {
+                srcQueueFamilyIndex = static_cast<RHIVkCommandBufferPool*>(cmd->GetOwner())->GetQueueFamilyIndex();
+            }
+            else if (dstQueueFamilyIndex == RHI_QUEUE_FAMILY_IGNORED &&
+                     srcQueueFamilyIndex == RHI_QUEUE_FAMILY_EXTERNAL)
+            {
+                dstQueueFamilyIndex = static_cast<RHIVkCommandBufferPool*>(cmd->GetOwner())->GetQueueFamilyIndex();
+            }
+
+            vkBarrier.srcQueueFamilyIndex = srcQueueFamilyIndex;
+            vkBarrier.dstQueueFamilyIndex = dstQueueFamilyIndex;
             vkBarrier.oldLayout = static_cast<VkImageLayout>(barrier.oldLayout);
             vkBarrier.newLayout = static_cast<VkImageLayout>(barrier.newLayout);
             vkBarrier.image = img->image;

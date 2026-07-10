@@ -506,4 +506,19 @@ namespace ArisenEngine::RHI
     {
         return m_Device->RegisterBindlessResource(sampler);
     }
+
+    void RHIVkFactory::UnregisterBindlessResourceImage(UInt32 bindlessIndex)
+    {
+        m_Device->UnregisterBindlessResourceImage(bindlessIndex);
+    }
+
+    void RHIVkFactory::UnregisterBindlessResourceBuffer(UInt32 bindlessIndex)
+    {
+        m_Device->UnregisterBindlessResourceBuffer(bindlessIndex);
+    }
+
+    void RHIVkFactory::UnregisterBindlessResourceSampler(UInt32 bindlessIndex)
+    {
+        m_Device->UnregisterBindlessResourceSampler(bindlessIndex);
+    }
 }

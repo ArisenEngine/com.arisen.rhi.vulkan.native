@@ -391,6 +391,21 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDevice::RegisterBindlessResource(RH
     return m_BindlessManager->RegisterSampler(sampler);
 }
 
+void ArisenEngine::RHI::RHIVkDevice::UnregisterBindlessResourceImage(UInt32 bindlessIndex)
+{
+    m_BindlessManager->UnregisterImage(bindlessIndex);
+}
+
+void ArisenEngine::RHI::RHIVkDevice::UnregisterBindlessResourceBuffer(UInt32 bindlessIndex)
+{
+    m_BindlessManager->UnregisterBuffer(bindlessIndex);
+}
+
+void ArisenEngine::RHI::RHIVkDevice::UnregisterBindlessResourceSampler(UInt32 bindlessIndex)
+{
+    m_BindlessManager->UnregisterSampler(bindlessIndex);
+}
+
 void ArisenEngine::RHI::RHIVkDevice::SetObjectName(ERHIObjectType type, UInt64 handle, const char* name)
 {
     if (vkSetDebugUtilsObjectNameEXT == nullptr) return;

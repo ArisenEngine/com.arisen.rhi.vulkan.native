@@ -126,6 +126,9 @@ namespace ArisenEngine::RHI
         UInt32 RegisterBindlessResource(RHIImageViewHandle image);
         UInt32 RegisterBindlessResource(RHIBufferHandle buffer);
         UInt32 RegisterBindlessResource(RHISamplerHandle sampler);
+        void UnregisterBindlessResourceImage(UInt32 bindlessIndex);
+        void UnregisterBindlessResourceBuffer(UInt32 bindlessIndex);
+        void UnregisterBindlessResourceSampler(UInt32 bindlessIndex);
 
         // Debug & Naming
         void SetObjectName(ERHIObjectType type, UInt64 handle, const char* name) override;

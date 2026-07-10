@@ -34,7 +34,12 @@
   },
   "nativeRuntimes": {
     "win-x64": [
-      "RHI.Vulkan.dll",
+      {
+        "path": "RHI.Vulkan.dll",
+        "exports": [
+          "CreateInstance"
+        ]
+      },
       "3rdparty/vulkan/Layers/VkLayer_khronos_validation.dll",
       "3rdparty/vulkan/Layers/VkLayer_khronos_validation.json",
       "3rdparty/vulkan/Layers/VkLayer_crash_diagnostic.dll",

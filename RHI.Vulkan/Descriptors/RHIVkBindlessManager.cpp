@@ -271,6 +271,11 @@ namespace ArisenEngine::RHI
 
     void RHIVkBindlessManager::ReleaseIndex(FreeList& list, UInt32 index)
     {
+        if (index == 0xFFFFFFFF || index >= list.capacity)
+        {
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(list.mutex);
         list.freeIndices.push_back(index);
     }

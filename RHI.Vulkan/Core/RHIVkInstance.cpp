@@ -5,6 +5,116 @@ using namespace ArisenEngine;
 #include "Windowing/RenderWindowAPI.h"
 #include "Windowing/RenderWindowAPI.h"
 
+namespace
+{
+    const char* ToVkPhysicalDeviceTypeName(VkPhysicalDeviceType type)
+    {
+        switch (type)
+        {
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+            return "IntegratedGPU";
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+            return "DiscreteGPU";
+        case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+            return "VirtualGPU";
+        case VK_PHYSICAL_DEVICE_TYPE_CPU:
+            return "CPU";
+        case VK_PHYSICAL_DEVICE_TYPE_OTHER:
+            return "Other";
+        default:
+            return "Unknown";
+        }
+    }
+
+    ArisenEngine::String JoinStrings(const ArisenEngine::Containers::Vector<ArisenEngine::String>& values)
+    {
+        if (values.empty()) return ArisenEngine::String("<none>");
+
+        std::string result;
+        for (size_t i = 0; i < values.size(); i++)
+        {
+            if (i > 0) result += ", ";
+            result += values[i].GetString();
+        }
+
+        return ArisenEngine::String(result);
+    }
+
+    ArisenEngine::String JoinNames(const ArisenEngine::Containers::Vector<const char*>& values)
+    {
+        if (values.empty()) return ArisenEngine::String("<none>");
+
+        std::string result;
+        for (size_t i = 0; i < values.size(); i++)
+        {
+            if (i > 0) result += ", ";
+            result += values[i];
+        }
+
+        return ArisenEngine::String(result);
+    }
+
+    const char* ToVkResultName(VkResult result)
+    {
+        switch (result)
+        {
+        case VK_SUCCESS:
+            return "VK_SUCCESS";
+        case VK_NOT_READY:
+            return "VK_NOT_READY";
+        case VK_TIMEOUT:
+            return "VK_TIMEOUT";
+        case VK_EVENT_SET:
+            return "VK_EVENT_SET";
+        case VK_EVENT_RESET:
+            return "VK_EVENT_RESET";
+        case VK_INCOMPLETE:
+            return "VK_INCOMPLETE";
+        case VK_ERROR_OUT_OF_HOST_MEMORY:
+            return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+            return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED:
+            return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST:
+            return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED:
+            return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT:
+            return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT:
+            return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT:
+            return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER:
+            return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS:
+            return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED:
+            return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_SURFACE_LOST_KHR:
+            return "VK_ERROR_SURFACE_LOST_KHR";
+        case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR:
+            return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+        case VK_SUBOPTIMAL_KHR:
+            return "VK_SUBOPTIMAL_KHR";
+        case VK_ERROR_OUT_OF_DATE_KHR:
+            return "VK_ERROR_OUT_OF_DATE_KHR";
+        default:
+            return "VK_UNKNOWN_RESULT";
+        }
+    }
+
+    bool IsMandatoryInstanceExtension(const char* extensionName, bool validationEnabled)
+    {
+        if (strcmp(extensionName, VK_KHR_SURFACE_EXTENSION_NAME) == 0) return true;
+        if (strcmp(extensionName, "VK_KHR_win32_surface") == 0) return true;
+        if (validationEnabled && strcmp(extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) return true;
+
+        return false;
+    }
+}
+
 namespace ArisenEngine::RHI
 {
     VulkanInitSettings VulkanInitSettings::GetDefault()
@@ -96,11 +206,22 @@ int RateDeviceSuitability(VkPhysicalDevice device)
     // Application can't function without geometry, tessellation shaders and wireframe support
     if (!deviceFeatures.geometryShader || !deviceFeatures.tessellationShader || !deviceFeatures.fillModeNonSolid)
     {
+        LOG_WARN(
+            String::Format(
+                "[RHIVkInstance::RateDeviceSuitability]: rejecting adapter '%s': required features missing. geometryShader=%d, tessellationShader=%d, fillModeNonSolid=%d",
+                deviceProperties.deviceName,
+                deviceFeatures.geometryShader,
+                deviceFeatures.tessellationShader,
+                deviceFeatures.fillModeNonSolid));
         return 0;
     }
 
     if (!deviceFeatures.samplerAnisotropy)
     {
+        LOG_WARN(
+            String::Format(
+                "[RHIVkInstance::RateDeviceSuitability]: rejecting adapter '%s': samplerAnisotropy is not supported.",
+                deviceProperties.deviceName));
         return 0;
     }
 
@@ -236,6 +357,7 @@ ArisenEngine::RHI::RHIVkInstance::RHIVkInstance(RHIInstanceInfo&& app_info): RHI
     VkLayerSettingsCreateInfoEXT settingsCreateInfo = {};
     VkLayerSettingEXT layerSettings[2] = {};
     Containers::Vector<const char*> filteredExtensions;
+    Containers::Vector<String> missingMandatoryInstanceExtensions;
 
     // shows all supported extensions
     uint32_t extensionCount = 0;
@@ -250,6 +372,41 @@ ArisenEngine::RHI::RHIVkInstance::RHIVkInstance(RHIInstanceInfo&& app_info): RHI
         LOG_DEBUG(extension.extensionName);
     }
 #endif
+
+    auto filterInstanceExtension = [&](const char* extensionName)
+    {
+        bool found = false;
+        for (const auto& ext : extensions)
+        {
+            if (strcmp(extensionName, ext.extensionName) == 0)
+            {
+                found = true;
+                break;
+            }
+        }
+
+        if (found)
+        {
+            filteredExtensions.push_back(extensionName);
+            return;
+        }
+
+        if (IsMandatoryInstanceExtension(extensionName, app_info.validationLayer))
+        {
+            missingMandatoryInstanceExtensions.push_back(extensionName);
+            LOG_WARN(
+                String::Format("[RHIVkInstance::RHIVkInstance]: mandatory instance extension not supported: %s",
+                    extensionName));
+            return;
+        }
+
+        if (strcmp(extensionName, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME) != 0)
+        {
+            LOG_INFO(
+                String::Format("[RHIVkInstance::RHIVkInstance]: optional instance extension not supported: %s",
+                    extensionName));
+        }
+    };
 
     if (app_info.validationLayer)
     {
@@ -296,33 +453,9 @@ ArisenEngine::RHI::RHIVkInstance::RHIVkInstance(RHIInstanceInfo&& app_info): RHI
                 "[RHIVkInstance::RHIVkInstance]: VK_EXT_layer_settings not supported, using standard debug messenger fallback.");
         }
 
-        // Extensions Slot 
         for (const char* extensionName : m_Settings.instanceExtensions)
         {
-            bool found = false;
-            for (const auto& ext : extensions)
-            {
-                if (strcmp(extensionName, ext.extensionName) == 0)
-                {
-                    found = true;
-                    break;
-                }
-            }
-
-            if (found)
-            {
-                filteredExtensions.push_back(extensionName);
-            }
-            else
-            {
-                // Silence warning for optional extensions
-                if (strcmp(extensionName, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME) != 0)
-                {
-                    LOG_WARN(
-                        String::Format("[RHIVkInstance::RHIVkInstance]: instance extension not supported: %s",
-                            extensionName));
-                }
-            }
+            filterInstanceExtension(extensionName);
         }
 
         createInfo.enabledExtensionCount = static_cast<uint32_t>(filteredExtensions.size());
@@ -333,36 +466,101 @@ ArisenEngine::RHI::RHIVkInstance::RHIVkInstance(RHIInstanceInfo&& app_info): RHI
         createInfo.enabledLayerCount = 0;
         createInfo.pNext = nullptr;
 
-        // Extensions Slot for non-validation case
         for (const char* extensionName : m_Settings.instanceExtensions)
         {
-            // Skip validation layer settings extension if validation is off
             if (strcmp(extensionName, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME) == 0) continue;
-
-            bool found = false;
-            for (const auto& ext : extensions)
-            {
-                if (strcmp(extensionName, ext.extensionName) == 0)
-                {
-                    found = true;
-                    break;
-                }
-            }
-            if (found) filteredExtensions.push_back(extensionName);
+            filterInstanceExtension(extensionName);
         }
 
         createInfo.enabledExtensionCount = static_cast<uint32_t>(filteredExtensions.size());
         createInfo.ppEnabledExtensionNames = filteredExtensions.data();
     }
 
+    if (!missingMandatoryInstanceExtensions.empty())
+    {
+        LOG_FATAL_AND_THROW(
+            String::Format(
+                "[RHIVkInstance::RHIVkInstance]: missing mandatory Vulkan instance extensions: %s. Check the installed Vulkan runtime/driver and platform surface support.",
+                JoinStrings(missingMandatoryInstanceExtensions).GetString()));
+    }
+
+    m_EnabledInstanceExtensions.clear();
+    for (const char* extensionName : filteredExtensions)
+    {
+        m_EnabledInstanceExtensions.push_back(extensionName);
+    }
+
     VkResult result = vkCreateInstance(&createInfo, nullptr, &m_VkInstance);
     if (result != VK_SUCCESS)
     {
         LOG_FATAL_AND_THROW(
-            String::Format("[RHIVkInstance::RHIVkInstance]: failed to create instance! VkResult: %d", (int)result));
+            String::Format(
+                "[RHIVkInstance::RHIVkInstance]: failed to create Vulkan instance. VkResult=%s (%d). Check Vulkan loader/runtime installation and graphics driver compatibility.",
+                ToVkResultName(result),
+                static_cast<int>(result)));
     }
 
     SetupDebugMessager();
+}
+
+String ArisenEngine::RHI::RHIVkInstance::GetAdapterName() const
+{
+    if (m_CurrentPhysicsDevice == VK_NULL_HANDLE) return String("<none>");
+    return String(m_DeviceProperties.deviceName);
+}
+
+String ArisenEngine::RHI::RHIVkInstance::GetAdapterTypeName() const
+{
+    if (m_CurrentPhysicsDevice == VK_NULL_HANDLE) return String("Unavailable");
+    return String(ToVkPhysicalDeviceTypeName(m_DeviceProperties.deviceType));
+}
+
+String ArisenEngine::RHI::RHIVkInstance::GetAdapterDriverInfo() const
+{
+    if (m_CurrentPhysicsDevice == VK_NULL_HANDLE) return String("Unavailable");
+
+    return String::Format(
+        "VendorID=0x%04X, DeviceID=0x%04X, API=%u.%u.%u, Driver=0x%08X",
+        m_DeviceProperties.vendorID,
+        m_DeviceProperties.deviceID,
+        VK_API_VERSION_MAJOR(m_DeviceProperties.apiVersion),
+        VK_API_VERSION_MINOR(m_DeviceProperties.apiVersion),
+        VK_API_VERSION_PATCH(m_DeviceProperties.apiVersion),
+        m_DeviceProperties.driverVersion);
+}
+
+String ArisenEngine::RHI::RHIVkInstance::GetEnabledInstanceExtensions() const
+{
+    return JoinStrings(m_EnabledInstanceExtensions);
+}
+
+String ArisenEngine::RHI::RHIVkInstance::GetEnabledDeviceExtensions() const
+{
+    return JoinStrings(m_EnabledDeviceExtensions);
+}
+
+String ArisenEngine::RHI::RHIVkInstance::GetMissingDeviceExtensions() const
+{
+    if (m_MissingMandatoryDeviceExtensions.empty() && m_MissingOptionalDeviceExtensions.empty())
+    {
+        return String("<none>");
+    }
+
+    std::string result;
+    if (!m_MissingMandatoryDeviceExtensions.empty())
+    {
+        result += "Mandatory: ";
+        result += JoinStrings(m_MissingMandatoryDeviceExtensions).GetString();
+    }
+
+    if (!m_MissingOptionalDeviceExtensions.empty())
+    {
+        if (!result.empty()) result += " | ";
+        result += "Optional: ";
+        result += JoinStrings(m_MissingOptionalDeviceExtensions).GetString();
+    }
+
+    return String(result);
 }
 
 VkResult CreateDebugUtilsMessengerEXT(
@@ -517,9 +715,14 @@ void ArisenEngine::RHI::RHIVkInstance::SetupDebugMessager()
     VkDebugUtilsMessengerCreateInfoEXT createInfo;
     PopulateDebugMessengerCreateInfo(createInfo);
 
-    if (CreateDebugUtilsMessengerEXT(m_VkInstance, &createInfo, nullptr, &m_VkDebugMessenger) != VK_SUCCESS)
+    VkResult result = CreateDebugUtilsMessengerEXT(m_VkInstance, &createInfo, nullptr, &m_VkDebugMessenger);
+    if (result != VK_SUCCESS)
     {
-        LOG_FATAL_AND_THROW("[RHIVkInstance::SetupDebugMessager]: failed to set up debug messenger!");
+        LOG_FATAL_AND_THROW(
+            String::Format(
+                "[RHIVkInstance::SetupDebugMessager]: failed to set up debug messenger. VkResult=%s (%d). Ensure VK_EXT_debug_utils is available when validation is enabled.",
+                ToVkResultName(result),
+                static_cast<int>(result)));
     }
 }
 
@@ -705,6 +908,9 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
     vkEnumerateDeviceExtensionProperties(m_CurrentPhysicsDevice, nullptr, &extensionCount, availableExtensions.data());
 
     Containers::Vector<const char*> enabledExtensions;
+    m_EnabledDeviceExtensions.clear();
+    m_MissingMandatoryDeviceExtensions.clear();
+    m_MissingOptionalDeviceExtensions.clear();
     auto checkAndEnable = [&](const Containers::Vector<const char*>& extensionList, bool mandatory)
     {
         for (const char* extensionName : extensionList)
@@ -725,6 +931,7 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
                 if (foundInAvailable)
                 {
                     enabledExtensions.push_back(extensionName);
+                    m_EnabledDeviceExtensions.push_back(extensionName);
                     continue;
                 }
 
@@ -745,15 +952,18 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
             if (found)
             {
                 enabledExtensions.push_back(extensionName);
+                m_EnabledDeviceExtensions.push_back(extensionName);
             }
                         else if (mandatory)
             {
+                m_MissingMandatoryDeviceExtensions.push_back(extensionName);
                 LOG_WARN(
                     String::Format("[RHIVkInstance::CreateLogicDevice]: mandatory device extension not supported: %s",
                         extensionName));
             }
             else
             {
+                m_MissingOptionalDeviceExtensions.push_back(extensionName);
                 LOG_INFO(
                     String::Format("[RHIVkInstance::CreateLogicDevice]: optional device extension not supported: %s",
                         extensionName));
@@ -764,6 +974,15 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
 
     checkAndEnable(m_Settings.mandatoryDeviceExtensions, true);
     checkAndEnable(m_Settings.optionalDeviceExtensions, false);
+
+    if (!m_MissingMandatoryDeviceExtensions.empty())
+    {
+        LOG_FATAL_AND_THROW(
+            String::Format(
+                "[RHIVkInstance::CreateLogicDevice]: missing mandatory Vulkan device extensions: %s. Selected adapter: %s. Check GPU driver support for the required RHI feature set.",
+                JoinStrings(m_MissingMandatoryDeviceExtensions).GetString(),
+                GetAdapterName().GetString()));
+    }
 
     // Mandatory Check for Virtual Viewport Interop (identified by bit-flag 0x80000000)
         if ((windowId & 0x80000000) || windowId == ~0u)
@@ -783,7 +1002,17 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
 
         if (!hasExternalMemory || !hasExternalMemoryWin32 || !hasExternalSemaphore || !hasExternalSemaphoreWin32)
         {
-            LOG_FATAL("[RHIVkInstance::CreateLogicDevice]: Physical Device does not support Win32 external memory/semaphore interop! Headless interop will fail.");
+            Containers::Vector<String> missingInteropExtensions;
+            if (!hasExternalMemory) missingInteropExtensions.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+            if (!hasExternalMemoryWin32) missingInteropExtensions.push_back("VK_KHR_external_memory_win32");
+            if (!hasExternalSemaphore) missingInteropExtensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
+            if (!hasExternalSemaphoreWin32) missingInteropExtensions.push_back("VK_KHR_external_semaphore_win32");
+
+            LOG_FATAL_AND_THROW(
+                String::Format(
+                    "[RHIVkInstance::CreateLogicDevice]: selected adapter does not support required virtual/shared-texture Win32 interop extensions: %s. Adapter=%s",
+                    JoinStrings(missingInteropExtensions).GetString(),
+                    GetAdapterName().GetString()));
         }
         else
         {
@@ -938,8 +1167,13 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
     if (res != VK_SUCCESS)
     {
         LOG_FATAL_AND_THROW(
-            String::Format("[RHIVkInstance::CreateLogicDevice]: failed to create logical device! VkResult: %d", (int)res
-            ));
+            String::Format(
+                "[RHIVkInstance::CreateLogicDevice]: failed to create Vulkan logical device. VkResult=%s (%d), Adapter=%s, EnabledExtensions=%s, MissingExtensions=%s",
+                ToVkResultName(res),
+                static_cast<int>(res),
+                GetAdapterName().GetString(),
+                JoinStrings(m_EnabledDeviceExtensions).GetString(),
+                GetMissingDeviceExtensions().GetString()));
     }
 
     Containers::Map<uint32_t, uint32_t> nextQueueIndex;
@@ -1290,7 +1524,8 @@ void ArisenEngine::RHI::RHIVkInstance::PickPhysicalDevice(bool considerSurface)
 
     if (deviceCount == 0)
     {
-        LOG_FATAL_AND_THROW("[RHIVkInstance::PickPhysicalDevice]: failed to find GPUs with Vulkan support!");
+        LOG_FATAL_AND_THROW(
+            "[RHIVkInstance::PickPhysicalDevice]: no Vulkan-capable GPU was reported by the Vulkan runtime. Check graphics driver installation and Vulkan ICD registration.");
     }
 
     LOG_DEBUG(String::Format("[RHIVkInstance::PickPhysicalDevice]: Device Count: %d", deviceCount));
@@ -1317,7 +1552,10 @@ void ArisenEngine::RHI::RHIVkInstance::PickPhysicalDevice(bool considerSurface)
     }
     else
     {
-        LOG_FATAL_AND_THROW("[RHIVkDevice::PickPhysicalDevice]: failed to find a suitable GPU!");
+        LOG_FATAL_AND_THROW(
+            String::Format(
+                "[RHIVkDevice::PickPhysicalDevice]: failed to find a suitable GPU. Required features include geometryShader, tessellationShader, fillModeNonSolid, samplerAnisotropy. Required device extensions: %s",
+                JoinNames(m_Settings.mandatoryDeviceExtensions).GetString()));
     }
 
     vkGetPhysicalDeviceProperties(m_CurrentPhysicsDevice, &m_DeviceProperties);

@@ -76,6 +76,9 @@ namespace ArisenEngine::RHI
         UInt32 RegisterBindlessResource(RHIImageViewHandle image) override;
         UInt32 RegisterBindlessResource(RHIBufferHandle buffer) override;
         UInt32 RegisterBindlessResource(RHISamplerHandle sampler) override;
+        void UnregisterBindlessResourceImage(UInt32 bindlessIndex) override;
+        void UnregisterBindlessResourceBuffer(UInt32 bindlessIndex) override;
+        void UnregisterBindlessResourceSampler(UInt32 bindlessIndex) override;
 
     private:
         RHIVkDevice* m_Device;
