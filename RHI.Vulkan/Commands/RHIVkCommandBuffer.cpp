@@ -963,6 +963,8 @@ namespace ArisenEngine::RHI
         {
             ::vkCmdBindVertexBuffers(cmd->m_VkCommandBuffer, firstBinding, cmd->m_VertexBuffers.size(),
                                      cmd->m_VertexBuffers.data(), cmd->m_VertexBindingOffsets.data());
+            cmd->m_VertexBuffers.clear();
+            cmd->m_VertexBindingOffsets.clear();
         }
         ::vkCmdDraw(cmd->m_VkCommandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
     }
@@ -975,6 +977,8 @@ namespace ArisenEngine::RHI
         {
             ::vkCmdBindVertexBuffers(cmd->m_VkCommandBuffer, firstBinding, cmd->m_VertexBuffers.size(),
                                      cmd->m_VertexBuffers.data(), cmd->m_VertexBindingOffsets.data());
+            cmd->m_VertexBuffers.clear();
+            cmd->m_VertexBindingOffsets.clear();
         }
 
         if (cmd->m_IndexBuffer.has_value())
@@ -994,6 +998,8 @@ namespace ArisenEngine::RHI
         {
             ::vkCmdBindVertexBuffers(cmd->m_VkCommandBuffer, 0, cmd->m_VertexBuffers.size(),
                                      cmd->m_VertexBuffers.data(), cmd->m_VertexBindingOffsets.data());
+            cmd->m_VertexBuffers.clear();
+            cmd->m_VertexBindingOffsets.clear();
         }
 
         auto* vkDevice = static_cast<RHIVkDevice*>(cmd->GetDevice());
@@ -1011,6 +1017,8 @@ namespace ArisenEngine::RHI
         {
             ::vkCmdBindVertexBuffers(cmd->m_VkCommandBuffer, 0, cmd->m_VertexBuffers.size(),
                                      cmd->m_VertexBuffers.data(), cmd->m_VertexBindingOffsets.data());
+            cmd->m_VertexBuffers.clear();
+            cmd->m_VertexBindingOffsets.clear();
         }
 
         if (cmd->m_IndexBuffer.has_value())
@@ -1469,9 +1477,11 @@ namespace ArisenEngine::RHI
     {
         VkViewport viewport{};
         viewport.x = x;
-        viewport.y = height < 0 ? y - height : y;
+        // RHI viewports use a top-left origin with a positive height. Vulkan's
+        // negative-height viewport preserves that cross-backend convention.
+        viewport.y = y + height;
         viewport.width = width;
-        viewport.height = height;
+        viewport.height = -height;
         viewport.minDepth = minDepth;
         viewport.maxDepth = maxDepth;
         ::vkCmdSetViewport(cmd->m_VkCommandBuffer, 0, 1, &viewport);

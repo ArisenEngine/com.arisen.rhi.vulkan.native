@@ -174,7 +174,11 @@ namespace ArisenEngine::RHI
         rasterizerInfo.polygonMode = static_cast<VkPolygonMode>(rs.polygonMode);
         rasterizerInfo.lineWidth = rs.lineWidth;
         rasterizerInfo.cullMode = static_cast<VkCullModeFlags>(rs.cullMode);
-        rasterizerInfo.frontFace = static_cast<VkFrontFace>(rs.frontFace);
+        // SetViewport flips Vulkan's viewport height to preserve the RHI's
+        // top-left convention, so compensate the resulting winding reversal.
+        rasterizerInfo.frontFace = rs.frontFace == FRONT_FACE_COUNTER_CLOCKWISE
+            ? VK_FRONT_FACE_CLOCKWISE
+            : VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rasterizerInfo.depthBiasEnable = static_cast<VkBool32>(rs.depthBiasEnable);
         rasterizerInfo.depthBiasConstantFactor = rs.depthBiasConstantFactor;
         rasterizerInfo.depthBiasClamp = rs.depthBiasClamp;
