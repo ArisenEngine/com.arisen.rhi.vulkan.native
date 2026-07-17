@@ -7,6 +7,11 @@
 
 namespace ArisenEngine::RHI
 {
+    static_assert(static_cast<UInt32>(FRONT_FACE_COUNTER_CLOCKWISE) ==
+        static_cast<UInt32>(VK_FRONT_FACE_COUNTER_CLOCKWISE));
+    static_assert(static_cast<UInt32>(FRONT_FACE_CLOCKWISE) ==
+        static_cast<UInt32>(VK_FRONT_FACE_CLOCKWISE));
+
     RHIVkGPUPipeline::~RHIVkGPUPipeline() noexcept
     {
         LOG_DEBUG("[RHIVkGPUPipeline::~RHIVkGPUPipeline]: ~RHIVkGPUPipeline");
@@ -174,11 +179,10 @@ namespace ArisenEngine::RHI
         rasterizerInfo.polygonMode = static_cast<VkPolygonMode>(rs.polygonMode);
         rasterizerInfo.lineWidth = rs.lineWidth;
         rasterizerInfo.cullMode = static_cast<VkCullModeFlags>(rs.cullMode);
-        // SetViewport flips Vulkan's viewport height to preserve the RHI's
-        // top-left convention, so compensate the resulting winding reversal.
-        rasterizerInfo.frontFace = rs.frontFace == FRONT_FACE_COUNTER_CLOCKWISE
-            ? VK_FRONT_FACE_CLOCKWISE
-            : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        // EFrontFace is defined in the RHI's top-left viewport convention and
+        // intentionally matches VkFrontFace. The negative Vulkan viewport must
+        // not invert this mapping a second time.
+        rasterizerInfo.frontFace = static_cast<VkFrontFace>(rs.frontFace);
         rasterizerInfo.depthBiasEnable = static_cast<VkBool32>(rs.depthBiasEnable);
         rasterizerInfo.depthBiasConstantFactor = rs.depthBiasConstantFactor;
         rasterizerInfo.depthBiasClamp = rs.depthBiasClamp;

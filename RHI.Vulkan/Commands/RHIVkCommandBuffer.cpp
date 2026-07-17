@@ -895,7 +895,16 @@ namespace ArisenEngine::RHI
 
         barrier.srcQueueFamilyIndex = srcQueueFamilyIndex;
         barrier.dstQueueFamilyIndex = dstQueueFamilyIndex;
-        barrier.subresourceRange = {IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        auto* vkDevice = static_cast<RHIVkDevice*>(cmd->GetDevice());
+        auto* vkImage = vkDevice->GetImagePool()->Get(image);
+        if (!vkImage) return;
+        barrier.subresourceRange = {
+            IMAGE_ASPECT_COLOR_BIT,
+            0,
+            vkImage->mipLevels,
+            0,
+            1
+        };
 
         barrier.srcStageMask = PIPELINE_STAGE_ALL_COMMANDS_BIT;
         barrier.dstStageMask = PIPELINE_STAGE_ALL_COMMANDS_BIT;
