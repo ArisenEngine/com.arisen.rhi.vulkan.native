@@ -760,6 +760,17 @@ void* ArisenEngine::RHI::RHIVkDevice::MapBuffer(RHIBufferHandle handle)
     void* mappedData = nullptr;
     if (vmaMapMemory(m_MemoryAllocator->GetVmaAllocator(), buffer->allocation, &mappedData) == VK_SUCCESS)
     {
+        if (buffer->memoryUsage == ERHIMemoryUsage::Readback &&
+            vmaInvalidateAllocation(
+                m_MemoryAllocator->GetVmaAllocator(),
+                buffer->allocation,
+                0,
+                VK_WHOLE_SIZE) != VK_SUCCESS)
+        {
+            vmaUnmapMemory(m_MemoryAllocator->GetVmaAllocator(), buffer->allocation);
+            return nullptr;
+        }
+
         return mappedData;
     }
     return nullptr;

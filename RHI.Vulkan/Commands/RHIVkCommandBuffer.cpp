@@ -68,6 +68,8 @@ namespace ArisenEngine::RHI
         void PushConstants(UInt32 offset, UInt32 size, const void* data, UInt32 stageFlags) override;
         void CopyBufferToImage(RHIBufferHandle srcBuffer, RHIImageHandle dst, EImageLayout dstImageLayout,
                                UInt32 regionCount, const RHIBufferImageCopy* pRegions) override;
+        void CopyImageToBuffer(RHIImageHandle src, EImageLayout srcImageLayout, RHIBufferHandle dstBuffer,
+                               UInt32 regionCount, const RHIBufferImageCopy* pRegions) override;
         void PipelineBarrier(const RHICmdPipelineBarrier& cmd, const RHIMemoryBarrier* pMem,
                              const RHIImageMemoryBarrier* pImg, const RHIBufferMemoryBarrier* pBuf) override;
         void TransitionImageLayout(RHIImageHandle image, EImageLayout oldLayout, EImageLayout targetLayout) override;
@@ -696,6 +698,43 @@ namespace ArisenEngine::RHI
 
         cmd->CaptureResource(srcBuffer);
         cmd->CaptureResource(dst);
+    }
+
+    void RHIVkExecutor::CopyImageToBuffer(RHIImageHandle src, EImageLayout srcImageLayout,
+                                          RHIBufferHandle dstBuffer, UInt32 regionCount,
+                                          const RHIBufferImageCopy* regions)
+    {
+        ARISEN_PROFILE_ZONE("Vk::CopyImageToBuffer");
+        auto* vkDevice = cmd->GetVkDevice();
+        auto* srcImg = vkDevice->GetImagePool()->Get(src);
+        auto* dstBuf = vkDevice->GetBufferPool()->Get(dstBuffer);
+
+        if (!srcImg || !dstBuf || !regions) return;
+
+        cmd->m_VkBufferImageCopies.clear();
+        cmd->m_VkBufferImageCopies.reserve(regionCount);
+        for (UInt32 i = 0; i < regionCount; ++i)
+        {
+            const auto& regionInfo = regions[i];
+            cmd->m_VkBufferImageCopies.emplace_back(BufferImageCopyRegion(regionInfo.bufferOffset,
+                                                                          regionInfo.bufferRowLength,
+                                                                          regionInfo.bufferImageHeight,
+                                                                          regionInfo.imageSubresource,
+                                                                          regionInfo.offsetX, regionInfo.offsetY,
+                                                                          regionInfo.offsetZ,
+                                                                          regionInfo.width, regionInfo.height,
+                                                                          regionInfo.depth));
+        }
+
+        ::vkCmdCopyImageToBuffer(cmd->m_VkCommandBuffer,
+                                 srcImg->image,
+                                 static_cast<VkImageLayout>(srcImageLayout),
+                                 dstBuf->buffer,
+                                 static_cast<uint32_t>(cmd->m_VkBufferImageCopies.size()),
+                                 cmd->m_VkBufferImageCopies.data());
+
+        cmd->CaptureResource(src);
+        cmd->CaptureResource(dstBuffer);
     }
 
 
