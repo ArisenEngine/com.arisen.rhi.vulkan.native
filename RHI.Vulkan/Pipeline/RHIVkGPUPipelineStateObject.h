@@ -25,7 +25,6 @@ namespace ArisenEngine::RHI
         void AddProgram(RHIShaderProgramHandle handle) override;
         void ClearAllPrograms() override;
 
-        const UInt32 GetHash() const override;
         void SetBindPoint(EPipelineBindPoint bindPoint) override { m_BindPoint = bindPoint; }
         const EPipelineBindPoint GetBindPoint() const override { return m_BindPoint; }
 

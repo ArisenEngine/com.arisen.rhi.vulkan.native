@@ -31,10 +31,10 @@ namespace ArisenEngine::RHI
         m_Pipelines[key] = pipeline;
     }
 
-    VkPipelineLayout RHIVkPSOCache::GetLayout(UInt32 psoHash)
+    VkPipelineLayout RHIVkPSOCache::GetLayout(UInt64 psoIdentity)
     {
         std::shared_lock lock(m_Mutex);
-        auto it = m_Layouts.find(psoHash);
+        auto it = m_Layouts.find(psoIdentity);
         if (it != m_Layouts.end())
         {
             return it->second;
@@ -42,33 +42,35 @@ namespace ArisenEngine::RHI
         return VK_NULL_HANDLE;
     }
 
-    void RHIVkPSOCache::StoreLayout(UInt32 psoHash, VkPipelineLayout layout)
+    void RHIVkPSOCache::StoreLayout(UInt64 psoIdentity, VkPipelineLayout layout)
     {
         std::unique_lock lock(m_Mutex);
-        m_Layouts[psoHash] = layout;
+        m_Layouts[psoIdentity] = layout;
+    }
+
+    void RHIVkPSOCache::Remove(UInt64 psoIdentity)
+    {
+        std::unique_lock lock(m_Mutex);
+        for (auto it = m_Pipelines.begin(); it != m_Pipelines.end();)
+        {
+            if (it->first.psoIdentity == psoIdentity)
+            {
+                it = m_Pipelines.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        m_Layouts.erase(psoIdentity);
     }
 
     void RHIVkPSOCache::Clear()
     {
         std::unique_lock lock(m_Mutex);
-        for (auto& [key, pipeline] : m_Pipelines)
-        {
-            if (pipeline != VK_NULL_HANDLE)
-            {
-                vkDestroyPipeline(m_VkDevice, pipeline, nullptr);
-            }
-        }
         m_Pipelines.clear();
-
-        for (auto& [hash, layout] : m_Layouts)
-        {
-            if (layout != VK_NULL_HANDLE)
-            {
-                vkDestroyPipelineLayout(m_VkDevice, layout, nullptr);
-            }
-        }
         m_Layouts.clear();
 
-        LOG_DEBUG("[RHIVkPSOCache]: Cleared all cached pipelines and layouts.");
+        LOG_DEBUG("[RHIVkPSOCache]: Cleared all cached pipeline references.");
     }
 }

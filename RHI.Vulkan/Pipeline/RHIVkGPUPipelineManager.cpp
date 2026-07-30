@@ -7,6 +7,7 @@
 #include "RHI/Pipeline/RHIPipeline.h"
 #include "RHI/Pipeline/RHIPipelineState.h"
 #include "RHI/RenderPass/RHISubPass.h"
+#include "RHI/Resources/RHIResourceRegistry.h"
 
 #include <fstream>
 #include "PlatformPath.h"
@@ -31,13 +32,16 @@ ArisenEngine::RHI::RHIVkGPUPipelineManager::~RHIVkGPUPipelineManager() noexcept
         vkDestroyPipelineCache(static_cast<VkDevice>(m_Device->GetHandle()), m_VkPipelineCache, nullptr);
     }
 
-    // Release handles from pool
-    for (auto const& [hash, handle] : m_PipelineHandles)
+    Containers::Vector<RHIPipelineHandle> handles;
+    handles.reserve(m_PipelineHandles.size());
+    for (auto const& [identity, handle] : m_PipelineHandles)
     {
-        m_Device->GetPipelinePool()->Deallocate(handle);
+        handles.emplace_back(handle);
     }
-    m_GPUPipelines.clear();
-    m_PipelineHandles.clear();
+    for (RHIPipelineHandle handle : handles)
+    {
+        ReleasePipelineInternal(handle, false);
+    }
 }
 
 ArisenEngine::RHI::RHIPipelineHandle ArisenEngine::RHI::RHIVkGPUPipelineManager::GetGraphicsPipeline(
@@ -45,28 +49,30 @@ ArisenEngine::RHI::RHIPipelineHandle ArisenEngine::RHI::RHIVkGPUPipelineManager:
 {
     ARISEN_PROFILE_ZONE("RHI::GetGraphicsPipeline");
     static_cast<RHIVkGPUPipelineStateObject*>(pso)->BuildDescriptorSetLayout();
-    auto hash = pso->GetHash();
-    if (!m_GPUPipelines.contains(hash))
+    auto identity = pso->GetCacheIdentity();
+    if (!m_PipelineResources.contains(identity))
     {
-        auto pipeline = std::make_unique<RHIVkGPUPipeline>(m_Device, pso, m_MaxFramesInFlight);
+        auto* resource = new RHIVkPipelineResource(static_cast<VkDevice>(m_Device->GetHandle()));
+        auto pipeline = std::make_unique<RHIVkGPUPipeline>(m_Device, pso, resource, m_MaxFramesInFlight);
         auto* rawPtr = pipeline.get();
-        m_GPUPipelines.emplace(hash, std::move(pipeline));
+        resource->SetPipeline(std::move(pipeline));
+        auto registryHandle = m_Device->GetResourceRegistry()->Create(MakeDeferredDeleteItem(resource));
 
-        // Not using deferred destroy here as Manager owns the unique_ptr and pool just stores observation
-        // Actually, if we use handles, we should be careful about ownership.
-        // For now, let's say the Pool observation is valid as long as m_GPUPipelines has it.
-        auto handle = m_Device->GetPipelinePool()->Allocate([rawPtr](RHIVkPipelinePoolItem* item)
+        auto handle = m_Device->GetPipelinePool()->Allocate([rawPtr, identity, registryHandle](RHIVkPipelinePoolItem* item)
         {
             *item = RHIVkPipelinePoolItem();
             item->pipeline = rawPtr;
+            item->cacheIdentity = identity;
+            item->registryHandle = registryHandle;
         });
-        m_PipelineHandles.emplace(hash, handle);
+        m_PipelineResources.emplace(identity, resource);
+        m_PipelineHandles.emplace(identity, handle);
         return handle;
     }
     else
     {
-        m_GPUPipelines[hash].get()->BindPipelineStateObject(pso);
-        return m_PipelineHandles[hash];
+        m_PipelineResources[identity]->GetPipeline()->BindPipelineStateObject(pso);
+        return m_PipelineHandles[identity];
     }
 }
 
@@ -82,26 +88,75 @@ ArisenEngine::RHI::RHIPipelineHandle ArisenEngine::RHI::RHIVkGPUPipelineManager:
 {
     ARISEN_PROFILE_ZONE("RHI::GetRayTracingPipeline");
     static_cast<RHIVkGPUPipelineStateObject*>(pso)->BuildDescriptorSetLayout();
-    auto hash = pso->GetHash();
-    if (!m_GPUPipelines.contains(hash))
+    auto identity = pso->GetCacheIdentity();
+    if (!m_PipelineResources.contains(identity))
     {
-        auto pipeline = std::make_unique<RHIVkGPUPipeline>(m_Device, pso, m_MaxFramesInFlight);
+        auto* resource = new RHIVkPipelineResource(static_cast<VkDevice>(m_Device->GetHandle()));
+        auto pipeline = std::make_unique<RHIVkGPUPipeline>(m_Device, pso, resource, m_MaxFramesInFlight);
         auto* rawPtr = pipeline.get();
-        m_GPUPipelines.emplace(hash, std::move(pipeline));
+        resource->SetPipeline(std::move(pipeline));
+        auto registryHandle = m_Device->GetResourceRegistry()->Create(MakeDeferredDeleteItem(resource));
 
-        auto handle = m_Device->GetPipelinePool()->Allocate([rawPtr](RHIVkPipelinePoolItem* item)
+        auto handle = m_Device->GetPipelinePool()->Allocate([rawPtr, identity, registryHandle](RHIVkPipelinePoolItem* item)
         {
             *item = RHIVkPipelinePoolItem();
             item->pipeline = rawPtr;
+            item->cacheIdentity = identity;
+            item->registryHandle = registryHandle;
         });
-        m_PipelineHandles.emplace(hash, handle);
+        m_PipelineResources.emplace(identity, resource);
+        m_PipelineHandles.emplace(identity, handle);
         return handle;
     }
     else
     {
-        m_GPUPipelines[hash].get()->BindPipelineStateObject(pso);
-        return m_PipelineHandles[hash];
+        m_PipelineResources[identity]->GetPipeline()->BindPipelineStateObject(pso);
+        return m_PipelineHandles[identity];
     }
+}
+
+void ArisenEngine::RHI::RHIVkGPUPipelineManager::ReleasePipeline(RHIPipelineHandle handle)
+{
+    ReleasePipelineInternal(handle, true);
+}
+
+bool ArisenEngine::RHI::RHIVkGPUPipelineManager::ReleasePipelineInternal(
+    RHIPipelineHandle handle,
+    bool logInvalidHandle)
+{
+    auto* pool = m_Device->GetPipelinePool();
+    auto* item = pool->Get(handle);
+    if (!item || !item->pipeline || item->cacheIdentity == 0)
+    {
+        if (logInvalidHandle)
+        {
+            LOG_WARN("[RHIVkGPUPipelineManager::ReleasePipeline]: Invalid or stale pipeline handle.");
+        }
+        return false;
+    }
+
+    const UInt64 identity = item->cacheIdentity;
+    const RHIResourceHandle registryHandle = item->registryHandle;
+    m_PSOCache->Remove(identity);
+    m_PipelineResources.erase(identity);
+    m_PipelineHandles.erase(identity);
+    *item = RHIVkPipelinePoolItem();
+
+    const bool deallocated = pool->Deallocate(handle) != nullptr;
+    if (registryHandle.IsValid())
+    {
+        m_Device->GetResourceRegistry()->Release(registryHandle);
+    }
+
+    if (!deallocated)
+    {
+        if (logInvalidHandle)
+        {
+            LOG_WARN("[RHIVkGPUPipelineManager::ReleasePipeline]: Failed to deallocate pipeline handle.");
+        }
+        return false;
+    }
+    return true;
 }
 
 std::unique_ptr<ArisenEngine::RHI::RHIPipelineState> ArisenEngine::RHI::RHIVkGPUPipelineManager::GetPipelineState()

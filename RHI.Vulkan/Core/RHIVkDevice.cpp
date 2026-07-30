@@ -914,13 +914,34 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageDeviceMemory(RHIImageHandle handl
         allocInfo.pNext = &exportInfo;
 
         VkDeviceMemory manualMemory = VK_NULL_HANDLE;
-        if (vkAllocateMemory(m_VkDevice, &allocInfo, nullptr, &manualMemory) != VK_SUCCESS)
+        const VkResult allocationResult = vkAllocateMemory(
+            m_VkDevice,
+            &allocInfo,
+            nullptr,
+            &manualMemory);
+        if (allocationResult != VK_SUCCESS)
         {
-            LOG_ERROR("[RHIVkDevice::AllocImageDeviceMemory]: Failed to allocate shared memory!");
+            LOG_ERRORF(
+                "[RHIVkDevice::AllocImageDeviceMemory]: Failed to allocate shared memory. "
+                "VkResult={0}, Bytes={1}, MemoryType={2}",
+                static_cast<int>(allocationResult),
+                memReqs.size,
+                allocInfo.memoryTypeIndex);
             return false;
         }
 
-        vkBindImageMemory(m_VkDevice, image->image, manualMemory, 0);
+        const VkResult bindResult = vkBindImageMemory(m_VkDevice, image->image, manualMemory, 0);
+        if (bindResult != VK_SUCCESS)
+        {
+            LOG_ERRORF(
+                "[RHIVkDevice::AllocImageDeviceMemory]: Failed to bind shared image memory. "
+                "VkResult={0}, Bytes={1}, MemoryType={2}",
+                static_cast<int>(bindResult),
+                memReqs.size,
+                allocInfo.memoryTypeIndex);
+            vkFreeMemory(m_VkDevice, manualMemory, nullptr);
+            return false;
+        }
 
         image->state->manualMemory = manualMemory;
         image->allocation = VK_NULL_HANDLE;
@@ -976,6 +997,8 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageDeviceMemory(RHIImageHandle handl
 
 void ArisenEngine::RHI::RHIVkDevice::FreeImageInternal(RHIVkImagePoolItem* image)
 {
+    if (!image) return;
+
     if (image->sharedHandle != nullptr)
     {
         ::CloseHandle((HANDLE)image->sharedHandle);
@@ -996,7 +1019,14 @@ void ArisenEngine::RHI::RHIVkDevice::FreeImageInternal(RHIVkImagePoolItem* image
 
 void ArisenEngine::RHI::RHIVkDevice::ReleaseImage(RHIImageHandle handle)
 {
-    FreeImageInternal(m_ImagePool->Get(handle));
+    auto* image = m_ImagePool->Get(handle);
+    if (!image)
+    {
+        LOG_WARN("[RHIVkDevice::ReleaseImage]: Ignoring invalid or stale handle.");
+        return;
+    }
+
+    FreeImageInternal(image);
     if (!m_ImagePool->Deallocate(handle))
     {
         LOG_WARN("[RHIVkDevice::ReleaseImage]: Failed to deallocate handle (invalid or stale)!");
@@ -1159,23 +1189,14 @@ void ArisenEngine::RHI::RHIVkDevice::ReleaseFrameBuffer(
     }
 }
 
-void ArisenEngine::RHI::RHIVkDevice::FreePipelineInternal(RHIPipelineHandle handle)
-{
-    auto* p = m_PipelinePool->Get(handle);
-    if (p && p->registryHandle.IsValid())
-    {
-        m_ResourceRegistry->Release(p->registryHandle);
-        p->registryHandle = RHIResourceHandle::Invalid();
-    }
-}
-
 void ArisenEngine::RHI::RHIVkDevice::ReleasePipeline(RHIPipelineHandle handle)
 {
-    FreePipelineInternal(handle);
-    if (!m_PipelinePool->Deallocate(handle))
+    if (!m_GPUPipelineManager)
     {
-        LOG_WARN("[RHIVkDevice::ReleasePipeline]: Failed to deallocate handle (invalid or stale)!");
+        LOG_WARN("[RHIVkDevice::ReleasePipeline]: Pipeline manager is unavailable.");
+        return;
     }
+    m_GPUPipelineManager->ReleasePipeline(handle);
 }
 
 ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept

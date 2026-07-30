@@ -9,9 +9,13 @@ namespace ArisenEngine.RHI.Vulkan.Native;
 
 public sealed class VulkanRHIBackend : IRHIBackend
 {
+    private VulkanRHIDevice? m_DeviceService;
+
     public string Name => "Vulkan";
 
     public bool IsInitialized { get; private set; }
+
+    public ulong Generation { get; private set; }
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
     private static extern IntPtr LoadLibrary(string lpFileName);
@@ -23,18 +27,45 @@ public sealed class VulkanRHIBackend : IRHIBackend
     {
         if (IsInitialized) return true;
 
+        return InitializeCore(services, diagnosticOverride: null);
+    }
+
+    public bool Restart(IServiceRegistry services, RHIBackendRestartOptions options)
+    {
+        if (!Enum.IsDefined(options.DiagnosticMode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(options));
+        }
+
+        Shutdown();
+        return InitializeCore(services, options.DiagnosticMode);
+    }
+
+    private bool InitializeCore(
+        IServiceRegistry services,
+        RHIBackendDiagnosticMode? diagnosticOverride)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
         try
         {
-            PreloadRenderDoc();
+            ConfigureRenderDocCapture(diagnosticOverride);
 
 #if ARISEN_ENGINE_EDITOR
-            return InitializeEditorBackend(services);
+            bool initialized = InitializeEditorBackend(services);
 #else
-            return InitializeRuntimeBackend(services);
+            bool initialized = InitializeRuntimeBackend(services);
 #endif
+            if (!initialized)
+            {
+                RollbackFailedInitialization();
+            }
+
+            return initialized;
         }
         catch (Exception e)
         {
+            RollbackFailedInitialization();
             KernelLog.ErrorFormat("[VulkanRHIBackend] Graphics init failed: {0}", e.Message);
             return false;
         }
@@ -129,10 +160,23 @@ public sealed class VulkanRHIBackend : IRHIBackend
                 ? registry.BeginPackageRegistration(VulkanRHIPackage.PackageId)
                 : null;
 
-            services.RegisterService<IRHIDevice>(new VulkanRHIDevice(rhiDevice.Handle));
+            ulong nextGeneration = checked(Generation + 1);
+            if (m_DeviceService == null)
+            {
+                var deviceService = new VulkanRHIDevice(rhiDevice.Handle, nextGeneration);
+                services.RegisterService<IRHIDevice>(deviceService);
+                m_DeviceService = deviceService;
+            }
+            else
+            {
+                m_DeviceService.Attach(rhiDevice.Handle, nextGeneration);
+            }
+
+            Generation = nextGeneration;
             IsInitialized = true;
             KernelLog.InfoFormat(
-                "[VulkanRHIBackend] Registered IRHIDevice. Mode={0}, Surface=0x{1:X}, Size={2}x{3}",
+                "[VulkanRHIBackend] Activated IRHIDevice generation {0}. Mode={1}, Surface=0x{2:X}, Size={3}x{4}",
+                Generation,
                 mode,
                 surfaceId,
                 width,
@@ -207,20 +251,59 @@ public sealed class VulkanRHIBackend : IRHIBackend
 
     public void Shutdown()
     {
+        m_DeviceService?.Detach();
         RHISystem.Shutdown();
         IsInitialized = false;
     }
 
-    private static void PreloadRenderDoc()
+    private void RollbackFailedInitialization()
     {
-        var handle = GetModuleHandle("renderdoc.dll");
-        if (handle != IntPtr.Zero)
+        m_DeviceService?.Detach();
+        IsInitialized = false;
+        RHISystem.Shutdown();
+    }
+
+    private static void ConfigureRenderDocCapture(RHIBackendDiagnosticMode? diagnosticOverride)
+    {
+        var existingHandle = GetModuleHandle("renderdoc.dll");
+        var startupMode = RenderDocStartupPolicy.Resolve(
+            diagnosticOverride == RHIBackendDiagnosticMode.RenderDoc
+                ? "1"
+                : diagnosticOverride == RHIBackendDiagnosticMode.None
+                    ? null
+                    : Environment.GetEnvironmentVariable(RenderDocStartupPolicy.OptInEnvironmentVariable),
+            existingHandle != IntPtr.Zero);
+
+        if (startupMode == RenderDocStartupMode.Disabled)
         {
-            KernelLog.Info("[VulkanRHIBackend] RenderDoc already loaded (injected). Skipping preload.");
+            Environment.SetEnvironmentVariable(
+                RenderDocStartupPolicy.VulkanEnableEnvironmentVariable,
+                null);
+            Environment.SetEnvironmentVariable(
+                RenderDocStartupPolicy.VulkanDisableEnvironmentVariable,
+                "1");
+            KernelLog.InfoFormat(
+                "[VulkanRHIBackend] RenderDoc disabled for ordinary startup. Set {0}=1 before launch to opt in.",
+                RenderDocStartupPolicy.OptInEnvironmentVariable);
             return;
         }
 
-        Environment.SetEnvironmentVariable("ENABLE_VULKAN_RENDERDOC_CAPTURE", "1");
+        if (startupMode == RenderDocStartupMode.AlreadyInjected)
+        {
+            Environment.SetEnvironmentVariable(
+                RenderDocStartupPolicy.VulkanDisableEnvironmentVariable,
+                null);
+            KernelLog.Info(
+                "[VulkanRHIBackend] RenderDoc was injected before backend initialization; treating the external diagnostic launch as opt-in.");
+            return;
+        }
+
+        Environment.SetEnvironmentVariable(
+            RenderDocStartupPolicy.VulkanDisableEnvironmentVariable,
+            null);
+        Environment.SetEnvironmentVariable(
+            RenderDocStartupPolicy.VulkanEnableEnvironmentVariable,
+            "1");
 
         string[] paths =
         {
@@ -232,14 +315,22 @@ public sealed class VulkanRHIBackend : IRHIBackend
         {
             if (!File.Exists(path)) continue;
 
-            handle = LoadLibrary(path);
+            var handle = LoadLibrary(path);
             if (handle != IntPtr.Zero)
             {
-                KernelLog.Info($"[VulkanRHIBackend] RenderDoc preloaded from: {path}");
+                KernelLog.InfoFormat(
+                    "[VulkanRHIBackend] RenderDoc explicitly enabled and preloaded from: {0}",
+                    path);
                 return;
             }
+
+            KernelLog.WarningFormat(
+                "[VulkanRHIBackend] RenderDoc preload failed for '{0}'. Win32Error={1}",
+                path,
+                Marshal.GetLastWin32Error());
         }
 
-        KernelLog.Info("[VulkanRHIBackend] RenderDoc not found. Frame capture will be unavailable.");
+        KernelLog.Warning(
+            "[VulkanRHIBackend] RenderDoc was requested but no preload DLL was found at a known path; the registered Vulkan implicit layer may still provide capture support.");
     }
 }

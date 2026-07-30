@@ -772,9 +772,16 @@ void ArisenEngine::RHI::RHIVkInstance::DestroySurface(UInt32 windowId)
 
 ArisenEngine::RHI::RHISurface& ArisenEngine::RHI::RHIVkInstance::GetSurface(UInt32 windowId)
 {
-    ASSERT(m_Surfaces[windowId] && m_Surfaces[windowId].get());
-    RHISurface& surface = *m_Surfaces[windowId].get();
-    return surface;
+    auto it = m_Surfaces.find(windowId);
+    if (it == m_Surfaces.end() || it->second == nullptr)
+    {
+        LOG_FATAL_AND_THROW(
+            String::Format(
+                "[RHIVkInstance::GetSurface]: No surface is available for id %u.",
+                windowId));
+    }
+
+    return *it->second;
 }
 
 bool ArisenEngine::RHI::RHIVkInstance::IsSupportLinearColorSpace(UInt32 windowId)
@@ -1343,18 +1350,35 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
     }
 
     LOG_INFO(String::Format("[RHIVkInstance::CreateLogicDevice]: Create Logical Device for surface %d", windowId));
+    auto* logicalDevicePtr = logicalDevice.get();
     m_LogicalDevices.insert(
         {
             windowId,
             std::move(logicalDevice)
         });
+
+    if (m_PrimaryLogicalDevice == nullptr)
+    {
+        m_PrimaryLogicalDevice = logicalDevicePtr;
+    }
 }
 
 ArisenEngine::RHI::RHIDevice* ArisenEngine::RHI::RHIVkInstance::GetLogicalDevice(UInt32 windowId)
 {
-    ASSERT(m_LogicalDevices[windowId] && m_LogicalDevices[windowId].get());
-    ASSERT(m_LogicalDevices[windowId].get()->m_VkDevice != VK_NULL_HANDLE);
-    return m_LogicalDevices[windowId].get();
+    auto it = m_LogicalDevices.find(windowId);
+    RHIVkDevice* logicalDevice = it != m_LogicalDevices.end()
+        ? it->second.get()
+        : (m_Surfaces.find(windowId) != m_Surfaces.end() ? m_PrimaryLogicalDevice : nullptr);
+
+    if (logicalDevice == nullptr || logicalDevice->m_VkDevice == VK_NULL_HANDLE)
+    {
+        LOG_FATAL_AND_THROW(
+            String::Format(
+                "[RHIVkInstance::GetLogicalDevice]: No logical device is available for surface %u.",
+                windowId));
+    }
+
+    return logicalDevice;
 }
 
 ArisenEngine::RHI::EFormat ArisenEngine::RHI::RHIVkInstance::GetSuitableSwapChainFormat(UInt32 windowId)
@@ -1463,6 +1487,7 @@ ArisenEngine::RHI::RHIVkInstance::~RHIVkInstance() noexcept
     m_Surfaces.clear();
 
     LOG_INFO("[RHIVkInstance::~RHIVkInstance]: Clearing Logical Devices");
+    m_PrimaryLogicalDevice = nullptr;
     m_LogicalDevices.clear();
 
     LOG_INFO("[RHIVkInstance::~RHIVkInstance]: Disposing Debug Messenger");

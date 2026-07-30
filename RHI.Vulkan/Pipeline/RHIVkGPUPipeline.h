@@ -3,16 +3,43 @@
 #include "RHI/Pipeline/RHIPipeline.h"
 #include "RHI/RenderPass/RHISubPass.h"
 
+#include <mutex>
+
 namespace ArisenEngine::RHI
 {
     class RHIPipelineState;
+    class RHIVkGPUPipeline;
+
+    class RHIVkPipelineResource final
+    {
+    public:
+        NO_COPY_NO_MOVE_NO_DEFAULT(RHIVkPipelineResource)
+        explicit RHIVkPipelineResource(VkDevice device);
+        ~RHIVkPipelineResource() noexcept;
+
+        void SetPipeline(std::unique_ptr<RHIVkGPUPipeline> pipeline);
+        RHIVkGPUPipeline* GetPipeline() const { return m_Pipeline.get(); }
+        void TrackPipeline(VkPipeline pipeline);
+        void TrackPipelineLayout(VkPipelineLayout layout);
+
+    private:
+        VkDevice m_Device{VK_NULL_HANDLE};
+        std::unique_ptr<RHIVkGPUPipeline> m_Pipeline;
+        Containers::Vector<VkPipeline> m_VkPipelines;
+        Containers::Vector<VkPipelineLayout> m_VkPipelineLayouts;
+        std::mutex m_Mutex;
+    };
 
     class RHIVkGPUPipeline final : public RHIPipeline
     {
     public:
         NO_COPY_NO_MOVE_NO_DEFAULT(RHIVkGPUPipeline)
         ~RHIVkGPUPipeline() noexcept override;
-        RHIVkGPUPipeline(RHIVkDevice* device, RHIPipelineState* pipelineStateObject, UInt32 maxFramesInFlight);
+        RHIVkGPUPipeline(
+            RHIVkDevice* device,
+            RHIPipelineState* pipelineStateObject,
+            RHIVkPipelineResource* resource,
+            UInt32 maxFramesInFlight);
         void* GetGraphicsPipeline(UInt32 frameIndex) override;
         void* GetComputePipeline(UInt32 frameIndex) override;
 
@@ -41,6 +68,7 @@ namespace ArisenEngine::RHI
         // device
         VkDevice m_VkDevice;
         RHIVkDevice* m_Device;
+        RHIVkPipelineResource* m_Resource;
 
         // subPass
         RHISubPass* m_SubPass;

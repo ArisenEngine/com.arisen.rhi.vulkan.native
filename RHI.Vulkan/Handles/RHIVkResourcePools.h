@@ -198,6 +198,7 @@ namespace ArisenEngine::RHI
     struct RHIVkPipelinePoolItem
     {
         RHIPipeline* pipeline{nullptr};
+        UInt64 cacheIdentity{0};
         String name{"Anonymous"};
         RHIResourceHandle registryHandle;
     };

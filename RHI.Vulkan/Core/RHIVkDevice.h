@@ -394,7 +394,6 @@ namespace ArisenEngine::RHI
 
         void FreeRenderPassInternal(RHIRenderPassHandle handle);
         void FreeFrameBufferInternal(RHIFrameBufferHandle handle);
-        void FreePipelineInternal(RHIPipelineHandle handle);
         void FreeAccelerationStructureInternal(RHIAccelerationStructureHandle handle);
         void FreeMemoryPoolInternal(RHIMemoryPoolHandle handle);
     };

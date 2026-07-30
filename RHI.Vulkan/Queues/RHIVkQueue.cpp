@@ -6,6 +6,23 @@
 #include "Descriptors/RHIVkDescriptorPool.h"
 #include "Profiler.h"
 
+namespace
+{
+    const char* GetVkResultName(VkResult result)
+    {
+        switch (result)
+        {
+        case VK_SUCCESS: return "VK_SUCCESS";
+        case VK_NOT_READY: return "VK_NOT_READY";
+        case VK_TIMEOUT: return "VK_TIMEOUT";
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+        default: return "VK_RESULT_UNKNOWN";
+        }
+    }
+}
+
 ArisenEngine::RHI::RHIVkQueue::RHIVkQueue(RHIVkDevice* rhiDevice, VkDevice device, VkQueue queue, RHIQueueType type,
                                           IRHIDeferredDeletionQueue* deferredDeletionQueue,
                                           RHIResourceRegistry* resourceRegistry)
@@ -71,25 +88,50 @@ ArisenEngine::RHI::RHIGpuTicket ArisenEngine::RHI::RHIVkQueue::Submit(RHICommand
     Containers::Vector<uint64_t> waitValues;
     Containers::Vector<VkSemaphore> signalSems;
     Containers::Vector<uint64_t> signalValues;
+    const UInt32 resourceFrameIndex = commandBuffer->GetCurrentFrameIndex();
+    const UInt32 swapChainFrameIndex = descriptor &&
+        (descriptor->WaitSwapChain || descriptor->SignalSwapChain)
+        ? descriptor->SwapChainFrameIndex
+        : resourceFrameIndex;
+    RHIVkSwapChain* signalSwapChain = nullptr;
 
     if (descriptor)
     {
         auto* vkDevice = m_RHIDevice;
-        UInt32 frameIndex = commandBuffer->GetCurrentFrameIndex();
 
         if (descriptor->WaitSwapChain)
         {
             auto* vkSwapChain = static_cast<RHIVkSwapChain*>(descriptor->WaitSwapChain);
-            if (vkSwapChain->HasAcquiredImage(frameIndex))
+            if (vkSwapChain->RequiresAcquireSemaphoreWait())
             {
-                auto semHandle = vkSwapChain->GetImageAvailableSemaphore(frameIndex);
+                if (vkSwapChain->HasAcquiredImage(swapChainFrameIndex))
+                {
+                    auto semHandle = vkSwapChain->GetImageAvailableSemaphore(swapChainFrameIndex);
+                    if (semHandle.IsValid())
+                    {
+                        auto* semItem = vkDevice->GetSemaphorePool()->Get(semHandle);
+                        if (semItem)
+                        {
+                            waitSems.push_back(semItem->semaphore);
+                            waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                            waitValues.push_back(0);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // The external compositor signals this semaphore after it has
+                // finished reading the exported image. Gate every command in the
+                // slot-reuse submission on that ownership return.
+                auto semHandle = vkSwapChain->GetExternalConsumerWaitSemaphore(swapChainFrameIndex);
                 if (semHandle.IsValid())
                 {
                     auto* semItem = vkDevice->GetSemaphorePool()->Get(semHandle);
                     if (semItem)
                     {
                         waitSems.push_back(semItem->semaphore);
-                        waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                        waitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
                         waitValues.push_back(0);
                     }
                 }
@@ -98,10 +140,11 @@ ArisenEngine::RHI::RHIGpuTicket ArisenEngine::RHI::RHIVkQueue::Submit(RHICommand
 
         if (descriptor->SignalSwapChain)
         {
-            auto* vkSwapChain = static_cast<RHIVkSwapChain*>(descriptor->SignalSwapChain);
-            if (vkSwapChain->HasAcquiredImage(frameIndex))
+            auto* requestedSignalSwapChain = static_cast<RHIVkSwapChain*>(descriptor->SignalSwapChain);
+            if (requestedSignalSwapChain->HasAcquiredImage(swapChainFrameIndex))
             {
-                auto semHandle = vkSwapChain->GetRenderFinishSemaphore(frameIndex);
+                signalSwapChain = requestedSignalSwapChain;
+                auto semHandle = requestedSignalSwapChain->GetRenderFinishSemaphore(swapChainFrameIndex);
                 if (semHandle.IsValid())
                 {
                     auto* semItem = vkDevice->GetSemaphorePool()->Get(semHandle);
@@ -169,11 +212,27 @@ ArisenEngine::RHI::RHIGpuTicket ArisenEngine::RHI::RHIVkQueue::Submit(RHICommand
 
     vkCmd->SetLatestSubmitTicket(submitTicket);
 
-    if (vkQueueSubmit(m_Queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS)
+    const VkResult submitResult = vkQueueSubmit(m_Queue, 1, &submitInfo, VK_NULL_HANDLE);
+    if (submitResult != VK_SUCCESS)
     {
         // If submission fails, we should clear the ticket.
         vkCmd->SetLatestSubmitTicket(0);
-        LOG_FATAL_AND_THROW("[RHIVkQueue::Submit]: failed to submit command buffer!");
+        LOG_FATALF(
+            "[RHIVkQueue::Submit]: vkQueueSubmit failed. Result={0} ({1}), Ticket={2}, "
+            "CommandBuffer={3}:{4}, WaitSemaphores={5}, SignalSemaphores={6}",
+            GetVkResultName(submitResult),
+            static_cast<int>(submitResult),
+            submitTicket,
+            handle.index,
+            handle.generation,
+            submitInfo.waitSemaphoreCount,
+            submitInfo.signalSemaphoreCount);
+        throw std::runtime_error("RHIVkQueue::Submit failed; see the Vulkan result in the native log.");
+    }
+
+    if (signalSwapChain)
+    {
+        signalSwapChain->NotifyFrameSubmitted(swapChainFrameIndex, submitTicket);
     }
 
     // Mark descriptor pools used by this submission so ResetPool can be GPU-safe.

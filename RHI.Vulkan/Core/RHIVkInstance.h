@@ -95,6 +95,7 @@ namespace ArisenEngine::RHI
 
         // devices
         Containers::Map<UInt32, std::unique_ptr<RHIVkDevice>> m_LogicalDevices;
+        RHIVkDevice* m_PrimaryLogicalDevice{nullptr};
         Containers::Map<UInt32, std::unique_ptr<RHIVkSurface>> m_Surfaces;
         Containers::Map<UInt32, EPresentMode> m_PreferredPresentModes;
 

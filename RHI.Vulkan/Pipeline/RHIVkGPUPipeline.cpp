@@ -12,6 +12,60 @@ namespace ArisenEngine::RHI
     static_assert(static_cast<UInt32>(FRONT_FACE_CLOCKWISE) ==
         static_cast<UInt32>(VK_FRONT_FACE_CLOCKWISE));
 
+    RHIVkPipelineResource::RHIVkPipelineResource(VkDevice device) : m_Device(device)
+    {
+    }
+
+    RHIVkPipelineResource::~RHIVkPipelineResource() noexcept
+    {
+        m_Pipeline.reset();
+
+        for (VkPipeline pipeline : m_VkPipelines)
+        {
+            if (pipeline != VK_NULL_HANDLE)
+            {
+                vkDestroyPipeline(m_Device, pipeline, nullptr);
+            }
+        }
+
+        for (VkPipelineLayout layout : m_VkPipelineLayouts)
+        {
+            if (layout != VK_NULL_HANDLE)
+            {
+                vkDestroyPipelineLayout(m_Device, layout, nullptr);
+            }
+        }
+    }
+
+    void RHIVkPipelineResource::SetPipeline(std::unique_ptr<RHIVkGPUPipeline> pipeline)
+    {
+        m_Pipeline = std::move(pipeline);
+    }
+
+    void RHIVkPipelineResource::TrackPipeline(VkPipeline pipeline)
+    {
+        if (pipeline == VK_NULL_HANDLE) return;
+
+        std::lock_guard lock(m_Mutex);
+        for (VkPipeline tracked : m_VkPipelines)
+        {
+            if (tracked == pipeline) return;
+        }
+        m_VkPipelines.emplace_back(pipeline);
+    }
+
+    void RHIVkPipelineResource::TrackPipelineLayout(VkPipelineLayout layout)
+    {
+        if (layout == VK_NULL_HANDLE) return;
+
+        std::lock_guard lock(m_Mutex);
+        for (VkPipelineLayout tracked : m_VkPipelineLayouts)
+        {
+            if (tracked == layout) return;
+        }
+        m_VkPipelineLayouts.emplace_back(layout);
+    }
+
     RHIVkGPUPipeline::~RHIVkGPUPipeline() noexcept
     {
         LOG_DEBUG("[RHIVkGPUPipeline::~RHIVkGPUPipeline]: ~RHIVkGPUPipeline");
@@ -24,17 +78,22 @@ namespace ArisenEngine::RHI
         m_SubPass = nullptr;
     }
 
-    RHIVkGPUPipeline::RHIVkGPUPipeline(RHIVkDevice* device, RHIPipelineState* pso, UInt32 maxFramesInFlight):
-        RHIPipeline(maxFramesInFlight), m_Device(device), m_VkDevice(static_cast<VkDevice>(device->GetHandle())),
-        m_PipelineStateObject(pso), m_SubPass(nullptr)
+    RHIVkGPUPipeline::RHIVkGPUPipeline(
+        RHIVkDevice* device,
+        RHIPipelineState* pso,
+        RHIVkPipelineResource* resource,
+        UInt32 maxFramesInFlight):
+        RHIPipeline(maxFramesInFlight), m_VkDevice(static_cast<VkDevice>(device->GetHandle())), m_Device(device),
+        m_Resource(resource), m_SubPass(nullptr), m_PipelineStateObject(pso)
     {
+        ASSERT(m_Resource != nullptr);
     }
 
     VkPipelineLayout RHIVkGPUPipeline::GetPipelineLayout(UInt32 frameIndex) const
     {
         auto* vkPSO = static_cast<RHIVkGPUPipelineStateObject*>(m_PipelineStateObject);
         auto* cache = static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())->GetPSOCache();
-        return cache->GetLayout(vkPSO->GetHash());
+        return cache->GetLayout(vkPSO->GetCacheIdentity());
     }
 
     VkPipeline RHIVkGPUPipeline::GetVkPipeline(UInt32 frameIndex) const
@@ -42,7 +101,7 @@ namespace ArisenEngine::RHI
         // Need to cast away const for GetGraphics/Compute pipeline as they might need better access but we can stay const here by calling them directly or using cache
         auto* vkPSO = static_cast<RHIVkGPUPipelineStateObject*>(m_PipelineStateObject);
         RHIVkPSOCacheKey key;
-        key.psoHash = vkPSO->GetHash();
+        key.psoIdentity = vkPSO->GetCacheIdentity();
         if (m_SubPass)
         {
             key.renderPass = static_cast<VkRenderPass>(m_SubPass->GetOwner()->GetHandle(frameIndex));
@@ -62,7 +121,7 @@ namespace ArisenEngine::RHI
     {
         auto* vkPSO = static_cast<RHIVkGPUPipelineStateObject*>(m_PipelineStateObject);
         RHIVkPSOCacheKey key;
-        key.psoHash = vkPSO->GetHash();
+        key.psoIdentity = vkPSO->GetCacheIdentity();
         if (m_SubPass)
         {
             key.renderPass = static_cast<VkRenderPass>(m_SubPass->GetOwner()->GetHandle(frameIndex));
@@ -89,7 +148,7 @@ namespace ArisenEngine::RHI
         // Compute pipelines don't have render passes
         auto* vkPSO = static_cast<RHIVkGPUPipelineStateObject*>(m_PipelineStateObject);
         RHIVkPSOCacheKey key;
-        key.psoHash = vkPSO->GetHash();
+        key.psoIdentity = vkPSO->GetCacheIdentity();
         key.renderPass = VK_NULL_HANDLE;
         key.subpassIndex = 0;
 
@@ -108,7 +167,7 @@ namespace ArisenEngine::RHI
         auto* cache = static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())->GetPSOCache();
 
         // 1. Get or Create Layout
-        VkPipelineLayout layout = cache->GetLayout(vkPSO->GetHash());
+        VkPipelineLayout layout = cache->GetLayout(vkPSO->GetCacheIdentity());
         if (layout == VK_NULL_HANDLE)
         {
             VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
@@ -122,12 +181,13 @@ namespace ArisenEngine::RHI
             {
                 LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocGraphicPipeline]: failed to create pipeline layout!");
             }
-            cache->StoreLayout(vkPSO->GetHash(), layout);
+            m_Resource->TrackPipelineLayout(layout);
+            cache->StoreLayout(vkPSO->GetCacheIdentity(), layout);
         }
 
         // 2. Build Cache Key for Pipeline
         RHIVkPSOCacheKey key;
-        key.psoHash = vkPSO->GetHash();
+        key.psoIdentity = vkPSO->GetCacheIdentity();
         if (subPass)
         {
             key.renderPass = static_cast<VkRenderPass>(subPass->GetOwner()->GetHandle(frameIndex));
@@ -364,6 +424,7 @@ namespace ArisenEngine::RHI
         {
             LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocPipeline]: failed to create GPU pipeline!");
         }
+        m_Resource->TrackPipeline(pipeline);
         cache->StorePipeline(key, pipeline);
     }
 
@@ -374,7 +435,7 @@ namespace ArisenEngine::RHI
         auto* cache = static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())->GetPSOCache();
 
         // 1. Get or Create Layout
-        VkPipelineLayout layout = cache->GetLayout(vkPso->GetHash());
+        VkPipelineLayout layout = cache->GetLayout(vkPso->GetCacheIdentity());
         if (layout == VK_NULL_HANDLE)
         {
             VkPipelineLayoutCreateInfo layoutInfo{};
@@ -388,12 +449,13 @@ namespace ArisenEngine::RHI
             {
                 LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocComputePipeline]: failed to create pipeline layout!");
             }
-            cache->StoreLayout(vkPso->GetHash(), layout);
+            m_Resource->TrackPipelineLayout(layout);
+            cache->StoreLayout(vkPso->GetCacheIdentity(), layout);
         }
 
         // 2. Build Cache Key
         RHIVkPSOCacheKey key;
-        key.psoHash = vkPso->GetHash();
+        key.psoIdentity = vkPso->GetCacheIdentity();
         key.renderPass = VK_NULL_HANDLE;
         key.subpassIndex = 0;
 
@@ -418,6 +480,7 @@ namespace ArisenEngine::RHI
         {
             LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocComputePipeline]: failed to create compute pipeline!");
         }
+        m_Resource->TrackPipeline(pipeline);
         cache->StorePipeline(key, pipeline);
     }
 
@@ -428,7 +491,7 @@ namespace ArisenEngine::RHI
         auto* cache = static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())->GetPSOCache();
 
         // 1. Get or Create Layout
-        VkPipelineLayout layout = cache->GetLayout(vkPso->GetHash());
+        VkPipelineLayout layout = cache->GetLayout(vkPso->GetCacheIdentity());
         if (layout == VK_NULL_HANDLE)
         {
             VkPipelineLayoutCreateInfo layoutInfo{};
@@ -442,12 +505,13 @@ namespace ArisenEngine::RHI
             {
                 LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocRayTracingPipeline]: failed to create pipeline layout!");
             }
-            cache->StoreLayout(vkPso->GetHash(), layout);
+            m_Resource->TrackPipelineLayout(layout);
+            cache->StoreLayout(vkPso->GetCacheIdentity(), layout);
         }
 
         // 2. Build Cache Key
         RHIVkPSOCacheKey key;
-        key.psoHash = vkPso->GetHash();
+        key.psoIdentity = vkPso->GetCacheIdentity();
         key.renderPass = VK_NULL_HANDLE;
         key.subpassIndex = 0;
 
@@ -472,6 +536,7 @@ namespace ArisenEngine::RHI
         {
             LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocRayTracingPipeline]: failed to create Ray Tracing pipeline!");
         }
+        m_Resource->TrackPipeline(pipeline);
         cache->StorePipeline(key, pipeline);
     }
 

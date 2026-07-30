@@ -146,15 +146,20 @@ RHI::RHISwapChain* RHI::RHIVkSurface::GetSwapChain()
 
 void RHI::RHIVkSurface::SetResolution(UInt32 width, UInt32 height)
 {
-    if (m_Width == width && m_Height == height && m_SwapChain != nullptr) return;
+    (void)TrySetResolution(width, height);
+}
+
+bool RHI::RHIVkSurface::TrySetResolution(UInt32 width, UInt32 height)
+{
+    if (m_Width == width && m_Height == height && m_SwapChain != nullptr)
+        return true;
+
+    if (m_SwapChain && !m_SwapChain->TrySetResolution(width, height))
+        return false;
 
     m_Width = width;
     m_Height = height;
-
-    if (m_SwapChain)
-    {
-        m_SwapChain->SetResolution(width, height);
-    }
+    return true;
 }
 
 VkSurfaceFormatKHR RHI::RHIVkSurface::GetDefaultSurfaceFormat()

@@ -6,6 +6,7 @@
 namespace ArisenEngine::RHI
 {
     class RHIVkDevice;
+    class RHIVkPipelineResource;
 
     class RHIVkGPUPipelineManager final : public RHIPipelineCache
     {
@@ -17,6 +18,7 @@ namespace ArisenEngine::RHI
         RHIPipelineHandle GetGraphicsPipeline(RHIPipelineState* pso) override;
         RHIPipelineHandle GetComputePipeline(RHIPipelineState* pso) override;
         RHIPipelineHandle GetRayTracingPipeline(RHIPipelineState* pso) override;
+        void ReleasePipeline(RHIPipelineHandle handle) override;
         std::unique_ptr<RHIPipelineState> GetPipelineState() override;
 
         VkPipelineCache GetVkPipelineCache() const { return m_VkPipelineCache; }
@@ -25,10 +27,11 @@ namespace ArisenEngine::RHI
     private:
         void LoadPipelineCache();
         void SavePipelineCache();
+        bool ReleasePipelineInternal(RHIPipelineHandle handle, bool logInvalidHandle);
 
         RHIVkDevice* m_Device;
-        Containers::Map<UInt32, std::unique_ptr<RHIPipeline>> m_GPUPipelines;
-        Containers::Map<UInt32, RHIPipelineHandle> m_PipelineHandles;
+        Containers::Map<UInt64, RHIVkPipelineResource*> m_PipelineResources;
+        Containers::Map<UInt64, RHIPipelineHandle> m_PipelineHandles;
 
         VkPipelineCache m_VkPipelineCache = VK_NULL_HANDLE;
         std::unique_ptr<class RHIVkPSOCache> m_PSOCache;

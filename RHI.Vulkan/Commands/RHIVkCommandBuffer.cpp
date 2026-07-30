@@ -472,6 +472,25 @@ namespace ArisenEngine::RHI
         auto* p = vkDevice->GetPipelinePool()->Get(pipelineHandle);
         if (!p || !p->pipeline) return;
 
+        const RHIResourceHandle registryHandle = p->registryHandle;
+        if (registryHandle.IsValid())
+        {
+            bool alreadyTracked = false;
+            for (RHIResourceHandle tracked : cmd->m_TrackedResourceHandles)
+            {
+                if (tracked == registryHandle)
+                {
+                    alreadyTracked = true;
+                    break;
+                }
+            }
+
+            if (!alreadyTracked && vkDevice->GetResourceRegistry()->Retain(registryHandle))
+            {
+                cmd->m_TrackedResourceHandles.emplace_back(registryHandle);
+            }
+        }
+
         RHIPipeline* pipeline = p->pipeline;
         cmd->m_CurrentPipeline = pipeline;
 
