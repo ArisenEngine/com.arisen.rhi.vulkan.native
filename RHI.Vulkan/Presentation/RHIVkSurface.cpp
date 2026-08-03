@@ -7,6 +7,7 @@
 #include "RHI/Enums/Image/EImageUsageFlagBits.h"
 #include "Windowing/HALWindow.h"
 #include "Windowing/RenderWindowAPI.h"
+#include "Definitions/RHIVkError.h"
 
 
 using namespace ArisenEngine;
@@ -39,11 +40,9 @@ ArisenEngine::RHI::RHIVkSurface::RHIVkSurface(UInt32&& id, RHIInstance* instance
     createInfo.hwnd = HAL::GetWindowHandle(id);
     createInfo.hinstance = GetModuleHandle(nullptr);
 
-    if (vkCreateWin32SurfaceKHR(static_cast<VkInstance>(m_Instance->GetHandle()), &createInfo, nullptr, &m_VkSurface) !=
-        VK_SUCCESS)
-    {
-        LOG_FATAL_AND_THROW("[RHIVkSurface::RHIVkSurface]: failed to create window surface!");
-    }
+    const VkInstance vkInstance = static_cast<VkInstance>(m_Instance->GetHandle());
+    CheckVkResult(vkCreateWin32SurfaceKHR(vkInstance, &createInfo, nullptr, &m_VkSurface),
+                  "vkCreateWin32SurfaceKHR", "VkInstance", GetVkObjectIdentity(vkInstance));
 }
 
 void RHI::RHIVkSurface::InitSwapChain()
@@ -59,8 +58,8 @@ void RHI::RHIVkSurface::InitSwapChain()
     }
 
     auto rhiInstance = static_cast<RHIVkInstance*>(m_Instance);
-    m_SwapChain = new RHIVkSwapChain(rhiInstance->GetLogicalDevice(m_RenderWindowId),
-                                     this, rhiInstance->GetMaxFramesInFlight());
+    auto swapChain = std::make_unique<RHIVkSwapChain>(
+        rhiInstance->GetLogicalDevice(m_RenderWindowId), this, rhiInstance->GetMaxFramesInFlight());
     
     UInt32 width, height, imageCount;
     VkSurfaceFormatKHR formats;
@@ -132,7 +131,8 @@ void RHI::RHIVkSurface::InitSwapChain()
     desc.surfaceTransformFlagBits = static_cast<UInt32>(transform);
     desc.compositeAlphaFlagBits = COMPOSITE_ALPHA_OPAQUE_BIT;
 
-    m_SwapChain->CreateSwapChainWithDesc(desc);
+    swapChain->CreateSwapChainWithDesc(desc);
+    m_SwapChain = swapChain.release();
 }
 
 RHI::RHISwapChain* RHI::RHIVkSurface::GetSwapChain()
@@ -142,6 +142,11 @@ RHI::RHISwapChain* RHI::RHIVkSurface::GetSwapChain()
         InitSwapChain();
     }
     return m_SwapChain;
+}
+
+bool RHI::RHIVkSurface::PrepareForRelease()
+{
+    return m_SwapChain == nullptr || m_SwapChain->PrepareForSurfaceRelease();
 }
 
 void RHI::RHIVkSurface::SetResolution(UInt32 width, UInt32 height)

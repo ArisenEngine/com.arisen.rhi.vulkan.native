@@ -30,6 +30,7 @@ namespace ArisenEngine::RHI
         [[nodiscard]] void* GetHandle() const override { return m_VkSurface; }
 
         void InitSwapChain() override;
+        bool PrepareForRelease();
         const VkQueueFamilyIndices GetQueueFamilyIndices() const { return m_QueueFamilyIndices; }
 
         RHISwapChain* GetSwapChain() override;

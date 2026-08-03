@@ -1,6 +1,8 @@
 #include "Core/RHIVkInstance.h"
 using namespace ArisenEngine;
+using namespace ArisenEngine::RHI;
 #include <vulkan/vulkan_core.h>
+#include "Definitions/RHIVkError.h"
 #include "Pipeline/RHIVkGPUProgram.h"
 #include "Windowing/RenderWindowAPI.h"
 #include "Windowing/RenderWindowAPI.h"
@@ -54,57 +56,6 @@ namespace
         return ArisenEngine::String(result);
     }
 
-    const char* ToVkResultName(VkResult result)
-    {
-        switch (result)
-        {
-        case VK_SUCCESS:
-            return "VK_SUCCESS";
-        case VK_NOT_READY:
-            return "VK_NOT_READY";
-        case VK_TIMEOUT:
-            return "VK_TIMEOUT";
-        case VK_EVENT_SET:
-            return "VK_EVENT_SET";
-        case VK_EVENT_RESET:
-            return "VK_EVENT_RESET";
-        case VK_INCOMPLETE:
-            return "VK_INCOMPLETE";
-        case VK_ERROR_OUT_OF_HOST_MEMORY:
-            return "VK_ERROR_OUT_OF_HOST_MEMORY";
-        case VK_ERROR_OUT_OF_DEVICE_MEMORY:
-            return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
-        case VK_ERROR_INITIALIZATION_FAILED:
-            return "VK_ERROR_INITIALIZATION_FAILED";
-        case VK_ERROR_DEVICE_LOST:
-            return "VK_ERROR_DEVICE_LOST";
-        case VK_ERROR_MEMORY_MAP_FAILED:
-            return "VK_ERROR_MEMORY_MAP_FAILED";
-        case VK_ERROR_LAYER_NOT_PRESENT:
-            return "VK_ERROR_LAYER_NOT_PRESENT";
-        case VK_ERROR_EXTENSION_NOT_PRESENT:
-            return "VK_ERROR_EXTENSION_NOT_PRESENT";
-        case VK_ERROR_FEATURE_NOT_PRESENT:
-            return "VK_ERROR_FEATURE_NOT_PRESENT";
-        case VK_ERROR_INCOMPATIBLE_DRIVER:
-            return "VK_ERROR_INCOMPATIBLE_DRIVER";
-        case VK_ERROR_TOO_MANY_OBJECTS:
-            return "VK_ERROR_TOO_MANY_OBJECTS";
-        case VK_ERROR_FORMAT_NOT_SUPPORTED:
-            return "VK_ERROR_FORMAT_NOT_SUPPORTED";
-        case VK_ERROR_SURFACE_LOST_KHR:
-            return "VK_ERROR_SURFACE_LOST_KHR";
-        case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR:
-            return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
-        case VK_SUBOPTIMAL_KHR:
-            return "VK_SUBOPTIMAL_KHR";
-        case VK_ERROR_OUT_OF_DATE_KHR:
-            return "VK_ERROR_OUT_OF_DATE_KHR";
-        default:
-            return "VK_UNKNOWN_RESULT";
-        }
-    }
-
     bool IsMandatoryInstanceExtension(const char* extensionName, bool validationEnabled)
     {
         if (strcmp(extensionName, VK_KHR_SURFACE_EXTENSION_NAME) == 0) return true;
@@ -112,6 +63,37 @@ namespace
         if (validationEnabled && strcmp(extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) return true;
 
         return false;
+    }
+
+    template <typename T, typename TEnumerator>
+    ArisenEngine::Containers::Vector<T> EnumerateVkObjects(
+        const char* operation,
+        const char* objectType,
+        uint64_t objectIdentity,
+        TEnumerator&& enumerate)
+    {
+        ArisenEngine::Containers::Vector<T> values;
+        for (;;)
+        {
+            uint32_t count = 0;
+            CheckVkResult(
+                enumerate(&count, nullptr),
+                operation,
+                objectType,
+                objectIdentity);
+            if (count == 0)
+                return values;
+
+            values.resize(count);
+            uint32_t writtenCount = count;
+            const VkResult result = enumerate(&writtenCount, values.data());
+            if (result == VK_INCOMPLETE)
+                continue;
+
+            CheckVkResult(result, operation, objectType, objectIdentity);
+            values.resize(writtenCount);
+            return values;
+        }
     }
 }
 
@@ -155,11 +137,14 @@ namespace ArisenEngine::RHI
 }
 bool CheckDeviceExtensionSupport(VkPhysicalDevice device)
 {
-    uint32_t extensionCount;
-    vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, nullptr);
-
-    ArisenEngine::Containers::Vector<VkExtensionProperties> availableExtensions(extensionCount);
-    vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, availableExtensions.data());
+    const auto availableExtensions = EnumerateVkObjects<VkExtensionProperties>(
+        "vkEnumerateDeviceExtensionProperties",
+        "VkPhysicalDevice",
+        GetVkObjectIdentity(device),
+        [device](uint32_t* count, VkExtensionProperties* values)
+        {
+            return vkEnumerateDeviceExtensionProperties(device, nullptr, count, values);
+        });
 
     const auto& mandatoryExtensions = ArisenEngine::RHI::VulkanInitSettings::GetDefault().mandatoryDeviceExtensions;
     ArisenEngine::Containers::Set<String> requiredExtensions(mandatoryExtensions.begin(),
@@ -236,11 +221,14 @@ int RateDeviceSuitability(VkPhysicalDevice device)
 
 bool CheckValidationLayerSupport()
 {
-    uint32_t layerCount;
-    vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
-
-    std::vector<VkLayerProperties> availableLayers(layerCount);
-    vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
+    const auto availableLayers = EnumerateVkObjects<VkLayerProperties>(
+        "vkEnumerateInstanceLayerProperties",
+        "VulkanLoader",
+        0,
+        [](uint32_t* count, VkLayerProperties* values)
+        {
+            return vkEnumerateInstanceLayerProperties(count, values);
+        });
 
     const auto& valLayers = ArisenEngine::RHI::VulkanInitSettings::GetDefault().validationLayers;
     for (const char* layerName : valLayers)
@@ -280,8 +268,6 @@ VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
         // This warning is usually caused by external tools like RenderDoc and is non-critical.
         return VK_FALSE;
     }
-
-    std::cout << pCallbackData->pMessage << std::endl;
 
     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
     {
@@ -360,10 +346,14 @@ ArisenEngine::RHI::RHIVkInstance::RHIVkInstance(RHIInstanceInfo&& app_info): RHI
     Containers::Vector<String> missingMandatoryInstanceExtensions;
 
     // shows all supported extensions
-    uint32_t extensionCount = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr);
-    std::vector<VkExtensionProperties> extensions(extensionCount);
-    vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, extensions.data());
+    const auto extensions = EnumerateVkObjects<VkExtensionProperties>(
+        "vkEnumerateInstanceExtensionProperties",
+        "VulkanLoader",
+        0,
+        [](uint32_t* count, VkExtensionProperties* values)
+        {
+            return vkEnumerateInstanceExtensionProperties(nullptr, count, values);
+        });
 
 #if _DEBUG
     LOG_DEBUG("[RHIVkInstance::RHIVkInstance]: available extensions:");
@@ -490,17 +480,20 @@ ArisenEngine::RHI::RHIVkInstance::RHIVkInstance(RHIInstanceInfo&& app_info): RHI
         m_EnabledInstanceExtensions.push_back(extensionName);
     }
 
-    VkResult result = vkCreateInstance(&createInfo, nullptr, &m_VkInstance);
-    if (result != VK_SUCCESS)
-    {
-        LOG_FATAL_AND_THROW(
-            String::Format(
-                "[RHIVkInstance::RHIVkInstance]: failed to create Vulkan instance. VkResult=%s (%d). Check Vulkan loader/runtime installation and graphics driver compatibility.",
-                ToVkResultName(result),
-                static_cast<int>(result)));
-    }
+    CheckVkResult(vkCreateInstance(&createInfo, nullptr, &m_VkInstance),
+                  "vkCreateInstance", "VulkanLoader", 0, UINT32_MAX, 0,
+                  "Check Vulkan runtime, driver, layers, and requested extensions");
 
-    SetupDebugMessager();
+    try
+    {
+        SetupDebugMessager();
+    }
+    catch (...)
+    {
+        vkDestroyInstance(m_VkInstance, nullptr);
+        m_VkInstance = VK_NULL_HANDLE;
+        throw;
+    }
 }
 
 String ArisenEngine::RHI::RHIVkInstance::GetAdapterName() const
@@ -640,7 +633,10 @@ ArisenEngine::RHI::VkQueueFamilyIndices ArisenEngine::RHI::RHIVkInstance::FindQu
         if (surface != VK_NULL_HANDLE)
         {
             VkBool32 presentSupport = false;
-            vkGetPhysicalDeviceSurfaceSupportKHR(m_CurrentPhysicsDevice, i, surface, &presentSupport);
+            CheckVkResult(vkGetPhysicalDeviceSurfaceSupportKHR(
+                              m_CurrentPhysicsDevice, i, surface, &presentSupport),
+                          "vkGetPhysicalDeviceSurfaceSupportKHR", "VkSurfaceKHR",
+                          GetVkObjectIdentity(surface));
 
             if (presentSupport)
             {
@@ -681,26 +677,30 @@ const ArisenEngine::RHI::VkSwapChainSupportDetail ArisenEngine::RHI::RHIVkInstan
         return details;
     }
 
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(m_CurrentPhysicsDevice, surface, &details.capabilities);
+    CheckVkResult(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+                      m_CurrentPhysicsDevice, surface, &details.capabilities),
+                  "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", "VkSurfaceKHR",
+                  GetVkObjectIdentity(surface));
 
-    uint32_t formatCount;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(m_CurrentPhysicsDevice, surface, &formatCount, nullptr);
+    details.formats = EnumerateVkObjects<VkSurfaceFormatKHR>(
+        "vkGetPhysicalDeviceSurfaceFormatsKHR",
+        "VkSurfaceKHR",
+        GetVkObjectIdentity(surface),
+        [this, surface](uint32_t* count, VkSurfaceFormatKHR* values)
+        {
+            return vkGetPhysicalDeviceSurfaceFormatsKHR(
+                m_CurrentPhysicsDevice, surface, count, values);
+        });
 
-    if (formatCount != 0)
-    {
-        details.formats.resize(formatCount);
-        vkGetPhysicalDeviceSurfaceFormatsKHR(m_CurrentPhysicsDevice, surface, &formatCount, details.formats.data());
-    }
-
-    uint32_t presentModeCount;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(m_CurrentPhysicsDevice, surface, &presentModeCount, nullptr);
-
-    if (presentModeCount != 0)
-    {
-        details.presentModes.resize(presentModeCount);
-        vkGetPhysicalDeviceSurfacePresentModesKHR(m_CurrentPhysicsDevice, surface, &presentModeCount,
-                                                  details.presentModes.data());
-    }
+    details.presentModes = EnumerateVkObjects<VkPresentModeKHR>(
+        "vkGetPhysicalDeviceSurfacePresentModesKHR",
+        "VkSurfaceKHR",
+        GetVkObjectIdentity(surface),
+        [this, surface](uint32_t* count, VkPresentModeKHR* values)
+        {
+            return vkGetPhysicalDeviceSurfacePresentModesKHR(
+                m_CurrentPhysicsDevice, surface, count, values);
+        });
 
     return details;
 }
@@ -715,15 +715,11 @@ void ArisenEngine::RHI::RHIVkInstance::SetupDebugMessager()
     VkDebugUtilsMessengerCreateInfoEXT createInfo;
     PopulateDebugMessengerCreateInfo(createInfo);
 
-    VkResult result = CreateDebugUtilsMessengerEXT(m_VkInstance, &createInfo, nullptr, &m_VkDebugMessenger);
-    if (result != VK_SUCCESS)
-    {
-        LOG_FATAL_AND_THROW(
-            String::Format(
-                "[RHIVkInstance::SetupDebugMessager]: failed to set up debug messenger. VkResult=%s (%d). Ensure VK_EXT_debug_utils is available when validation is enabled.",
-                ToVkResultName(result),
-                static_cast<int>(result)));
-    }
+    CheckVkResult(CreateDebugUtilsMessengerEXT(
+                      m_VkInstance, &createInfo, nullptr, &m_VkDebugMessenger),
+                  "vkCreateDebugUtilsMessengerEXT", "VkInstance",
+                  GetVkObjectIdentity(m_VkInstance), UINT32_MAX, 0,
+                  "VK_EXT_debug_utils is required when validation is enabled");
 }
 
 void DestroyDebugUtilsMessengerEXT(
@@ -765,6 +761,14 @@ void ArisenEngine::RHI::RHIVkInstance::DestroySurface(UInt32 windowId)
     auto it = m_Surfaces.find(windowId);
     if (it != m_Surfaces.end())
     {
+        if (it->second && !it->second->PrepareForRelease())
+        {
+            ThrowInvalidState(
+                "RHIInstance_DestroySurface",
+                "RHIVkSurface",
+                windowId,
+                "Surface release did not commit; active frame, external-consumer lease, or GPU generation ownership remains");
+        }
         it->second.reset();
         m_Surfaces.erase(it);
     }
@@ -909,10 +913,15 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
     }
 
     // Enumerate supported device extensions
-    uint32_t extensionCount = 0;
-    vkEnumerateDeviceExtensionProperties(m_CurrentPhysicsDevice, nullptr, &extensionCount, nullptr);
-    Containers::Vector<VkExtensionProperties> availableExtensions(extensionCount);
-    vkEnumerateDeviceExtensionProperties(m_CurrentPhysicsDevice, nullptr, &extensionCount, availableExtensions.data());
+    const auto availableExtensions = EnumerateVkObjects<VkExtensionProperties>(
+        "vkEnumerateDeviceExtensionProperties",
+        "VkPhysicalDevice",
+        GetVkObjectIdentity(m_CurrentPhysicsDevice),
+        [this](uint32_t* count, VkExtensionProperties* values)
+        {
+            return vkEnumerateDeviceExtensionProperties(
+                m_CurrentPhysicsDevice, nullptr, count, values);
+        });
 
     Containers::Vector<const char*> enabledExtensions;
     m_EnabledDeviceExtensions.clear();
@@ -1169,19 +1178,10 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
         createInfo.enabledLayerCount = 0;
     }
 
-    VkDevice device;
-    VkResult res = vkCreateDevice(m_CurrentPhysicsDevice, &createInfo, nullptr, &device);
-    if (res != VK_SUCCESS)
-    {
-        LOG_FATAL_AND_THROW(
-            String::Format(
-                "[RHIVkInstance::CreateLogicDevice]: failed to create Vulkan logical device. VkResult=%s (%d), Adapter=%s, EnabledExtensions=%s, MissingExtensions=%s",
-                ToVkResultName(res),
-                static_cast<int>(res),
-                GetAdapterName().GetString(),
-                JoinStrings(m_EnabledDeviceExtensions).GetString(),
-                GetMissingDeviceExtensions().GetString()));
-    }
+    VkDevice device = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateDevice(m_CurrentPhysicsDevice, &createInfo, nullptr, &device),
+                  "vkCreateDevice", "VkPhysicalDevice",
+                  GetVkObjectIdentity(m_CurrentPhysicsDevice));
 
     Containers::Map<uint32_t, uint32_t> nextQueueIndex;
     auto getNextQueueIndex = [&](uint32_t family) -> uint32_t {
@@ -1220,12 +1220,22 @@ void ArisenEngine::RHI::RHIVkInstance::CreateLogicDevice(UInt32 windowId)
     VkPhysicalDeviceMemoryProperties memoryProperties;
     vkGetPhysicalDeviceMemoryProperties(m_CurrentPhysicsDevice, &memoryProperties);
 
-    auto logicalDevice = std::make_unique<RHIVkDevice>(this, rhiSurface, graphicQueue, presentQueue, computeQueue,
-                                                       transferQueue, device, memoryProperties,
-                                                       indices.graphicsFamily.value(),
-                                                       indices.computeFamily.value_or(0),
-                                                       indices.transferFamily.value_or(0),
-                                                       indices.presentFamily.value_or(0));
+    std::unique_ptr<RHIVkDevice> logicalDevice;
+    try
+    {
+        logicalDevice = std::make_unique<RHIVkDevice>(
+            this, rhiSurface, graphicQueue, presentQueue, computeQueue,
+            transferQueue, device, memoryProperties,
+            indices.graphicsFamily.value(),
+            indices.computeFamily.value_or(0),
+            indices.transferFamily.value_or(0),
+            indices.presentFamily.value_or(0));
+    }
+    catch (...)
+    {
+        vkDestroyDevice(device, nullptr);
+        throw;
+    }
     VkPhysicalDeviceProperties physicalProperties{};
     vkGetPhysicalDeviceProperties(m_CurrentPhysicsDevice, &physicalProperties);
     {
@@ -1478,7 +1488,13 @@ ArisenEngine::RHI::RHIVkInstance::~RHIVkInstance() noexcept
             auto* vkDevice = static_cast<RHIVkDevice*>(pair.second.get());
             if (vkDevice->GetHandle())
             {
-                vkDeviceWaitIdle(static_cast<VkDevice>(vkDevice->GetHandle()));
+                const VkResult idleResult = vkDeviceWaitIdle(static_cast<VkDevice>(vkDevice->GetHandle()));
+                if (idleResult != VK_SUCCESS)
+                {
+                    LOG_ERRORF("[RHIVkInstance::~RHIVkInstance]: vkDeviceWaitIdle failed for surface {0} "
+                               "with {1} ({2}).",
+                               pair.first, GetVkResultName(idleResult), static_cast<int>(idleResult));
+                }
             }
         }
     }
@@ -1544,19 +1560,24 @@ void ArisenEngine::RHI::RHIVkInstance::PickPhysicalDevice(bool considerSurface)
 
     // TODO: pick device by surface ?
 
-    uint32_t deviceCount = 0;
-    vkEnumeratePhysicalDevices(m_VkInstance, &deviceCount, nullptr);
+    const auto devices = EnumerateVkObjects<VkPhysicalDevice>(
+        "vkEnumeratePhysicalDevices",
+        "VkInstance",
+        GetVkObjectIdentity(m_VkInstance),
+        [this](uint32_t* count, VkPhysicalDevice* values)
+        {
+            return vkEnumeratePhysicalDevices(m_VkInstance, count, values);
+        });
 
-    if (deviceCount == 0)
+    if (devices.empty())
     {
         LOG_FATAL_AND_THROW(
             "[RHIVkInstance::PickPhysicalDevice]: no Vulkan-capable GPU was reported by the Vulkan runtime. Check graphics driver installation and Vulkan ICD registration.");
     }
 
-    LOG_DEBUG(String::Format("[RHIVkInstance::PickPhysicalDevice]: Device Count: %d", deviceCount));
-
-    Containers::Vector<VkPhysicalDevice> devices(deviceCount);
-    vkEnumeratePhysicalDevices(m_VkInstance, &deviceCount, devices.data());
+    LOG_DEBUG(String::Format(
+        "[RHIVkInstance::PickPhysicalDevice]: Device Count: %d",
+        static_cast<int>(devices.size())));
 
     // Use an ordered map to automatically sort candidates by increasing score
     Containers::Multimap<int, VkPhysicalDevice> candidates;

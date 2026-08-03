@@ -1,7 +1,9 @@
 #pragma once
 #include <vulkan/vulkan_core.h>
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <utility>
 #include "Base/FoundationMinimal.h"
 
 namespace ArisenEngine::RHI
@@ -45,9 +47,21 @@ namespace ArisenEngine::RHI
         void StoreLayout(UInt64 psoIdentity, VkPipelineLayout layout);
 
         void Remove(UInt64 psoIdentity);
+        template <typename TBeforeCommit>
+        bool RemoveAfter(UInt64 psoIdentity, TBeforeCommit&& beforeCommit)
+        {
+            std::unique_lock lock(m_Mutex);
+            if (!std::forward<TBeforeCommit>(beforeCommit)())
+                return false;
+
+            RemoveUnlocked(psoIdentity);
+            return true;
+        }
         void Clear();
 
     private:
+        void RemoveUnlocked(UInt64 psoIdentity);
+
         RHIVkDevice* m_Device;
         VkDevice m_VkDevice;
 

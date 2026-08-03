@@ -1,4 +1,5 @@
 #include "Commands/RHIVkCommandBufferPool.h"
+#include "Definitions/RHIVkError.h"
 #include "Profiler.h"
 #include "Logger/Logger.h"
 
@@ -223,10 +224,16 @@ RHIVkCommandBufferPool::ThreadSlot& ArisenEngine::RHI::RHIVkCommandBufferPool::G
             poolInfo.queueFamilyIndex = vkDevice->GetGraphicsFamilyIndex();
         }
 
-        if (vkCreateCommandPool(m_VkDevice, &poolInfo, nullptr, &slot.commandPool) != VK_SUCCESS)
+        try
         {
-            LOG_FATAL_AND_THROW(
-                "[RHIVkCommandBufferPool::GetCurrentThreadSlot]: failed to create command pool for thread!");
+            CheckVkResult(vkCreateCommandPool(m_VkDevice, &poolInfo, nullptr, &slot.commandPool),
+                          "vkCreateCommandPool", "RHIVkDevice", GetVkObjectIdentity(m_VkDevice));
+        }
+        catch (...)
+        {
+            slot.commandPool = VK_NULL_HANDLE;
+            slot.initialized.store(false, std::memory_order_release);
+            throw;
         }
     }
 

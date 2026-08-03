@@ -18,13 +18,15 @@ namespace ArisenEngine::RHI
         RHIPipelineHandle GetGraphicsPipeline(RHIPipelineState* pso) override;
         RHIPipelineHandle GetComputePipeline(RHIPipelineState* pso) override;
         RHIPipelineHandle GetRayTracingPipeline(RHIPipelineState* pso) override;
-        void ReleasePipeline(RHIPipelineHandle handle) override;
+        bool ReleasePipeline(RHIPipelineHandle handle) override;
+        bool IsAlive(RHIPipelineHandle handle) const override;
         std::unique_ptr<RHIPipelineState> GetPipelineState() override;
 
         VkPipelineCache GetVkPipelineCache() const { return m_VkPipelineCache; }
         class RHIVkPSOCache* GetPSOCache() const { return m_PSOCache.get(); }
 
     private:
+        RHIPipelineHandle CreatePipeline(RHIPipelineState* pso, UInt64 identity);
         void LoadPipelineCache();
         void SavePipelineCache();
         bool ReleasePipelineInternal(RHIPipelineHandle handle, bool logInvalidHandle);

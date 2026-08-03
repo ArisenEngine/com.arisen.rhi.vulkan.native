@@ -1,4 +1,5 @@
 #include "RHIVkCommandBuffer.h"
+#include "Definitions/RHIVkError.h"
 #include "RHI/Enums/Buffer/EBufferUsage.h"
 
 #include "Commands/RHIVkCommandBufferPool.h"
@@ -117,16 +118,10 @@ namespace ArisenEngine::RHI
 
     RHIVkCommandBuffer::~RHIVkCommandBuffer() noexcept
     {
-        // Ensure resources are released if the buffer is destroyed before submission
-        auto* vkDevice = GetVkDevice();
-        auto* registry = vkDevice->GetResourceRegistry();
-        if (registry)
-        {
-            for (auto h : m_TrackedResourceHandles)
-            {
-                registry->Release(h);
-            }
-        }
+        if (!TryReleaseTrackedDescriptorPoolUses("RHIVkCommandBuffer::~RHIVkCommandBuffer"))
+            LOG_ERROR("[RHIVkCommandBuffer::~RHIVkCommandBuffer]: Descriptor-pool uses remain for terminal device shutdown.");
+        if (!TryReleaseTrackedResourceHandles("RHIVkCommandBuffer::~RHIVkCommandBuffer"))
+            LOG_ERROR("[RHIVkCommandBuffer::~RHIVkCommandBuffer]: Registry retains remain for terminal device shutdown.");
     }
 
     RHIVkDevice* RHIVkCommandBuffer::GetVkDevice() const
@@ -154,10 +149,10 @@ namespace ArisenEngine::RHI
             allocInfo.commandBufferCount = 1;
 
             // todo: separate alloc memory and free memory
-            if (::vkAllocateCommandBuffers(this->m_VkDevice, &allocInfo, &this->m_VkCommandBuffer) != VK_SUCCESS)
-            {
-                LOG_FATAL_AND_THROW("[RHIVkCommandBuffer::RHIVkCommandBuffer]: failed to allocate command buffers!");
-            }
+            CheckVkResult(
+                ::vkAllocateCommandBuffers(this->m_VkDevice, &allocInfo, &this->m_VkCommandBuffer),
+                "vkAllocateCommandBuffers", "RHIVkCommandBufferPool",
+                GetVkObjectIdentity(this->m_VkCommandPool));
         }
 
         SetState(ECommandBufferState::Initial);
@@ -258,6 +253,7 @@ namespace ArisenEngine::RHI
             vkAtt.loadOp = static_cast<VkAttachmentLoadOp>(att.loadOp);
             vkAtt.storeOp = static_cast<VkAttachmentStoreOp>(att.storeOp);
 
+            cmd->CaptureResource(att.imageView);
             auto* view = vkDevice->GetImageViewPool()->Get(att.imageView);
             if (view)
             {
@@ -275,6 +271,7 @@ namespace ArisenEngine::RHI
             if (info.pResolveAttachments != nullptr)
             {
                 const auto& resolveAtt = info.pResolveAttachments[i];
+                cmd->CaptureResource(resolveAtt.imageView);
                 auto* resolveView = vkDevice->GetImageViewPool()->Get(resolveAtt.imageView);
                 if (resolveView)
                 {
@@ -291,6 +288,7 @@ namespace ArisenEngine::RHI
         if (info.pDepthAttachment != nullptr)
         {
             const auto& att = *info.pDepthAttachment;
+            cmd->CaptureResource(att.imageView);
             auto* view = vkDevice->GetImageViewPool()->Get(att.imageView);
             if (view)
             {
@@ -308,6 +306,7 @@ namespace ArisenEngine::RHI
         if (info.pStencilAttachment != nullptr)
         {
             const auto& att = *info.pStencilAttachment;
+            cmd->CaptureResource(att.imageView);
             auto* view = vkDevice->GetImageViewPool()->Get(att.imageView);
             if (view)
             {
@@ -374,21 +373,129 @@ namespace ArisenEngine::RHI
             beginInfo.pInheritanceInfo = &inheritanceInfo;
         }
 
-        if (::vkBeginCommandBuffer(cmd->m_VkCommandBuffer, &beginInfo) != VK_SUCCESS)
-        {
-            LOG_FATAL("[RHIVkCommandBuffer::Begin]: failed to begin recording command buffer!");
-        }
+        CheckVkResult(::vkBeginCommandBuffer(cmd->m_VkCommandBuffer, &beginInfo),
+                      "vkBeginCommandBuffer", "RHIVkCommandBuffer",
+                      GetVkObjectIdentity(cmd->m_VkCommandBuffer));
     }
 
     void RHIVkExecutor::End()
     {
         ARISEN_PROFILE_ZONE("Vk::End");
-        if (::vkEndCommandBuffer(cmd->m_VkCommandBuffer) != VK_SUCCESS)
-        {
-            LOG_FATAL("[RHIVkCommandBuffer::End]: failed to record command buffer!");
-        }
+        CheckVkResult(::vkEndCommandBuffer(cmd->m_VkCommandBuffer),
+                      "vkEndCommandBuffer", "RHIVkCommandBuffer",
+                      GetVkObjectIdentity(cmd->m_VkCommandBuffer));
     }
 
+
+    void RHIVkCommandBuffer::CaptureRegistryResource(RHIResourceHandle registryHandle,
+                                                      const char* objectType,
+                                                      UInt32 ownerIndex,
+                                                      UInt32 ownerGeneration)
+    {
+        if (!registryHandle.IsValid())
+        {
+            ThrowInvalidState("RHIVkCommandBuffer::CaptureResource", objectType,
+                              GetVkObjectIdentity(m_VkCommandBuffer),
+                              "Resource has no valid deferred-lifetime owner",
+                              ownerIndex, ownerGeneration);
+        }
+
+        for (RHIResourceHandle tracked : m_TrackedResourceHandles)
+        {
+            if (tracked == registryHandle)
+                return;
+        }
+
+        auto* registry = GetVkDevice()->GetResourceRegistry();
+        if (!registry)
+        {
+            ThrowInvalidState("RHIVkCommandBuffer::CaptureResource", objectType,
+                              GetVkObjectIdentity(m_VkCommandBuffer),
+                              "Resource registry is unavailable",
+                              ownerIndex, ownerGeneration);
+        }
+
+        // Complete every fallible vector allocation before publishing the retain.
+        m_TrackedResourceHandles.reserve(m_TrackedResourceHandles.size() + 1);
+        if (!registry->Retain(registryHandle))
+        {
+            ThrowInvalidHandle("RHIVkCommandBuffer::CaptureResource", objectType,
+                               ownerIndex, ownerGeneration,
+                               "Deferred resource ownership became stale during command compilation",
+                               GetVkObjectIdentity(m_VkCommandBuffer));
+        }
+        m_TrackedResourceHandles.emplace_back(registryHandle);
+    }
+
+    bool RHIVkCommandBuffer::TryReleaseTrackedResourceHandles(const char* operation) noexcept
+    {
+        auto* vkDevice = GetVkDevice();
+        auto* registry = vkDevice ? vkDevice->GetResourceRegistry() : nullptr;
+        if (!registry)
+            return m_TrackedResourceHandles.empty();
+
+        size_t retainedCount = 0;
+        for (RHIResourceHandle handle : m_TrackedResourceHandles)
+        {
+            bool released = false;
+            try
+            {
+                released = registry->Release(handle);
+            }
+            catch (const std::exception& error)
+            {
+                LOG_ERRORF("[{0}]: Resource release {1}:{2} failed: {3}",
+                           operation, handle.index, handle.generation, error.what());
+            }
+            catch (...)
+            {
+                LOG_ERRORF("[{0}]: Resource release {1}:{2} failed with an unknown error.",
+                           operation, handle.index, handle.generation);
+            }
+
+            if (!released)
+                m_TrackedResourceHandles[retainedCount++] = handle;
+        }
+        m_TrackedResourceHandles.resize(retainedCount);
+        return retainedCount == 0;
+    }
+
+    bool RHIVkCommandBuffer::TryReleaseTrackedDescriptorPoolUses(const char* operation) noexcept
+    {
+        auto* vkDevice = GetVkDevice();
+        auto* poolRegistry = vkDevice ? vkDevice->GetDescriptorPoolPool() : nullptr;
+        if (!poolRegistry)
+            return m_TrackedDescriptorPools.empty();
+
+        size_t retainedCount = 0;
+        for (const TrackedPoolUse& tracked : m_TrackedDescriptorPools)
+        {
+            bool released = false;
+            try
+            {
+                auto* poolItem = poolRegistry->Get(tracked.poolHandle);
+                auto* pool = poolItem ? static_cast<RHIVkDescriptorPool*>(poolItem->pool) : nullptr;
+                released = pool && pool->ReleasePoolUse(tracked.poolId);
+            }
+            catch (const std::exception& error)
+            {
+                LOG_ERRORF("[{0}]: Descriptor-pool use {1}:{2}/{3} release failed: {4}",
+                           operation, tracked.poolHandle.index, tracked.poolHandle.generation,
+                           tracked.poolId, error.what());
+            }
+            catch (...)
+            {
+                LOG_ERRORF("[{0}]: Descriptor-pool use {1}:{2}/{3} release failed with an unknown error.",
+                           operation, tracked.poolHandle.index, tracked.poolHandle.generation,
+                           tracked.poolId);
+            }
+
+            if (!released)
+                m_TrackedDescriptorPools[retainedCount++] = tracked;
+        }
+        m_TrackedDescriptorPools.resize(retainedCount);
+        return retainedCount == 0;
+    }
 
     void RHIVkCommandBuffer::CaptureResource(RHIBufferHandle buffer)
     {
@@ -397,24 +504,9 @@ namespace ArisenEngine::RHI
         auto* buf = vkDevice->GetBufferPool()->Get(buffer);
         if (!buf) return;
 
-        auto handle = buf->registryHandle;
-
-        // Performance: skip redundant tracking
-        for (const auto& h : this->m_TrackedResourceHandles)
-        {
-            if (h.index == handle.index && h.generation == handle.generation) goto check_mem;
-        }
-
-        if (handle.IsValid())
-        {
-            m_TrackedResourceHandles.emplace_back(handle);
-            vkDevice->GetResourceRegistry()->Retain(handle);
-        }
-
-    check_mem:
+        CaptureRegistryResource(buf->registryHandle, "RHIBuffer", buffer.index, buffer.generation);
         // Memory is now managed by VMA and bound to the buffer/image. 
         // We don't have a separate RHIDeviceMemory handle to track for resource lifetime in the same way.
-        return;
     }
 
     void RHIVkCommandBuffer::CaptureResource(RHIImageHandle image)
@@ -424,22 +516,49 @@ namespace ArisenEngine::RHI
         auto* img = vkDevice->GetImagePool()->Get(image);
         if (!img) return;
 
-        auto handle = img->registryHandle;
-
-        for (const auto& h : this->m_TrackedResourceHandles)
-        {
-            if (h.index == handle.index && h.generation == handle.generation) goto check_mem;
-        }
-
-        if (handle.IsValid())
-        {
-            m_TrackedResourceHandles.emplace_back(handle);
-            vkDevice->GetResourceRegistry()->Retain(handle);
-        }
-
-    check_mem:
+        CaptureRegistryResource(img->registryHandle, "RHIImage", image.index, image.generation);
         // Memory is now managed by VMA and bound to the buffer/image.
-        return;
+    }
+
+    void RHIVkCommandBuffer::CaptureResource(RHIImageViewHandle imageView)
+    {
+        if (!imageView.IsValid()) return;
+
+        auto* vkDevice = GetVkDevice();
+        auto* view = vkDevice->GetImageViewPool()->Get(imageView);
+        if (!view)
+        {
+            ThrowInvalidHandle(
+                "RHIVkCommandBuffer::CaptureResource",
+                "RHIImageView",
+                imageView.index,
+                imageView.generation,
+                "Image-view attachment is stale",
+                GetVkObjectIdentity(m_VkCommandBuffer));
+        }
+
+        auto* image = vkDevice->GetImagePool()->Get(view->imageHandle);
+        if (!image)
+        {
+            ThrowInvalidHandle(
+                "RHIVkCommandBuffer::CaptureResource",
+                "RHIImage",
+                view->imageHandle.index,
+                view->imageHandle.generation,
+                "Image-view attachment refers to a stale image",
+                GetVkObjectIdentity(m_VkCommandBuffer));
+        }
+
+        CaptureRegistryResource(
+            view->registryHandle,
+            "RHIImageView",
+            imageView.index,
+            imageView.generation);
+        CaptureRegistryResource(
+            image->registryHandle,
+            "RHIImage",
+            view->imageHandle.index,
+            view->imageHandle.generation);
     }
 
     void RHIVkCommandBuffer::CaptureResource(RHIAccelerationStructureHandle handle)
@@ -449,18 +568,8 @@ namespace ArisenEngine::RHI
         auto* as = vkDevice->m_AccelerationStructurePool->Get(handle);
         if (!as) return;
 
-        auto regHandle = as->registryHandle;
-
-        for (const auto& h : this->m_TrackedResourceHandles)
-        {
-            if (h.index == regHandle.index && h.generation == regHandle.generation) return;
-        }
-
-        if (regHandle.IsValid())
-        {
-            m_TrackedResourceHandles.emplace_back(regHandle);
-            vkDevice->GetResourceRegistry()->Retain(regHandle);
-        }
+        CaptureRegistryResource(as->registryHandle, "RHIAccelerationStructure",
+                                handle.index, handle.generation);
     }
 
 
@@ -472,24 +581,8 @@ namespace ArisenEngine::RHI
         auto* p = vkDevice->GetPipelinePool()->Get(pipelineHandle);
         if (!p || !p->pipeline) return;
 
-        const RHIResourceHandle registryHandle = p->registryHandle;
-        if (registryHandle.IsValid())
-        {
-            bool alreadyTracked = false;
-            for (RHIResourceHandle tracked : cmd->m_TrackedResourceHandles)
-            {
-                if (tracked == registryHandle)
-                {
-                    alreadyTracked = true;
-                    break;
-                }
-            }
-
-            if (!alreadyTracked && vkDevice->GetResourceRegistry()->Retain(registryHandle))
-            {
-                cmd->m_TrackedResourceHandles.emplace_back(registryHandle);
-            }
-        }
+        cmd->CaptureRegistryResource(p->registryHandle, "RHIPipeline",
+                                     pipelineHandle.index, pipelineHandle.generation);
 
         RHIPipeline* pipeline = p->pipeline;
         cmd->m_CurrentPipeline = pipeline;
@@ -549,51 +642,52 @@ namespace ArisenEngine::RHI
         ARISEN_PROFILE_ZONE("Vk::BindDescriptorSets");
         auto* vkDevice = cmd->GetVkDevice();
         auto* poolItem = vkDevice->GetDescriptorPoolPool()->Get(poolHandle);
-        if (poolItem == nullptr) return;
+        if (!poolItem || !poolItem->pool)
+        {
+            ThrowInvalidHandle("RHIVkExecutor::BindDescriptorSets", "RHIDescriptorPool",
+                               poolHandle.index, poolHandle.generation,
+                               "Descriptor-pool owner became stale during command compilation");
+        }
 
-        RHIDescriptorPool* pool = poolItem->pool;
-        if (pool == nullptr) return;
-
-
-        UInt32 frameIndex = cmd->GetCurrentFrameIndex();
         if (cmd->m_CurrentPipeline == nullptr)
         {
-            LOG_FATAL("[RHIVkExecutor::BindDescriptorSets] pipeline is null, should binding pipeline first.");
-            return;
+            ThrowInvalidState("RHIVkExecutor::BindDescriptorSets", "RHICommandBuffer",
+                              GetVkObjectIdentity(cmd->m_VkCommandBuffer),
+                              "A pipeline must be bound before descriptor sets");
         }
 
-        RHIVkGPUPipeline* pipeline = static_cast<RHIVkGPUPipeline*>(cmd->m_CurrentPipeline);
-        auto& sets = pool->GetDescriptorSets(poolId);
-
-        cmd->m_VkDescriptorSets.clear();
-
-        if (singleSet)
+        bool alreadyTracked = false;
+        for (const auto& tracked : cmd->m_TrackedDescriptorPools)
         {
-            if (setIndex >= sets.size()) return;
-            cmd->m_VkDescriptorSets.emplace_back(static_cast<VkDescriptorSet>(sets[setIndex]->GetHandle()));
-        }
-        else
-        {
-            cmd->m_VkDescriptorSets.reserve(sets.size());
-            for (UInt32 i = 0; i < sets.size(); ++i)
+            if (tracked.poolHandle == poolHandle && tracked.poolId == poolId)
             {
-                cmd->m_VkDescriptorSets.emplace_back(static_cast<VkDescriptorSet>(sets[i]->GetHandle()));
+                alreadyTracked = true;
+                break;
             }
         }
+        if (!alreadyTracked)
+            cmd->m_TrackedDescriptorPools.reserve(cmd->m_TrackedDescriptorPools.size() + 1);
 
-        if (!cmd->m_VkDescriptorSets.empty())
+        auto* pool = static_cast<RHIVkDescriptorPool*>(poolItem->pool);
+        if (!pool->CaptureDescriptorSets(poolId, setIndex, singleSet,
+                                         cmd->m_VkDescriptorSets, !alreadyTracked))
         {
-            ::vkCmdBindDescriptorSets(cmd->m_VkCommandBuffer,
-                                      static_cast<VkPipelineBindPoint>(bindPoint),
-                                      pipeline->GetPipelineLayout(frameIndex),
-                                      firstSet,
-                                      static_cast<uint32_t>(cmd->m_VkDescriptorSets.size()),
-                                      cmd->m_VkDescriptorSets.data(),
-                                      0,
-                                      nullptr);
+            return;
         }
+        if (!alreadyTracked)
+            cmd->m_TrackedDescriptorPools.emplace_back(
+                RHIVkCommandBuffer::TrackedPoolUse{poolHandle, poolId});
 
-        this->TrackDescriptorPoolUse(poolHandle, poolId);
+        const UInt32 frameIndex = cmd->GetCurrentFrameIndex();
+        RHIVkGPUPipeline* pipeline = static_cast<RHIVkGPUPipeline*>(cmd->m_CurrentPipeline);
+        ::vkCmdBindDescriptorSets(cmd->m_VkCommandBuffer,
+                                  static_cast<VkPipelineBindPoint>(bindPoint),
+                                  pipeline->GetPipelineLayout(frameIndex),
+                                  firstSet,
+                                  static_cast<uint32_t>(cmd->m_VkDescriptorSets.size()),
+                                  cmd->m_VkDescriptorSets.data(),
+                                  0,
+                                  nullptr);
     }
 
     // Removing the raw pointer overload since it is deprecated in this path
@@ -1328,22 +1422,26 @@ namespace ArisenEngine::RHI
 
     void RHIVkCommandBuffer::ResetInternal()
     {
+        if (!TryReleaseTrackedDescriptorPoolUses("RHIVkCommandBuffer::ResetInternal"))
+        {
+            ThrowInvalidState("vkResetCommandBuffer", "RHICommandBuffer",
+                              GetVkObjectIdentity(m_VkCommandBuffer),
+                              "Tracked descriptor-pool ownership could not be released",
+                              GetRHIHandle().index, GetRHIHandle().generation);
+        }
+        if (!TryReleaseTrackedResourceHandles("RHIVkCommandBuffer::ResetInternal"))
+        {
+            ThrowInvalidState("vkResetCommandBuffer", "RHICommandBuffer",
+                              GetVkObjectIdentity(m_VkCommandBuffer),
+                              "Tracked resource ownership could not be released",
+                              GetRHIHandle().index, GetRHIHandle().generation);
+        }
+
         m_IsCompiled = false;
         SetCurrentFrameIndex(0);
         m_CommandStream.clear();
         SetLatestSubmitTicket(0);
 
-        // Always clear tracked resources when resetting
-        auto* vkDevice = static_cast<RHIVkDevice*>(GetDevice());
-        auto* registry = vkDevice->GetResourceRegistry();
-        if (registry)
-        {
-            for (auto h : m_TrackedResourceHandles)
-            {
-                registry->Release(h);
-            }
-        }
-        m_TrackedResourceHandles.clear();
         m_TrackedDescriptorPools.clear();
 
         if (GetState() == ECommandBufferState::Initial) return;
@@ -1363,7 +1461,9 @@ namespace ArisenEngine::RHI
 
         m_CurrentPipeline = nullptr;
 
-        ::vkResetCommandBuffer(m_VkCommandBuffer, 0);
+        CheckVkResult(::vkResetCommandBuffer(m_VkCommandBuffer, 0),
+                      "vkResetCommandBuffer", "RHIVkCommandBuffer",
+                      GetVkObjectIdentity(m_VkCommandBuffer));
         SetState(ECommandBufferState::Initial);
     }
 
@@ -1531,12 +1631,24 @@ namespace ArisenEngine::RHI
 
     void RHIVkExecutor::TrackDescriptorPoolUse(RHIDescriptorPoolHandle poolHandle, UInt32 poolId)
     {
-        // Simple linear search to avoid duplicates
-        for (const auto& p : cmd->m_TrackedDescriptorPools)
+        for (const auto& tracked : cmd->m_TrackedDescriptorPools)
         {
-            if (p.poolHandle == poolHandle) return;
+            if (tracked.poolHandle == poolHandle && tracked.poolId == poolId)
+                return;
         }
-        cmd->m_TrackedDescriptorPools.push_back({poolHandle, poolId});
+
+        cmd->m_TrackedDescriptorPools.reserve(cmd->m_TrackedDescriptorPools.size() + 1);
+        auto* poolItem = cmd->GetVkDevice()->GetDescriptorPoolPool()->Get(poolHandle);
+        auto* pool = poolItem ? static_cast<RHIVkDescriptorPool*>(poolItem->pool) : nullptr;
+        if (!pool)
+        {
+            ThrowInvalidHandle("RHIVkExecutor::TrackDescriptorPoolUse", "RHIDescriptorPool",
+                               poolHandle.index, poolHandle.generation,
+                               "Descriptor-pool owner became stale during command compilation");
+        }
+        pool->AcquirePoolUse(poolId);
+        cmd->m_TrackedDescriptorPools.emplace_back(
+            RHIVkCommandBuffer::TrackedPoolUse{poolHandle, poolId});
     }
 
     void RHIVkExecutor::SetViewport(Float32 x, Float32 y, Float32 width, Float32 height, Float32 minDepth,

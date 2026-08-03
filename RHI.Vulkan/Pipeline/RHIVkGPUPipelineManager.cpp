@@ -12,9 +12,10 @@
 #include <fstream>
 #include "PlatformPath.h"
 #include "Pipeline/RHIVkPSOCache.h"
+#include "Definitions/RHIVkError.h"
 
 ArisenEngine::RHI::RHIVkGPUPipelineManager::RHIVkGPUPipelineManager(RHIVkDevice* device, UInt32 maxFramesInFlight):
-    RHIPipelineCache(maxFramesInFlight),
+    RHIPipelineCache(device, maxFramesInFlight),
     m_Device(device)
 {
     m_PSOCache = std::make_unique<RHIVkPSOCache>(m_Device);
@@ -25,22 +26,34 @@ ArisenEngine::RHI::RHIVkGPUPipelineManager::~RHIVkGPUPipelineManager() noexcept
 {
     LOG_DEBUG("[RHIVkGPUPipelineManager::~RHIVkGPUPipelineManager]: ~RHIVkGPUPipelineManager");
 
-    SavePipelineCache();
+    try
+    {
+        SavePipelineCache();
+
+        Containers::Vector<RHIPipelineHandle> handles;
+        handles.reserve(m_PipelineHandles.size());
+        for (auto const& [identity, handle] : m_PipelineHandles)
+        {
+            handles.emplace_back(handle);
+        }
+        for (RHIPipelineHandle handle : handles)
+        {
+            ReleasePipelineInternal(handle, false);
+        }
+    }
+    catch (const std::exception& ex)
+    {
+        LOG_ERRORF("[RHIVkGPUPipelineManager::~RHIVkGPUPipelineManager]: Cleanup failed: {0}", ex.what());
+    }
+    catch (...)
+    {
+        LOG_ERROR("[RHIVkGPUPipelineManager::~RHIVkGPUPipelineManager]: Cleanup failed with an unknown exception.");
+    }
 
     if (m_VkPipelineCache != VK_NULL_HANDLE)
     {
         vkDestroyPipelineCache(static_cast<VkDevice>(m_Device->GetHandle()), m_VkPipelineCache, nullptr);
-    }
-
-    Containers::Vector<RHIPipelineHandle> handles;
-    handles.reserve(m_PipelineHandles.size());
-    for (auto const& [identity, handle] : m_PipelineHandles)
-    {
-        handles.emplace_back(handle);
-    }
-    for (RHIPipelineHandle handle : handles)
-    {
-        ReleasePipelineInternal(handle, false);
+        m_VkPipelineCache = VK_NULL_HANDLE;
     }
 }
 
@@ -51,24 +64,7 @@ ArisenEngine::RHI::RHIPipelineHandle ArisenEngine::RHI::RHIVkGPUPipelineManager:
     static_cast<RHIVkGPUPipelineStateObject*>(pso)->BuildDescriptorSetLayout();
     auto identity = pso->GetCacheIdentity();
     if (!m_PipelineResources.contains(identity))
-    {
-        auto* resource = new RHIVkPipelineResource(static_cast<VkDevice>(m_Device->GetHandle()));
-        auto pipeline = std::make_unique<RHIVkGPUPipeline>(m_Device, pso, resource, m_MaxFramesInFlight);
-        auto* rawPtr = pipeline.get();
-        resource->SetPipeline(std::move(pipeline));
-        auto registryHandle = m_Device->GetResourceRegistry()->Create(MakeDeferredDeleteItem(resource));
-
-        auto handle = m_Device->GetPipelinePool()->Allocate([rawPtr, identity, registryHandle](RHIVkPipelinePoolItem* item)
-        {
-            *item = RHIVkPipelinePoolItem();
-            item->pipeline = rawPtr;
-            item->cacheIdentity = identity;
-            item->registryHandle = registryHandle;
-        });
-        m_PipelineResources.emplace(identity, resource);
-        m_PipelineHandles.emplace(identity, handle);
-        return handle;
-    }
+        return CreatePipeline(pso, identity);
     else
     {
         m_PipelineResources[identity]->GetPipeline()->BindPipelineStateObject(pso);
@@ -90,24 +86,7 @@ ArisenEngine::RHI::RHIPipelineHandle ArisenEngine::RHI::RHIVkGPUPipelineManager:
     static_cast<RHIVkGPUPipelineStateObject*>(pso)->BuildDescriptorSetLayout();
     auto identity = pso->GetCacheIdentity();
     if (!m_PipelineResources.contains(identity))
-    {
-        auto* resource = new RHIVkPipelineResource(static_cast<VkDevice>(m_Device->GetHandle()));
-        auto pipeline = std::make_unique<RHIVkGPUPipeline>(m_Device, pso, resource, m_MaxFramesInFlight);
-        auto* rawPtr = pipeline.get();
-        resource->SetPipeline(std::move(pipeline));
-        auto registryHandle = m_Device->GetResourceRegistry()->Create(MakeDeferredDeleteItem(resource));
-
-        auto handle = m_Device->GetPipelinePool()->Allocate([rawPtr, identity, registryHandle](RHIVkPipelinePoolItem* item)
-        {
-            *item = RHIVkPipelinePoolItem();
-            item->pipeline = rawPtr;
-            item->cacheIdentity = identity;
-            item->registryHandle = registryHandle;
-        });
-        m_PipelineResources.emplace(identity, resource);
-        m_PipelineHandles.emplace(identity, handle);
-        return handle;
-    }
+        return CreatePipeline(pso, identity);
     else
     {
         m_PipelineResources[identity]->GetPipeline()->BindPipelineStateObject(pso);
@@ -115,9 +94,60 @@ ArisenEngine::RHI::RHIPipelineHandle ArisenEngine::RHI::RHIVkGPUPipelineManager:
     }
 }
 
-void ArisenEngine::RHI::RHIVkGPUPipelineManager::ReleasePipeline(RHIPipelineHandle handle)
+ArisenEngine::RHI::RHIPipelineHandle ArisenEngine::RHI::RHIVkGPUPipelineManager::CreatePipeline(
+    RHIPipelineState* pso,
+    UInt64 identity)
 {
-    ReleasePipelineInternal(handle, true);
+    auto resource = std::make_unique<RHIVkPipelineResource>(static_cast<VkDevice>(m_Device->GetHandle()));
+    auto pipeline = std::make_unique<RHIVkGPUPipeline>(m_Device, pso, resource.get(), m_MaxFramesInFlight);
+    auto* pipelinePtr = pipeline.get();
+    auto* resourcePtr = resource.get();
+    resource->SetPipeline(std::move(pipeline));
+
+    const RHIResourceHandle registryHandle = m_Device->GetResourceRegistry()->Create(
+        MakeDeferredDeleteItem(resource.get()));
+    resource.release();
+
+    RHIPipelineHandle handle = RHIPipelineHandle::Invalid();
+    try
+    {
+        handle = m_Device->GetPipelinePool()->Allocate(
+            [pipelinePtr, identity, registryHandle](RHIVkPipelinePoolItem* item)
+            {
+                *item = RHIVkPipelinePoolItem();
+                item->pipeline = pipelinePtr;
+                item->cacheIdentity = identity;
+                item->registryHandle = registryHandle;
+            });
+
+        m_PipelineResources.emplace(identity, resourcePtr);
+        m_PipelineHandles.emplace(identity, handle);
+    }
+    catch (...)
+    {
+        m_PipelineResources.erase(identity);
+        m_PipelineHandles.erase(identity);
+        if (handle.IsValid())
+        {
+            if (auto* item = m_Device->GetPipelinePool()->Get(handle))
+                *item = RHIVkPipelinePoolItem();
+            m_Device->GetPipelinePool()->Deallocate(handle);
+        }
+        m_Device->GetResourceRegistry()->Release(registryHandle);
+        throw;
+    }
+
+    return handle;
+}
+
+bool ArisenEngine::RHI::RHIVkGPUPipelineManager::ReleasePipeline(RHIPipelineHandle handle)
+{
+    return ReleasePipelineInternal(handle, true);
+}
+
+bool ArisenEngine::RHI::RHIVkGPUPipelineManager::IsAlive(RHIPipelineHandle handle) const
+{
+    return m_Device->GetPipelinePool()->Get(handle) != nullptr;
 }
 
 bool ArisenEngine::RHI::RHIVkGPUPipelineManager::ReleasePipelineInternal(
@@ -135,28 +165,53 @@ bool ArisenEngine::RHI::RHIVkGPUPipelineManager::ReleasePipelineInternal(
         return false;
     }
 
-    const UInt64 identity = item->cacheIdentity;
-    const RHIResourceHandle registryHandle = item->registryHandle;
-    m_PSOCache->Remove(identity);
-    m_PipelineResources.erase(identity);
-    m_PipelineHandles.erase(identity);
-    *item = RHIVkPipelinePoolItem();
-
-    const bool deallocated = pool->Deallocate(handle) != nullptr;
-    if (registryHandle.IsValid())
+    const bool committed = pool->DeallocateAfter(handle, [this, handle](RHIVkPipelinePoolItem* claimedItem)
     {
-        m_Device->GetResourceRegistry()->Release(registryHandle);
-    }
-
-    if (!deallocated)
-    {
-        if (logInvalidHandle)
+        const UInt64 identity = claimedItem->cacheIdentity;
+        const RHIResourceHandle registryHandle = claimedItem->registryHandle;
+        auto resourceIt = m_PipelineResources.find(identity);
+        auto handleIt = m_PipelineHandles.find(identity);
+        if (resourceIt == m_PipelineResources.end() ||
+            handleIt == m_PipelineHandles.end() ||
+            resourceIt->second == nullptr ||
+            resourceIt->second->GetPipeline() != claimedItem->pipeline ||
+            handleIt->second.index != handle.index ||
+            handleIt->second.generation != handle.generation ||
+            !registryHandle.IsValid())
         {
-            LOG_WARN("[RHIVkGPUPipelineManager::ReleasePipeline]: Failed to deallocate pipeline handle.");
+            ThrowInvalidState("RHIVkGPUPipelineManager::ReleasePipeline", "RHIPipeline",
+                              identity, "Pipeline cache ownership is inconsistent",
+                              handle.index, handle.generation);
         }
-        return false;
+
+        const bool ownershipTransferred = m_PSOCache->RemoveAfter(
+            identity, [this, registryHandle, handle, identity]()
+        {
+            if (m_Device->ConsumePooledResourceReleaseRejectionForTesting())
+                return false;
+
+            if (!m_Device->GetResourceRegistry()->Release(registryHandle))
+            {
+                ThrowInvalidState("RHIVkGPUPipelineManager::ReleasePipeline", "RHIPipeline",
+                                  identity, "Deferred pipeline ownership is stale",
+                                  handle.index, handle.generation);
+            }
+            return true;
+        });
+        if (!ownershipTransferred)
+            return false;
+
+        m_PipelineResources.erase(resourceIt);
+        m_PipelineHandles.erase(handleIt);
+        *claimedItem = RHIVkPipelinePoolItem();
+        return true;
+    }) != nullptr;
+
+    if (!committed && logInvalidHandle)
+    {
+        LOG_WARN("[RHIVkGPUPipelineManager::ReleasePipeline]: Pipeline ownership release was rejected.");
     }
-    return true;
+    return committed;
 }
 
 std::unique_ptr<ArisenEngine::RHI::RHIPipelineState> ArisenEngine::RHI::RHIVkGPUPipelineManager::GetPipelineState()
@@ -175,11 +230,19 @@ void ArisenEngine::RHI::RHIVkGPUPipelineManager::LoadPipelineCache()
     if (file.is_open())
     {
         std::streamsize size = file.tellg();
-        file.seekg(0, std::ios::beg);
-        cacheData.resize(size);
-        if (file.read(cacheData.data(), size))
+        if (size > 0)
         {
-            LOG_INFO("[RHIVkGPUPipelineManager]: Loaded PSO cache from disk (" + std::to_string(size) + " bytes)");
+            file.seekg(0, std::ios::beg);
+            cacheData.resize(static_cast<size_t>(size));
+            if (file.read(cacheData.data(), size))
+            {
+                LOG_INFO("[RHIVkGPUPipelineManager]: Loaded PSO cache from disk (" + std::to_string(size) + " bytes)");
+            }
+            else
+            {
+                cacheData.clear();
+                LOG_WARN("[RHIVkGPUPipelineManager]: Failed to read the complete pipeline cache; starting empty.");
+            }
         }
         file.close();
     }
@@ -187,12 +250,10 @@ void ArisenEngine::RHI::RHIVkGPUPipelineManager::LoadPipelineCache()
     VkPipelineCacheCreateInfo cacheCreateInfo{};
     cacheCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
     cacheCreateInfo.initialDataSize = cacheData.size();
-    cacheCreateInfo.pInitialData = cacheData.data();
+    cacheCreateInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
 
-    if (vkCreatePipelineCache(vkDevice, &cacheCreateInfo, nullptr, &m_VkPipelineCache) != VK_SUCCESS)
-    {
-        LOG_ERROR("[RHIVkGPUPipelineManager]: Failed to create pipeline cache!");
-    }
+    CheckVkResult(vkCreatePipelineCache(vkDevice, &cacheCreateInfo, nullptr, &m_VkPipelineCache),
+                  "vkCreatePipelineCache", "VkDevice", GetVkObjectIdentity(vkDevice));
 }
 
 void ArisenEngine::RHI::RHIVkGPUPipelineManager::SavePipelineCache()
@@ -201,23 +262,44 @@ void ArisenEngine::RHI::RHIVkGPUPipelineManager::SavePipelineCache()
     if (m_VkPipelineCache == VK_NULL_HANDLE) return;
 
     VkDevice vkDevice = static_cast<VkDevice>(m_Device->GetHandle());
-    size_t cacheSize = 0;
-    vkGetPipelineCacheData(vkDevice, m_VkPipelineCache, &cacheSize, nullptr);
-
-    if (cacheSize > 0)
+    Containers::Vector<char> cacheData;
+    for (;;)
     {
-        Containers::Vector<char> cacheData(cacheSize);
-        if (vkGetPipelineCacheData(vkDevice, m_VkPipelineCache, &cacheSize, cacheData.data()) == VK_SUCCESS)
+        size_t cacheSize = 0;
+        VkResult result = vkGetPipelineCacheData(vkDevice, m_VkPipelineCache, &cacheSize, nullptr);
+        if (result != VK_SUCCESS)
         {
-            String cachePath = HAL::PlatformPath::GetExecutableDirectory() + "/" + m_PipelineCacheFileName;
-            std::ofstream file(cachePath.c_str(), std::ios::binary);
-            if (file.is_open())
-            {
-                file.write(cacheData.data(), cacheSize);
-                file.close();
-                LOG_INFO(
-                    "[RHIVkGPUPipelineManager]: Saved PSO cache to disk (" + std::to_string(cacheSize) + " bytes)");
-            }
+            LOG_ERRORF("[RHIVkGPUPipelineManager::SavePipelineCache]: Size query failed with {0} ({1}).",
+                       GetVkResultName(result), static_cast<int>(result));
+            return;
         }
+        if (cacheSize == 0)
+            return;
+
+        cacheData.resize(cacheSize);
+        size_t writtenSize = cacheSize;
+        result = vkGetPipelineCacheData(vkDevice, m_VkPipelineCache, &writtenSize, cacheData.data());
+        if (result == VK_INCOMPLETE)
+            continue;
+        if (result != VK_SUCCESS)
+        {
+            LOG_ERRORF("[RHIVkGPUPipelineManager::SavePipelineCache]: Data query failed with {0} ({1}).",
+                       GetVkResultName(result), static_cast<int>(result));
+            return;
+        }
+
+        cacheData.resize(writtenSize);
+        break;
+    }
+
+    String cachePath = HAL::PlatformPath::GetExecutableDirectory() + "/" + m_PipelineCacheFileName;
+    std::ofstream file(cachePath.c_str(), std::ios::binary);
+    if (file.is_open())
+    {
+        file.write(cacheData.data(), static_cast<std::streamsize>(cacheData.size()));
+        file.close();
+        LOG_INFO(
+            "[RHIVkGPUPipelineManager]: Saved PSO cache to disk (" +
+            std::to_string(cacheData.size()) + " bytes)");
     }
 }

@@ -8,6 +8,7 @@
 #include "Descriptors/RHIVkBindlessManager.h"
 #include "Handles/RHIVkResourcePools.h"
 #include "Descriptors/RHIVkBindlessDescriptorTable.h"
+#include "Definitions/RHIVkError.h"
 #include "Descriptors/RHIVkDescriptorHeap.h"
 #include "Profiler.h"
 
@@ -19,7 +20,8 @@ namespace ArisenEngine::RHI
         Clear();
     }
 
-    RHIVkGPUPipelineStateObject::RHIVkGPUPipelineStateObject(RHIVkDevice* device): RHIPipelineState(), m_Device(device)
+    RHIVkGPUPipelineStateObject::RHIVkGPUPipelineStateObject(RHIVkDevice* device):
+        RHIPipelineState(device), m_Device(device)
     {
         ARISEN_PROFILE_ZONE("RHI::VulkanPSOCreate");
         LOG_DEBUG("[RHIVkGPUPipelineStateObject::RHIVkGPUPipelineStateObject]: PSO Create.");
@@ -182,8 +184,6 @@ namespace ArisenEngine::RHI
     void RHIVkGPUPipelineStateObject::BuildDescriptorSetLayout()
     {
         ARISEN_PROFILE_ZONE("RHI::VulkanPSOBuildDescriptorSetLayout");
-        ClearDescriptorSetLayouts();
-
         auto vkDevice = static_cast<VkDevice>(m_Device->GetHandle());
         VkDescriptorSetLayout bindlessLayout = VK_NULL_HANDLE;
         if (m_BindlessTable)
@@ -203,56 +203,58 @@ namespace ArisenEngine::RHI
             if (set > maxSet) maxSet = set;
         }
 
-        m_DescriptorSetLayouts.resize((std::max)(maxSet + 1, 4u)); // Ensure at least 4 sets (0-2 common + 3 bindless)
+        Containers::Vector<VkDescriptorSetLayout> newLayouts(
+            (std::max)(maxSet + 1, 4u), VK_NULL_HANDLE); // Ensure at least 4 sets (0-2 common + 3 bindless)
+        Containers::Vector<VkDescriptorUpdateTemplate> newTemplates(newLayouts.size(), VK_NULL_HANDLE);
 
-        for (UInt32 i = 0; i < m_DescriptorSetLayouts.size(); ++i)
+        try
         {
-            if (i == 3) // Set 3 is reserved for Bindless
+            for (UInt32 i = 0; i < newLayouts.size(); ++i)
             {
-                m_DescriptorSetLayouts[i] = bindlessLayout;
-                continue;
-            }
+                if (i == 3) // Set 3 is reserved for Bindless
+                {
+                    newLayouts[i] = bindlessLayout;
+                    continue;
+                }
 
-            if (m_DescriptorSetLayoutBindings.contains(i))
-            {
-                const auto& bindings = m_DescriptorSetLayoutBindings[i];
                 VkDescriptorSetLayoutCreateInfo layoutInfo{};
                 layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-                layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-                layoutInfo.pBindings = bindings.data();
-
-                if (vkCreateDescriptorSetLayout(vkDevice, &layoutInfo, nullptr, &m_DescriptorSetLayouts[i]) !=
-                    VK_SUCCESS)
+                if (m_DescriptorSetLayoutBindings.contains(i))
                 {
-                    LOG_FATAL(
-                        "[RHIVkGPUPipelineStateObject::BuildDescriptorSetLayout]: failed to create descriptor set layout!");
+                    const auto& bindings = m_DescriptorSetLayoutBindings[i];
+                    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+                    layoutInfo.pBindings = bindings.data();
                 }
+
+                CheckVkResult(vkCreateDescriptorSetLayout(vkDevice, &layoutInfo, nullptr, &newLayouts[i]),
+                              "vkCreateDescriptorSetLayout", "VkDevice", GetVkObjectIdentity(vkDevice),
+                              UINT32_MAX, 0, "Pipeline descriptor set layout");
             }
-            else
-            {
-                // Create empty layout for holes
-                VkDescriptorSetLayoutCreateInfo layoutInfo{};
-                layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-                layoutInfo.bindingCount = 0;
-                layoutInfo.pNext = nullptr;
 
-                if (vkCreateDescriptorSetLayout(vkDevice, &layoutInfo, nullptr, &m_DescriptorSetLayouts[i]) !=
-                    VK_SUCCESS)
-                {
-                    LOG_FATAL(
-                        "[RHIVkGPUPipelineStateObject::BuildDescriptorSetLayout]: failed to create empty descriptor set layout!");
-                }
+            for (UInt32 i = 0; i < newLayouts.size(); ++i)
+            {
+                if (i != 3 && newLayouts[i] != VK_NULL_HANDLE)
+                    newTemplates[i] = CreateDescriptorUpdateTemplate(i, newLayouts[i]);
             }
         }
-
-        m_DescriptorUpdateTemplates.resize(m_DescriptorSetLayouts.size(), VK_NULL_HANDLE);
-        for (UInt32 i = 0; i < m_DescriptorSetLayouts.size(); ++i)
+        catch (...)
         {
-            if (m_DescriptorSetLayouts[i] != VK_NULL_HANDLE && m_DescriptorSetLayouts[i] != bindlessLayout)
+            for (VkDescriptorUpdateTemplate updateTemplate : newTemplates)
             {
-                BuildDescriptorUpdateTemplate(i);
+                if (updateTemplate != VK_NULL_HANDLE)
+                    vkDestroyDescriptorUpdateTemplate(vkDevice, updateTemplate, nullptr);
             }
+            for (UInt32 i = 0; i < newLayouts.size(); ++i)
+            {
+                if (i != 3 && newLayouts[i] != VK_NULL_HANDLE)
+                    vkDestroyDescriptorSetLayout(vkDevice, newLayouts[i], nullptr);
+            }
+            throw;
         }
+
+        ClearDescriptorSetLayouts();
+        m_DescriptorSetLayouts = std::move(newLayouts);
+        m_DescriptorUpdateTemplates = std::move(newTemplates);
     }
 
     VkDescriptorSetLayout RHIVkGPUPipelineStateObject::GetVkDescriptorSetLayout(UInt32 layoutIndex) const
@@ -296,19 +298,11 @@ namespace ArisenEngine::RHI
     void RHIVkGPUPipelineStateObject::ClearDescriptorSetLayouts()
     {
         auto vkDevice = static_cast<VkDevice>(m_Device->GetHandle());
-        VkDescriptorSetLayout bindlessLayout = VK_NULL_HANDLE;
-        if (m_BindlessTable)
-        {
-            bindlessLayout = static_cast<RHIVkDescriptorHeap*>(m_BindlessTable->GetHeap())->GetVkDescriptorSetLayout();
-        }
-        else
-        {
-            bindlessLayout = m_Device->GetBindlessManager()->GetDescriptorSetLayout();
-        }
 
-        for (VkDescriptorSetLayout descriptorSetLayout : m_DescriptorSetLayouts)
+        for (UInt32 i = 0; i < m_DescriptorSetLayouts.size(); ++i)
         {
-            if (descriptorSetLayout != VK_NULL_HANDLE && descriptorSetLayout != bindlessLayout)
+            const VkDescriptorSetLayout descriptorSetLayout = m_DescriptorSetLayouts[i];
+            if (i != 3 && descriptorSetLayout != VK_NULL_HANDLE)
             {
                 ::vkDestroyDescriptorSetLayout(vkDevice, descriptorSetLayout, nullptr);
             }
@@ -507,6 +501,30 @@ namespace ArisenEngine::RHI
         }
     }
 
+    bool RHIVkGPUPipelineStateObject::TryGetDescriptorBinding(UInt32 layoutIndex, UInt32 binding,
+                                                               EDescriptorType& type, UInt32& count) const
+    {
+        const auto layoutIt = m_DescriptorSetLayoutBindings.find(layoutIndex);
+        if (layoutIt == m_DescriptorSetLayoutBindings.end())
+            return false;
+
+        for (const auto& descriptorBinding : layoutIt->second)
+        {
+            if (descriptorBinding.binding != binding)
+                continue;
+            type = static_cast<EDescriptorType>(descriptorBinding.descriptorType);
+            count = descriptorBinding.descriptorCount;
+            return true;
+        }
+        return false;
+    }
+
+    bool RHIVkGPUPipelineStateObject::IsDescriptorSetLayoutAlive(UInt32 layoutIndex) const
+    {
+        return layoutIndex < m_DescriptorSetLayouts.size() &&
+            m_DescriptorSetLayouts[layoutIndex] != VK_NULL_HANDLE;
+    }
+
     void RHIVkGPUPipelineStateObject::SetRenderingFormats(const Containers::Vector<EFormat>& colorFormats,
                                                           EFormat depthFormat, EFormat stencilFormat)
     {
@@ -547,13 +565,15 @@ namespace ArisenEngine::RHI
         return m_DescriptorUpdateTemplates[layoutIndex];
     }
 
-    void RHIVkGPUPipelineStateObject::BuildDescriptorUpdateTemplate(UInt32 layoutIndex)
+    VkDescriptorUpdateTemplate RHIVkGPUPipelineStateObject::CreateDescriptorUpdateTemplate(
+        UInt32 layoutIndex,
+        VkDescriptorSetLayout descriptorSetLayout)
     {
         ARISEN_PROFILE_ZONE("RHI::VulkanPSOBuildDescriptorUpdateTemplate");
-        if (!m_DescriptorSetLayoutBindings.contains(layoutIndex)) return;
+        if (!m_DescriptorSetLayoutBindings.contains(layoutIndex)) return VK_NULL_HANDLE;
 
         const auto& bindings = m_DescriptorSetLayoutBindings[layoutIndex];
-        if (bindings.empty()) return;
+        if (bindings.empty()) return VK_NULL_HANDLE;
 
         // Sort bindings to ensure consistent order (although map/vector might be already sorted or implicitly ordered by insertion if we were careful, but bindings is a vector here).
         // The vector is populated in InternalAddDescriptorSetLayoutBinding. It might not be sorted by binding point.
@@ -615,14 +635,14 @@ namespace ArisenEngine::RHI
             currentOffset += typeSize * binding.descriptorCount;
         }
 
-        if (entries.empty()) return;
+        if (entries.empty()) return VK_NULL_HANDLE;
 
         VkDescriptorUpdateTemplateCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO;
         createInfo.descriptorUpdateEntryCount = static_cast<uint32_t>(entries.size());
         createInfo.pDescriptorUpdateEntries = entries.data();
         createInfo.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
-        createInfo.descriptorSetLayout = m_DescriptorSetLayouts[layoutIndex];
+        createInfo.descriptorSetLayout = descriptorSetLayout;
         createInfo.pipelineBindPoint = static_cast<VkPipelineBindPoint>(m_BindPoint);
         // Remove PIPELINE_LAYOUT assumption if possible, or we need the pipeline layout.
         // For VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET, pipelineLayout is optional (ignored) 
@@ -641,13 +661,13 @@ namespace ArisenEngine::RHI
         // So we should pass layoutIndex.
         createInfo.set = layoutIndex;
 
-        if (vkCreateDescriptorUpdateTemplate(static_cast<VkDevice>(m_Device->GetHandle()), &createInfo, nullptr,
-                                             &m_DescriptorUpdateTemplates[layoutIndex]) != VK_SUCCESS)
-        {
-            LOG_ERROR(
-                "[RHIVkGPUPipelineStateObject::BuildDescriptorUpdateTemplate] Failed to create descriptor update template for set "
-                + std::to_string(layoutIndex));
-        }
+        const VkDevice device = static_cast<VkDevice>(m_Device->GetHandle());
+        VkDescriptorUpdateTemplate updateTemplate = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateDescriptorUpdateTemplate(device, &createInfo, nullptr, &updateTemplate),
+                      "vkCreateDescriptorUpdateTemplate", "VkDescriptorSetLayout",
+                      GetVkObjectIdentity(descriptorSetLayout), UINT32_MAX, 0,
+                      "Pipeline descriptor update template");
+        return updateTemplate;
     }
 
     void ArisenEngine::RHI::RHIVkGPUPipelineStateObject::AddRayTracingShaderGroup(const RHIRayTracingShaderGroup& group)

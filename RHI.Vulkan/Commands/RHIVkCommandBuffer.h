@@ -45,6 +45,13 @@ namespace ArisenEngine
             void ResetInternal() override;
 
         private:
+            void CaptureRegistryResource(RHIResourceHandle registryHandle,
+                                         const char* objectType,
+                                         UInt32 ownerIndex,
+                                         UInt32 ownerGeneration);
+            bool TryReleaseTrackedResourceHandles(const char* operation) noexcept;
+            bool TryReleaseTrackedDescriptorPoolUses(const char* operation) noexcept;
+
             VkCommandBuffer m_VkCommandBuffer;
             VkCommandPool m_VkCommandPool;
             VkDevice m_VkDevice;
@@ -94,6 +101,7 @@ namespace ArisenEngine
         public:
             void CaptureResource(RHIBufferHandle buffer);
             void CaptureResource(RHIImageHandle image);
+            void CaptureResource(RHIImageViewHandle imageView);
             void CaptureResource(RHIAccelerationStructureHandle handle);
 
             const Containers::Vector<RHIResourceHandle>& GetTrackedResourceHandles() const

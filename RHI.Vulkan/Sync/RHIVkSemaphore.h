@@ -30,8 +30,8 @@ namespace ArisenEngine::RHI
         bool IsTimeline() const override { return m_IsTimeline; }
 
     private:
-        VkSemaphore m_VkSemaphore;
-        VkDevice m_VkDevice;
-        bool m_IsTimeline;
+        VkSemaphore m_VkSemaphore{VK_NULL_HANDLE};
+        VkDevice m_VkDevice{VK_NULL_HANDLE};
+        bool m_IsTimeline{false};
     };
 }

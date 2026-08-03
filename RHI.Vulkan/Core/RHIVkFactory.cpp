@@ -1,4 +1,5 @@
 #include "Core/RHIVkFactory.h"
+#include "Definitions/RHIVkError.h"
 #include "Profiler.h"
 #include "Core/RHIVkDevice.h"
 #include "Pipeline/RHIVkGPUProgram.h"
@@ -8,6 +9,19 @@
 #include "Handles/RHIVkResourcePools.h"
 #include "RHI/Core/RHIInstance.h"
 #include "Utils/RHIVkInitializer.h"
+
+namespace
+{
+    template <typename T>
+    ArisenEngine::RHI::RHIResourceHandle RegisterDeferredResource(
+        ArisenEngine::RHI::RHIResourceRegistry& registry,
+        std::unique_ptr<T> resource)
+    {
+        const auto handle = registry.Create(ArisenEngine::RHI::MakeDeferredDeleteItem(resource.get()));
+        resource.release();
+        return handle;
+    }
+}
 
 namespace ArisenEngine::RHI
 {
@@ -20,24 +34,26 @@ namespace ArisenEngine::RHI
         ARISEN_PROFILE_ZONE("RHI::CreateGPUProgram");
         return m_Device->GetGPUProgramPool()->Allocate([this](RHIVkGPUProgramPoolItem* item)
         {
-            // Reset item to default state
-            *item = RHIVkGPUProgramPoolItem();
-            item->program = new RHIVkGPUProgram((VkDevice)m_Device->GetHandle());
-
-            // Register for deferred deletion (of the program object itself)
             struct DeferredGPUProgram
             {
-                RHIShaderProgram* prog;
-                ~DeferredGPUProgram() { delete prog; }
+                std::unique_ptr<RHIShaderProgram> program;
             };
-            item->registryHandle = m_Device->GetResourceRegistry()->Create(
-                MakeDeferredDeleteItem(new DeferredGPUProgram{item->program}));
+
+            auto deferred = std::make_unique<DeferredGPUProgram>();
+            deferred->program = std::make_unique<RHIVkGPUProgram>(static_cast<VkDevice>(m_Device->GetHandle()));
+            auto* program = deferred->program.get();
+            const RHIResourceHandle registryHandle = RegisterDeferredResource(
+                *m_Device->GetResourceRegistry(), std::move(deferred));
+
+            *item = RHIVkGPUProgramPoolItem();
+            item->program = program;
+            item->registryHandle = registryHandle;
         });
     }
 
-    void RHIVkFactory::ReleaseGPUProgram(RHIShaderProgramHandle handle)
+    bool RHIVkFactory::ReleaseGPUProgram(RHIShaderProgramHandle handle)
     {
-        m_Device->ReleaseGPUProgram(handle);
+        return m_Device->ReleaseGPUProgram(handle);
     }
 
     bool RHIVkFactory::AttachProgramByteCode(RHIShaderProgramHandle handle, RHIShaderProgramDesc&& desc)
@@ -56,23 +72,27 @@ namespace ArisenEngine::RHI
         ARISEN_PROFILE_ZONE("RHI::CreateCommandBufferPool");
         return m_Device->GetCommandBufferPoolPool()->Allocate([this, poolQueueType](RHIVkCommandBufferPoolItem* item)
         {
-            *item = RHIVkCommandBufferPoolItem();
-            item->pool = new RHIVkCommandBufferPool(
-                m_Device, m_Device->GetInstance()->GetMaxFramesInFlight(), poolQueueType);
-
             struct DeferredCmdPool
             {
-                RHICommandBufferPool* p;
-                ~DeferredCmdPool() { delete p; }
+                std::unique_ptr<RHICommandBufferPool> pool;
             };
-            item->registryHandle = m_Device->GetResourceRegistry()->Create(
-                MakeDeferredDeleteItem(new DeferredCmdPool{item->pool}));
+
+            auto deferred = std::make_unique<DeferredCmdPool>();
+            deferred->pool = std::make_unique<RHIVkCommandBufferPool>(
+                m_Device, m_Device->GetInstance()->GetMaxFramesInFlight(), poolQueueType);
+            auto* pool = deferred->pool.get();
+            const RHIResourceHandle registryHandle = RegisterDeferredResource(
+                *m_Device->GetResourceRegistry(), std::move(deferred));
+
+            *item = RHIVkCommandBufferPoolItem();
+            item->pool = pool;
+            item->registryHandle = registryHandle;
         });
     }
 
-    void RHIVkFactory::ReleaseCommandBufferPool(RHICommandBufferPoolHandle handle)
+    bool RHIVkFactory::ReleaseCommandBufferPool(RHICommandBufferPoolHandle handle)
     {
-        m_Device->ReleaseCommandBufferPool(handle);
+        return m_Device->ReleaseCommandBufferPool(handle);
     }
 
     RHIRenderPassHandle RHIVkFactory::CreateRenderPass()
@@ -80,24 +100,26 @@ namespace ArisenEngine::RHI
         ARISEN_PROFILE_ZONE("RHI::CreateRenderPass");
         return m_Device->GetRenderPassPool()->Allocate([this](RHIVkRenderPassPoolItem* rp)
         {
-            *rp = RHIVkRenderPassPoolItem();
-            auto* rpObj = new RHIVkGPURenderPass(m_Device, m_Device->GetMaxFramesInFlight());
-            rp->renderPassObj = rpObj;
-
-            // Register for deferred deletion
             struct DeferredGPURenderPass
             {
-                RHIVkGPURenderPass* obj;
-                ~DeferredGPURenderPass() { delete obj; }
+                std::unique_ptr<RHIVkGPURenderPass> renderPass;
             };
-            rp->registryHandle = m_Device->GetResourceRegistry()->Create(
-                MakeDeferredDeleteItem(new DeferredGPURenderPass{rpObj}));
+
+            auto deferred = std::make_unique<DeferredGPURenderPass>();
+            deferred->renderPass = std::make_unique<RHIVkGPURenderPass>(m_Device, m_Device->GetMaxFramesInFlight());
+            auto* renderPass = deferred->renderPass.get();
+            const RHIResourceHandle registryHandle = RegisterDeferredResource(
+                *m_Device->GetResourceRegistry(), std::move(deferred));
+
+            *rp = RHIVkRenderPassPoolItem();
+            rp->renderPassObj = renderPass;
+            rp->registryHandle = registryHandle;
         });
     }
 
-    void RHIVkFactory::ReleaseRenderPass(RHIRenderPassHandle renderPass)
+    bool RHIVkFactory::ReleaseRenderPass(RHIRenderPassHandle renderPass)
     {
-        m_Device->ReleaseRenderPass(renderPass);
+        return m_Device->ReleaseRenderPass(renderPass);
     }
 
     RHIFrameBufferHandle RHIVkFactory::CreateFrameBuffer()
@@ -105,24 +127,26 @@ namespace ArisenEngine::RHI
         ARISEN_PROFILE_ZONE("RHI::CreateFrameBuffer");
         return m_Device->GetFrameBufferPool()->Allocate([this](RHIVkFrameBufferPoolItem* fb)
         {
-            *fb = RHIVkFrameBufferPoolItem();
-            auto* fbObj = new RHIVkFrameBuffer(m_Device, m_Device->GetMaxFramesInFlight());
-            fb->frameBufferObj = fbObj;
-
-            // Register for deferred deletion
             struct DeferredGPUFrameBuffer
             {
-                RHIVkFrameBuffer* obj;
-                ~DeferredGPUFrameBuffer() { delete obj; }
+                std::unique_ptr<RHIVkFrameBuffer> framebuffer;
             };
-            fb->registryHandle = m_Device->GetResourceRegistry()->Create(
-                MakeDeferredDeleteItem(new DeferredGPUFrameBuffer{fbObj}));
+
+            auto deferred = std::make_unique<DeferredGPUFrameBuffer>();
+            deferred->framebuffer = std::make_unique<RHIVkFrameBuffer>(m_Device, m_Device->GetMaxFramesInFlight());
+            auto* framebuffer = deferred->framebuffer.get();
+            const RHIResourceHandle registryHandle = RegisterDeferredResource(
+                *m_Device->GetResourceRegistry(), std::move(deferred));
+
+            *fb = RHIVkFrameBufferPoolItem();
+            fb->frameBufferObj = framebuffer;
+            fb->registryHandle = registryHandle;
         });
     }
 
-    void RHIVkFactory::ReleaseFrameBuffer(RHIFrameBufferHandle RHIFrameBuffer)
+    bool RHIVkFactory::ReleaseFrameBuffer(RHIFrameBufferHandle RHIFrameBuffer)
     {
-        m_Device->ReleaseFrameBuffer(RHIFrameBuffer);
+        return m_Device->ReleaseFrameBuffer(RHIFrameBuffer);
     }
 
     ArisenEngine::RHI::RHIBufferHandle ArisenEngine::RHI::RHIVkFactory::CreateBuffer(
@@ -135,24 +159,28 @@ namespace ArisenEngine::RHI
             item->name = name;
         });
 
-        if (!m_Device->AllocBuffer(handle, std::move(desc)))
+        try
         {
-            m_Device->ReleaseBuffer(handle);
-            return ArisenEngine::RHI::RHIBufferHandle::Invalid();
+            if (!m_Device->AllocBuffer(handle, std::move(desc)) ||
+                !m_Device->AllocBufferDeviceMemory(handle))
+            {
+                m_Device->ReleaseBuffer(handle);
+                return ArisenEngine::RHI::RHIBufferHandle::Invalid();
+            }
         }
-
-        if (!m_Device->AllocBufferDeviceMemory(handle))
+        catch (...)
         {
-            m_Device->ReleaseBuffer(handle);
-            return ArisenEngine::RHI::RHIBufferHandle::Invalid();
+            if (m_Device->GetBufferPool()->Get(handle))
+                m_Device->ReleaseBuffer(handle);
+            throw;
         }
 
         return handle;
     }
 
-    void RHIVkFactory::ReleaseBuffer(RHIBufferHandle bufferHandle)
+    bool RHIVkFactory::ReleaseBuffer(RHIBufferHandle bufferHandle)
     {
-        m_Device->ReleaseBuffer(bufferHandle);
+        return m_Device->ReleaseBuffer(bufferHandle);
     }
 
     ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkFactory::CreateImage(
@@ -165,24 +193,28 @@ namespace ArisenEngine::RHI
             item->name = name;
         });
 
-        if (!m_Device->AllocImage(handle, std::move(desc)))
+        try
         {
-            m_Device->ReleaseImage(handle);
-            return ArisenEngine::RHI::RHIImageHandle::Invalid();
+            if (!m_Device->AllocImage(handle, std::move(desc)) ||
+                !m_Device->AllocImageDeviceMemory(handle))
+            {
+                m_Device->ReleaseImage(handle);
+                return ArisenEngine::RHI::RHIImageHandle::Invalid();
+            }
         }
-
-        if (!m_Device->AllocImageDeviceMemory(handle))
+        catch (...)
         {
-            m_Device->ReleaseImage(handle);
-            return ArisenEngine::RHI::RHIImageHandle::Invalid();
+            if (m_Device->GetImagePool()->Get(handle))
+                m_Device->ReleaseImage(handle);
+            throw;
         }
 
         return handle;
     }
 
-    void RHIVkFactory::ReleaseImage(RHIImageHandle imageHandle)
+    bool RHIVkFactory::ReleaseImage(RHIImageHandle imageHandle)
     {
-        m_Device->ReleaseImage(imageHandle);
+        return m_Device->ReleaseImage(imageHandle);
     }
 
     ArisenEngine::RHI::RHIImageViewHandle ArisenEngine::RHI::RHIVkFactory::CreateImageView(
@@ -193,38 +225,40 @@ namespace ArisenEngine::RHI
         {
             *item = ArisenEngine::RHI::RHIVkImageViewPoolItem();
         });
-        if (!m_Device->AllocImageView(handle, imageHandle, std::move(desc)))
+        try
         {
-            m_Device->ReleaseImageView(handle);
-            return ArisenEngine::RHI::RHIImageViewHandle::Invalid();
+            if (!m_Device->AllocImageView(handle, imageHandle, std::move(desc)))
+            {
+                m_Device->ReleaseImageView(handle);
+                return ArisenEngine::RHI::RHIImageViewHandle::Invalid();
+            }
+        }
+        catch (...)
+        {
+            if (m_Device->GetImageViewPool()->Get(handle))
+                m_Device->ReleaseImageView(handle);
+            throw;
         }
         return handle;
     }
 
-    void RHIVkFactory::ReleaseImageView(RHIImageViewHandle imageViewHandle)
+    bool RHIVkFactory::ReleaseImageView(RHIImageViewHandle imageViewHandle)
     {
-        m_Device->ReleaseImageView(imageViewHandle);
+        return m_Device->ReleaseImageView(imageViewHandle);
     }
 
     RHISamplerHandle RHIVkFactory::CreateSampler(RHISamplerDesc&& desc)
     {
         return m_Device->GetSamplerPool()->Allocate([this, &desc](RHIVkSamplerPoolItem* sampler)
         {
-            *sampler = RHIVkSamplerPoolItem();
             ARISEN_PROFILE_ZONE("Vk::CreateSampler");
             auto samplerInfo = SamplerCreateInfo(std::move(desc));
-            if (vkCreateSampler(static_cast<VkDevice>(m_Device->GetHandle()),
-                                &samplerInfo, nullptr,
-                                &sampler->sampler) != VK_SUCCESS)
-            {
-                LOG_ERROR("[RHIVkFactory::CreateSampler]: failed to create texture "
-                    "sampler!");
-            }
+            const VkDevice device = static_cast<VkDevice>(m_Device->GetHandle());
 
             struct DeferredVkSampler
             {
-                VkDevice device;
-                VkSampler sampler;
+                VkDevice device{VK_NULL_HANDLE};
+                VkSampler sampler{VK_NULL_HANDLE};
 
                 ~DeferredVkSampler()
                 {
@@ -234,17 +268,24 @@ namespace ArisenEngine::RHI
                     }
                 }
             };
-            auto* deferred = new DeferredVkSampler{
-                static_cast<VkDevice>(m_Device->GetHandle()), sampler->sampler
-            };
-            sampler->registryHandle = m_Device->GetResourceRegistry()->Create(
-                MakeDeferredDeleteItem(deferred));
+
+            auto deferred = std::make_unique<DeferredVkSampler>();
+            deferred->device = device;
+            CheckVkResult(vkCreateSampler(device, &samplerInfo, nullptr, &deferred->sampler),
+                          "vkCreateSampler", "VkDevice", GetVkObjectIdentity(device));
+            const VkSampler vkSampler = deferred->sampler;
+            const RHIResourceHandle registryHandle = RegisterDeferredResource(
+                *m_Device->GetResourceRegistry(), std::move(deferred));
+
+            *sampler = RHIVkSamplerPoolItem();
+            sampler->sampler = vkSampler;
+            sampler->registryHandle = registryHandle;
         });
     }
 
-    void RHIVkFactory::ReleaseSampler(RHISamplerHandle samplerHandle)
+    bool RHIVkFactory::ReleaseSampler(RHISamplerHandle samplerHandle)
     {
-        m_Device->ReleaseSampler(samplerHandle);
+        return m_Device->ReleaseSampler(samplerHandle);
     }
 
         RHISemaphoreHandle RHIVkFactory::CreateSemaphore()
@@ -252,7 +293,6 @@ namespace ArisenEngine::RHI
     {
         return m_Device->GetSemaphorePool()->Allocate([this](RHIVkSemaphorePoolItem* sem)
         {
-            *sem = RHIVkSemaphorePoolItem();
             ARISEN_PROFILE_ZONE("Vk::CreateSemaphore");
             VkExportSemaphoreCreateInfo exportInfo{};
             exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
@@ -262,19 +302,11 @@ namespace ArisenEngine::RHI
             createInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
             createInfo.pNext = &exportInfo;
 
-                        if (vkCreateSemaphore(static_cast<VkDevice>(m_Device->GetHandle()),
-                                  &createInfo, nullptr,
-                                  &sem->semaphore) != VK_SUCCESS)
-            {
-                LOG_ERROR("[RHIVkFactory::CreateSemaphore]: failed to create "
-                    "semaphore!");
-            }
-
-
+            const VkDevice device = static_cast<VkDevice>(m_Device->GetHandle());
             struct DeferredVkSemaphore
             {
-                VkDevice device;
-                VkSemaphore semaphore;
+                VkDevice device{VK_NULL_HANDLE};
+                VkSemaphore semaphore{VK_NULL_HANDLE};
 
                 ~DeferredVkSemaphore()
                 {
@@ -284,11 +316,18 @@ namespace ArisenEngine::RHI
                     }
                 }
             };
-            auto* deferred = new DeferredVkSemaphore{
-                static_cast<VkDevice>(m_Device->GetHandle()), sem->semaphore
-            };
-            sem->registryHandle = m_Device->GetResourceRegistry()->Create(
-                MakeDeferredDeleteItem(deferred));
+
+            auto deferred = std::make_unique<DeferredVkSemaphore>();
+            deferred->device = device;
+            CheckVkResult(vkCreateSemaphore(device, &createInfo, nullptr, &deferred->semaphore),
+                          "vkCreateSemaphore", "VkDevice", GetVkObjectIdentity(device));
+            const VkSemaphore semaphore = deferred->semaphore;
+            const RHIResourceHandle registryHandle = RegisterDeferredResource(
+                *m_Device->GetResourceRegistry(), std::move(deferred));
+
+            *sem = RHIVkSemaphorePoolItem();
+            sem->semaphore = semaphore;
+            sem->registryHandle = registryHandle;
         });
     }
 
@@ -296,7 +335,6 @@ namespace ArisenEngine::RHI
     {
         return m_Device->GetSemaphorePool()->Allocate([this, initialValue](RHIVkSemaphorePoolItem* sem)
         {
-            *sem = RHIVkSemaphorePoolItem();
             ARISEN_PROFILE_ZONE("Vk::CreateTimelineSemaphore");
             VkSemaphoreTypeCreateInfo typeInfo{};
             typeInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
@@ -307,17 +345,11 @@ namespace ArisenEngine::RHI
             createInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
             createInfo.pNext = &typeInfo;
 
-            if (vkCreateSemaphore(static_cast<VkDevice>(m_Device->GetHandle()),
-                                  &createInfo, nullptr,
-                                  &sem->semaphore) != VK_SUCCESS)
-            {
-                LOG_ERROR("[RHIVkFactory::CreateTimelineSemaphore]: failed to create timeline semaphore!");
-            }
-
+            const VkDevice device = static_cast<VkDevice>(m_Device->GetHandle());
             struct DeferredVkSemaphore
             {
-                VkDevice device;
-                VkSemaphore semaphore;
+                VkDevice device{VK_NULL_HANDLE};
+                VkSemaphore semaphore{VK_NULL_HANDLE};
 
                 ~DeferredVkSemaphore()
                 {
@@ -327,17 +359,25 @@ namespace ArisenEngine::RHI
                     }
                 }
             };
-            auto* deferred = new DeferredVkSemaphore{
-                static_cast<VkDevice>(m_Device->GetHandle()), sem->semaphore
-            };
-            sem->registryHandle = m_Device->GetResourceRegistry()->Create(
-                MakeDeferredDeleteItem(deferred));
+
+            auto deferred = std::make_unique<DeferredVkSemaphore>();
+            deferred->device = device;
+            CheckVkResult(vkCreateSemaphore(device, &createInfo, nullptr, &deferred->semaphore),
+                          "vkCreateSemaphore", "VkDevice", GetVkObjectIdentity(device),
+                          UINT32_MAX, 0, "Timeline semaphore");
+            const VkSemaphore semaphore = deferred->semaphore;
+            const RHIResourceHandle registryHandle = RegisterDeferredResource(
+                *m_Device->GetResourceRegistry(), std::move(deferred));
+
+            *sem = RHIVkSemaphorePoolItem();
+            sem->semaphore = semaphore;
+            sem->registryHandle = registryHandle;
         });
     }
 
-    void RHIVkFactory::ReleaseSemaphore(RHISemaphoreHandle semaphoreHandle)
+    bool RHIVkFactory::ReleaseSemaphore(RHISemaphoreHandle semaphoreHandle)
     {
-        m_Device->ReleaseSemaphore(semaphoreHandle);
+        return m_Device->ReleaseSemaphore(semaphoreHandle);
     }
 
 
@@ -351,9 +391,9 @@ namespace ArisenEngine::RHI
         });
     }
 
-    void RHIVkFactory::ReleaseAccelerationStructure(RHIAccelerationStructureHandle handle)
+    bool RHIVkFactory::ReleaseAccelerationStructure(RHIAccelerationStructureHandle handle)
     {
-        m_Device->ReleaseAccelerationStructure(handle);
+        return m_Device->ReleaseAccelerationStructure(handle);
     }
 
     RHIMemoryPoolHandle RHIVkFactory::CreateMemoryPool(UInt64 size, UInt32 usageBits)
@@ -364,18 +404,27 @@ namespace ArisenEngine::RHI
             *item = RHIVkMemoryPoolPoolItem();
         });
 
-        if (!m_Device->AllocMemoryPool(handle, size, usageBits))
+        try
         {
-            m_Device->ReleaseMemoryPool(handle);
-            return RHIMemoryPoolHandle::Invalid();
+            if (!m_Device->AllocMemoryPool(handle, size, usageBits))
+            {
+                m_Device->ReleaseMemoryPool(handle);
+                return RHIMemoryPoolHandle::Invalid();
+            }
+        }
+        catch (...)
+        {
+            if (m_Device->GetMemoryPoolPool()->Get(handle))
+                m_Device->ReleaseMemoryPool(handle);
+            throw;
         }
 
         return handle;
     }
 
-    void RHIVkFactory::ReleaseMemoryPool(RHIMemoryPoolHandle handle)
+    bool RHIVkFactory::ReleaseMemoryPool(RHIMemoryPoolHandle handle)
     {
-        m_Device->ReleaseMemoryPool(handle);
+        return m_Device->ReleaseMemoryPool(handle);
     }
 
     RHIBufferHandle RHIVkFactory::CreateBufferAliased(RHIBufferDescriptor&& desc, RHIMemoryPoolHandle pool,
@@ -388,10 +437,19 @@ namespace ArisenEngine::RHI
             item->name = name;
         });
 
-        if (!m_Device->AllocBufferAliased(handle, std::move(desc), pool, offset))
+        try
         {
-            m_Device->ReleaseBuffer(handle);
-            return RHIBufferHandle::Invalid();
+            if (!m_Device->AllocBufferAliased(handle, std::move(desc), pool, offset))
+            {
+                m_Device->ReleaseBuffer(handle);
+                return RHIBufferHandle::Invalid();
+            }
+        }
+        catch (...)
+        {
+            if (m_Device->GetBufferPool()->Get(handle))
+                m_Device->ReleaseBuffer(handle);
+            throw;
         }
 
         return handle;
@@ -407,10 +465,19 @@ namespace ArisenEngine::RHI
             item->name = name;
         });
 
-        if (!m_Device->AllocImageAliased(handle, std::move(desc), pool, offset))
+        try
         {
-            m_Device->ReleaseImage(handle);
-            return RHIImageHandle::Invalid();
+            if (!m_Device->AllocImageAliased(handle, std::move(desc), pool, offset))
+            {
+                m_Device->ReleaseImage(handle);
+                return RHIImageHandle::Invalid();
+            }
+        }
+        catch (...)
+        {
+            if (m_Device->GetImagePool()->Get(handle))
+                m_Device->ReleaseImage(handle);
+            throw;
         }
 
         return handle;
@@ -507,18 +574,63 @@ namespace ArisenEngine::RHI
         return m_Device->RegisterBindlessResource(sampler);
     }
 
-    void RHIVkFactory::UnregisterBindlessResourceImage(UInt32 bindlessIndex)
+    bool RHIVkFactory::UnregisterBindlessResourceImage(UInt32 bindlessIndex)
     {
-        m_Device->UnregisterBindlessResourceImage(bindlessIndex);
+        return m_Device->UnregisterBindlessResourceImage(bindlessIndex);
     }
 
-    void RHIVkFactory::UnregisterBindlessResourceBuffer(UInt32 bindlessIndex)
+    bool RHIVkFactory::UnregisterBindlessResourceBuffer(UInt32 bindlessIndex)
     {
-        m_Device->UnregisterBindlessResourceBuffer(bindlessIndex);
+        return m_Device->UnregisterBindlessResourceBuffer(bindlessIndex);
     }
 
-    void RHIVkFactory::UnregisterBindlessResourceSampler(UInt32 bindlessIndex)
+    bool RHIVkFactory::UnregisterBindlessResourceSampler(UInt32 bindlessIndex)
     {
-        m_Device->UnregisterBindlessResourceSampler(bindlessIndex);
+        return m_Device->UnregisterBindlessResourceSampler(bindlessIndex);
+    }
+
+    bool RHIVkFactory::IsAlive(RHIShaderProgramHandle handle) const
+    {
+        return m_Device->GetGPUProgramPool()->Get(handle) != nullptr;
+    }
+
+    bool RHIVkFactory::IsAlive(RHICommandBufferPoolHandle handle) const
+    {
+        return m_Device->GetCommandBufferPoolPool()->Get(handle) != nullptr;
+    }
+
+    bool RHIVkFactory::IsAlive(RHIRenderPassHandle handle) const
+    {
+        return m_Device->GetRenderPassPool()->Get(handle) != nullptr;
+    }
+
+    bool RHIVkFactory::IsAlive(RHIFrameBufferHandle handle) const
+    {
+        return m_Device->GetFrameBufferPool()->Get(handle) != nullptr;
+    }
+
+    bool RHIVkFactory::IsAlive(RHIBufferHandle handle) const
+    {
+        return m_Device->GetBufferPool()->Get(handle) != nullptr;
+    }
+
+    bool RHIVkFactory::IsAlive(RHIImageHandle handle) const
+    {
+        return m_Device->GetImagePool()->Get(handle) != nullptr;
+    }
+
+    bool RHIVkFactory::IsAlive(RHIImageViewHandle handle) const
+    {
+        return m_Device->GetImageViewPool()->Get(handle) != nullptr;
+    }
+
+    bool RHIVkFactory::IsAlive(RHISamplerHandle handle) const
+    {
+        return m_Device->GetSamplerPool()->Get(handle) != nullptr;
+    }
+
+    bool RHIVkFactory::IsAlive(RHISemaphoreHandle handle) const
+    {
+        return m_Device->GetSemaphorePool()->Get(handle) != nullptr;
     }
 }

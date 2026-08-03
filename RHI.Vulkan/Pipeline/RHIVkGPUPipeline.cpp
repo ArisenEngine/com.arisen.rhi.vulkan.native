@@ -4,9 +4,37 @@
 #include "Pipeline/RHIVkPSOCache.h"
 #include "RHI/Pipeline/RHIPipelineState.h"
 #include "Core/RHIVkDevice.h"
+#include "Definitions/RHIVkError.h"
 
 namespace ArisenEngine::RHI
 {
+    namespace
+    {
+        struct PendingPipelineLayout
+        {
+            VkDevice device{VK_NULL_HANDLE};
+            VkPipelineLayout layout{VK_NULL_HANDLE};
+
+            ~PendingPipelineLayout()
+            {
+                if (device != VK_NULL_HANDLE && layout != VK_NULL_HANDLE)
+                    vkDestroyPipelineLayout(device, layout, nullptr);
+            }
+        };
+
+        struct PendingPipeline
+        {
+            VkDevice device{VK_NULL_HANDLE};
+            VkPipeline pipeline{VK_NULL_HANDLE};
+
+            ~PendingPipeline()
+            {
+                if (device != VK_NULL_HANDLE && pipeline != VK_NULL_HANDLE)
+                    vkDestroyPipeline(device, pipeline, nullptr);
+            }
+        };
+    }
+
     static_assert(static_cast<UInt32>(FRONT_FACE_COUNTER_CLOCKWISE) ==
         static_cast<UInt32>(VK_FRONT_FACE_COUNTER_CLOCKWISE));
     static_assert(static_cast<UInt32>(FRONT_FACE_CLOCKWISE) ==
@@ -177,11 +205,12 @@ namespace ArisenEngine::RHI
             pipelineLayoutInfo.pushConstantRangeCount = static_cast<uint32_t>(vkPSO->GetPushConstantRanges().size());
             pipelineLayoutInfo.pPushConstantRanges = vkPSO->GetPushConstantRanges().data();
 
-            if (vkCreatePipelineLayout(m_VkDevice, &pipelineLayoutInfo, nullptr, &layout) != VK_SUCCESS)
-            {
-                LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocGraphicPipeline]: failed to create pipeline layout!");
-            }
-            m_Resource->TrackPipelineLayout(layout);
+            PendingPipelineLayout pending{m_VkDevice};
+            CheckVkResult(vkCreatePipelineLayout(m_VkDevice, &pipelineLayoutInfo, nullptr, &pending.layout),
+                          "vkCreatePipelineLayout", "VkDevice", GetVkObjectIdentity(m_VkDevice));
+            layout = pending.layout;
+            m_Resource->TrackPipelineLayout(pending.layout);
+            pending.layout = VK_NULL_HANDLE;
             cache->StoreLayout(vkPSO->GetCacheIdentity(), layout);
         }
 
@@ -418,13 +447,15 @@ namespace ArisenEngine::RHI
 
         pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
 
-        if (vkCreateGraphicsPipelines(
-            m_VkDevice, static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())->GetVkPipelineCache(), 1,
-            &pipelineInfo, nullptr, &pipeline) != VK_SUCCESS)
-        {
-            LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocPipeline]: failed to create GPU pipeline!");
-        }
-        m_Resource->TrackPipeline(pipeline);
+        PendingPipeline pending{m_VkDevice};
+        CheckVkResult(vkCreateGraphicsPipelines(
+                          m_VkDevice,
+                          static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())->GetVkPipelineCache(),
+                          1, &pipelineInfo, nullptr, &pending.pipeline),
+                      "vkCreateGraphicsPipelines", "VkPipelineLayout", GetVkObjectIdentity(layout));
+        pipeline = pending.pipeline;
+        m_Resource->TrackPipeline(pending.pipeline);
+        pending.pipeline = VK_NULL_HANDLE;
         cache->StorePipeline(key, pipeline);
     }
 
@@ -445,11 +476,12 @@ namespace ArisenEngine::RHI
             layoutInfo.pushConstantRangeCount = static_cast<uint32_t>(vkPso->GetPushConstantRanges().size());
             layoutInfo.pPushConstantRanges = vkPso->GetPushConstantRanges().data();
 
-            if (vkCreatePipelineLayout(m_VkDevice, &layoutInfo, nullptr, &layout) != VK_SUCCESS)
-            {
-                LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocComputePipeline]: failed to create pipeline layout!");
-            }
-            m_Resource->TrackPipelineLayout(layout);
+            PendingPipelineLayout pending{m_VkDevice};
+            CheckVkResult(vkCreatePipelineLayout(m_VkDevice, &layoutInfo, nullptr, &pending.layout),
+                          "vkCreatePipelineLayout", "VkDevice", GetVkObjectIdentity(m_VkDevice));
+            layout = pending.layout;
+            m_Resource->TrackPipelineLayout(pending.layout);
+            pending.layout = VK_NULL_HANDLE;
             cache->StoreLayout(vkPso->GetCacheIdentity(), layout);
         }
 
@@ -474,13 +506,15 @@ namespace ArisenEngine::RHI
         }
         pipelineInfo.stage = vkPso->m_PipelineStageCreateInfos[0];
 
-        if (vkCreateComputePipelines(
-            m_VkDevice, static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())->GetVkPipelineCache(), 1,
-            &pipelineInfo, nullptr, &pipeline) != VK_SUCCESS)
-        {
-            LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocComputePipeline]: failed to create compute pipeline!");
-        }
-        m_Resource->TrackPipeline(pipeline);
+        PendingPipeline pending{m_VkDevice};
+        CheckVkResult(vkCreateComputePipelines(
+                          m_VkDevice,
+                          static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())->GetVkPipelineCache(),
+                          1, &pipelineInfo, nullptr, &pending.pipeline),
+                      "vkCreateComputePipelines", "VkPipelineLayout", GetVkObjectIdentity(layout));
+        pipeline = pending.pipeline;
+        m_Resource->TrackPipeline(pending.pipeline);
+        pending.pipeline = VK_NULL_HANDLE;
         cache->StorePipeline(key, pipeline);
     }
 
@@ -501,11 +535,12 @@ namespace ArisenEngine::RHI
             layoutInfo.pushConstantRangeCount = static_cast<uint32_t>(vkPso->GetPushConstantRanges().size());
             layoutInfo.pPushConstantRanges = vkPso->GetPushConstantRanges().data();
 
-            if (vkCreatePipelineLayout(m_VkDevice, &layoutInfo, nullptr, &layout) != VK_SUCCESS)
-            {
-                LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocRayTracingPipeline]: failed to create pipeline layout!");
-            }
-            m_Resource->TrackPipelineLayout(layout);
+            PendingPipelineLayout pending{m_VkDevice};
+            CheckVkResult(vkCreatePipelineLayout(m_VkDevice, &layoutInfo, nullptr, &pending.layout),
+                          "vkCreatePipelineLayout", "VkDevice", GetVkObjectIdentity(m_VkDevice));
+            layout = pending.layout;
+            m_Resource->TrackPipelineLayout(pending.layout);
+            pending.layout = VK_NULL_HANDLE;
             cache->StoreLayout(vkPso->GetCacheIdentity(), layout);
         }
 
@@ -529,14 +564,20 @@ namespace ArisenEngine::RHI
         pipelineInfo.pGroups = vkPso->m_RayTracingShaderGroups.data();
         pipelineInfo.maxPipelineRayRecursionDepth = vkPso->m_MaxRecursionDepth;
 
-        if (m_Device->vkCreateRayTracingPipelinesKHR(m_VkDevice, VK_NULL_HANDLE,
-                                                     static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())
-                                                     ->GetVkPipelineCache(), 1, &pipelineInfo, nullptr,
-                                                     &pipeline) != VK_SUCCESS)
-        {
-            LOG_FATAL_AND_THROW("[RHIVkGPUPipeline::AllocRayTracingPipeline]: failed to create Ray Tracing pipeline!");
-        }
-        m_Resource->TrackPipeline(pipeline);
+        if (!m_Device->vkCreateRayTracingPipelinesKHR)
+            ThrowVkFailure("vkCreateRayTracingPipelinesKHR", VK_ERROR_EXTENSION_NOT_PRESENT,
+                           "VkDevice", GetVkObjectIdentity(m_VkDevice), UINT32_MAX, 0,
+                           "Ray tracing pipeline procedure is unavailable");
+
+        PendingPipeline pending{m_VkDevice};
+        CheckVkResult(m_Device->vkCreateRayTracingPipelinesKHR(
+                          m_VkDevice, VK_NULL_HANDLE,
+                          static_cast<RHIVkGPUPipelineManager*>(m_Device->GetPipelineCache())->GetVkPipelineCache(),
+                          1, &pipelineInfo, nullptr, &pending.pipeline),
+                      "vkCreateRayTracingPipelinesKHR", "VkPipelineLayout", GetVkObjectIdentity(layout));
+        pipeline = pending.pipeline;
+        m_Resource->TrackPipeline(pending.pipeline);
+        pending.pipeline = VK_NULL_HANDLE;
         cache->StorePipeline(key, pipeline);
     }
 

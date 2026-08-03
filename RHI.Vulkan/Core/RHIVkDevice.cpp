@@ -25,8 +25,95 @@
 #include <windows.h>
 #include <vulkan/vulkan_win32.h>
 #include "Presentation/RHIVkSurface.h"
+#include "Definitions/RHIVkError.h"
 
 using namespace ArisenEngine::RHI;
+
+namespace
+{
+    template <typename T>
+    RHIResourceHandle RegisterDeferredResource(
+        RHIResourceRegistry& registry,
+        std::unique_ptr<T> resource)
+    {
+        const RHIResourceHandle handle = registry.Create(MakeDeferredDeleteItem(resource.get()));
+        resource.release();
+        return handle;
+    }
+
+    template <typename THandle>
+    void ReleaseRegistryOwnership(RHIResourceRegistry& registry,
+                                  RHIResourceHandle registryHandle,
+                                  const char* operation,
+                                  const char* objectType,
+                                  THandle ownerHandle)
+    {
+        if (registryHandle.IsValid() && !registry.Release(registryHandle))
+        {
+            ThrowInvalidState(operation, objectType, 0,
+                              "Deferred resource ownership is stale",
+                              ownerHandle.index, ownerHandle.generation);
+        }
+    }
+
+    struct ScopedVmaMapping
+    {
+        VmaAllocator allocator{VK_NULL_HANDLE};
+        VmaAllocation allocation{VK_NULL_HANDLE};
+        void* data{nullptr};
+
+        ~ScopedVmaMapping()
+        {
+            if (data != nullptr)
+                vmaUnmapMemory(allocator, allocation);
+        }
+
+        void* Release() noexcept
+        {
+            void* result = data;
+            data = nullptr;
+            return result;
+        }
+    };
+
+    struct ScopedVmaAllocation
+    {
+        VmaAllocator allocator{VK_NULL_HANDLE};
+        VmaAllocation allocation{VK_NULL_HANDLE};
+
+        ~ScopedVmaAllocation()
+        {
+            if (allocator != VK_NULL_HANDLE && allocation != VK_NULL_HANDLE)
+                vmaFreeMemory(allocator, allocation);
+        }
+
+        VmaAllocation Release() noexcept
+        {
+            const VmaAllocation result = allocation;
+            allocation = VK_NULL_HANDLE;
+            return result;
+        }
+    };
+}
+
+ArisenEngine::RHI::RHIVkImageState::~RHIVkImageState()
+{
+    if (sharedHandle != nullptr)
+    {
+        if (::CloseHandle(static_cast<HANDLE>(sharedHandle)) == FALSE)
+        {
+            LOG_ERRORF("[RHIVkImageState::~RHIVkImageState]: CloseHandle failed with Win32 error {0}.",
+                       static_cast<uint32_t>(::GetLastError()));
+        }
+        sharedHandle = nullptr;
+    }
+    if (device != VK_NULL_HANDLE && image != VK_NULL_HANDLE)
+        vkDestroyImage(device, image, nullptr);
+    if (allocator != VK_NULL_HANDLE && allocation != VK_NULL_HANDLE)
+        vmaFreeMemory(allocator, allocation);
+    if (device != VK_NULL_HANDLE && manualMemory != VK_NULL_HANDLE)
+        vkFreeMemory(device, manualMemory, nullptr);
+}
 
 #if ARISEN_RHI__RESOURCE_INSPECTOR
 #define RHI_STATS_PTR(x) (&(x))
@@ -46,9 +133,8 @@ ArisenEngine::RHI::RHIVkDevice::RHIVkDevice(RHIInstance* instance, RHISurface* s
       m_TransferFamilyIndex(transferFamilyIndex), m_PresentFamilyIndex(presentFamilyIndex),
       m_VkPhysicalDeviceMemoryProperties(memoryProperties)
 {
-    std::cout << "[DEBUG] RHIVkDevice::RHIVkDevice START" << std::endl;
-    m_GPUPipelineManager = new RHIVkGPUPipelineManager(this, m_Instance->GetMaxFramesInFlight());
-    m_DescriptorPool = new RHIVkDescriptorPool(this);
+    m_GPUPipelineManager = std::make_unique<RHIVkGPUPipelineManager>(this, m_Instance->GetMaxFramesInFlight());
+    m_DescriptorPool = std::make_unique<RHIVkDescriptorPool>(this);
 
     // Cache function pointers for Sync 2.0 and Dynamic Rendering
     vkCmdPipelineBarrier2KHR = (PFN_vkCmdPipelineBarrier2KHR)vkGetDeviceProcAddr(m_VkDevice, "vkCmdPipelineBarrier2KHR");
@@ -130,15 +216,16 @@ ArisenEngine::RHI::RHIVkDevice::RHIVkDevice(RHIInstance* instance, RHISurface* s
     vkCmdSetStencilOpEXT = (PFN_vkCmdSetStencilOpEXT)vkGetDeviceProcAddr(m_VkDevice, "vkCmdSetStencilOpEXT");
 
     auto* vkInstance = static_cast<RHIVkInstance*>(m_Instance);
-    m_MemoryAllocator = new RHIVkMemoryAllocator(this, vkInstance->GetVkInstance(), vkInstance->GetPhysicalDevice(),
-                                                 m_VkDevice, VK_API_VERSION_1_2,
-                                                 RHI_STATS_PTR(m_Stats.totalVideoMemoryAllocated));
+    m_MemoryAllocator = std::make_unique<RHIVkMemoryAllocator>(
+        this, vkInstance->GetVkInstance(), vkInstance->GetPhysicalDevice(),
+        m_VkDevice, VK_API_VERSION_1_2,
+        RHI_STATS_PTR(m_Stats.totalVideoMemoryAllocated));
 
 
-    m_BindlessManager = new RHIVkBindlessManager(this);
+    m_BindlessManager = std::make_unique<RHIVkBindlessManager>(this);
     m_BindlessManager->Initialize();
 
-    m_Factory = new RHIVkFactory(this);
+    m_Factory = std::make_unique<RHIVkFactory>(this);
     m_DeferredDeletion = std::make_unique<RHIVkDeferredDeletion>(m_Instance->GetMaxFramesInFlight());
     m_ResourceRegistry = std::make_unique<RHIResourceRegistry>(m_DeferredDeletion.get());
 
@@ -171,7 +258,7 @@ ArisenEngine::RHI::RHIVkDevice::RHIVkDevice(RHIInstance* instance, RHISurface* s
     // Register default descriptor pool
     m_DescriptorPoolHandle = m_DescriptorPoolPool->Allocate([&](auto* item)
     {
-        item->pool = m_DescriptorPool;
+        item->pool = m_DescriptorPool.get();
         item->name = "DefaultDescriptorPool";
     });
     m_MemoryPoolPool = std::make_unique<RHIResourcePool<RHIMemoryPoolHandle, RHIVkMemoryPoolPoolItem>>();
@@ -202,7 +289,6 @@ ArisenEngine::RHI::RHIVkDevice::RHIVkDevice(RHIInstance* instance, RHISurface* s
     // Initialize TransferManager after queues and allocator are ready
     m_TransferManager = std::make_unique<RHIVkTransferManager>(this);
 
-    std::cout << "[DEBUG] RHIVkDevice::RHIVkDevice END" << std::endl;
 }
 
 #undef RHI_STATS_PTR
@@ -210,7 +296,7 @@ ArisenEngine::RHI::RHIVkDevice::RHIVkDevice(RHIInstance* instance, RHISurface* s
 
 ArisenEngine::RHI::RHIFactory* ArisenEngine::RHI::RHIVkDevice::GetFactory() const
 {
-    return m_Factory;
+    return m_Factory.get();
 }
 
 ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDevice::GetMaxFramesInFlight() const
@@ -220,12 +306,13 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDevice::GetMaxFramesInFlight() cons
 
 ArisenEngine::RHI::RHIMemoryAllocator* ArisenEngine::RHI::RHIVkDevice::GetMemoryAllocator() const
 {
-    return m_MemoryAllocator;
+    return m_MemoryAllocator.get();
 }
 
 void ArisenEngine::RHI::RHIVkDevice::DeviceWaitIdle() const
 {
-    vkDeviceWaitIdle(m_VkDevice);
+    CheckVkResult(vkDeviceWaitIdle(m_VkDevice), "vkDeviceWaitIdle", "RHIVkDevice",
+                  reinterpret_cast<uint64_t>(m_VkDevice));
 }
 void ArisenEngine::RHI::RHIVkDevice::GraphicQueueWaitIdle() const
 {
@@ -278,29 +365,25 @@ void ArisenEngine::RHI::RHIVkDevice::EnqueueDeferredDestroy(const RHIDeletionDep
     if (m_DeferredDeletion)
     {
         m_DeferredDeletion->Enqueue(deps, item);
+        return;
     }
-}
 
-namespace
-{
-    struct DeferredCallItem
-    {
-        std::function<void()> fn;
-    };
-
-    static void DeferredCallDeleter(void* p)
-    {
-        auto* item = static_cast<DeferredCallItem*>(p);
-        if (item && item->fn) item->fn();
-        delete item;
-    }
+    if (item.ptr && item.deleter)
+        item.deleter(item.ptr);
 }
 
 void ArisenEngine::RHI::RHIVkDevice::EnqueueDeferredDestroy(const RHIDeletionDependencies& deps,
-                                                           std::function<void()>&& fn)
+                                                           std::function<void()>& fn)
 {
-    auto* item = new DeferredCallItem{std::move(fn)};
-    EnqueueDeferredDestroy(deps, RHIDeferredDeleteItem{item, &DeferredCallDeleter});
+    if (m_DeferredDeletion)
+    {
+        m_DeferredDeletion->EnqueueCallback(deps, fn);
+        return;
+    }
+
+    auto immediate = std::move(fn);
+    if (immediate)
+        immediate();
 }
 
 
@@ -391,19 +474,19 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDevice::RegisterBindlessResource(RH
     return m_BindlessManager->RegisterSampler(sampler);
 }
 
-void ArisenEngine::RHI::RHIVkDevice::UnregisterBindlessResourceImage(UInt32 bindlessIndex)
+bool ArisenEngine::RHI::RHIVkDevice::UnregisterBindlessResourceImage(UInt32 bindlessIndex)
 {
-    m_BindlessManager->UnregisterImage(bindlessIndex);
+    return m_BindlessManager && m_BindlessManager->UnregisterImage(bindlessIndex);
 }
 
-void ArisenEngine::RHI::RHIVkDevice::UnregisterBindlessResourceBuffer(UInt32 bindlessIndex)
+bool ArisenEngine::RHI::RHIVkDevice::UnregisterBindlessResourceBuffer(UInt32 bindlessIndex)
 {
-    m_BindlessManager->UnregisterBuffer(bindlessIndex);
+    return m_BindlessManager && m_BindlessManager->UnregisterBuffer(bindlessIndex);
 }
 
-void ArisenEngine::RHI::RHIVkDevice::UnregisterBindlessResourceSampler(UInt32 bindlessIndex)
+bool ArisenEngine::RHI::RHIVkDevice::UnregisterBindlessResourceSampler(UInt32 bindlessIndex)
 {
-    m_BindlessManager->UnregisterSampler(bindlessIndex);
+    return m_BindlessManager && m_BindlessManager->UnregisterSampler(bindlessIndex);
 }
 
 void ArisenEngine::RHI::RHIVkDevice::SetObjectName(ERHIObjectType type, UInt64 handle, const char* name)
@@ -531,7 +614,9 @@ void ArisenEngine::RHI::RHIVkDevice::SetObjectName(ERHIObjectType type, UInt64 h
 
     if (nameInfo.objectType != VK_OBJECT_TYPE_UNKNOWN)
     {
-        vkSetDebugUtilsObjectNameEXT(m_VkDevice, &nameInfo);
+        CheckVkResult(vkSetDebugUtilsObjectNameEXT(m_VkDevice, &nameInfo),
+                      "vkSetDebugUtilsObjectNameEXT", "VkDevice",
+                      GetVkObjectIdentity(m_VkDevice), UINT32_MAX, 0, name);
     }
 }
 
@@ -554,23 +639,22 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocBuffer(RHIBufferHandle handle, RHIBuff
     buffer->size = desc.size;
     buffer->range = desc.size;
 
-    if (vkCreateBuffer(m_VkDevice, &bufferInfo, nullptr, &buffer->buffer) != VK_SUCCESS)
-    {
-        std::cout << "AllocBuffer FAILED to create buffer! Size: " << desc.size << " Usage: " << (int)desc.usage <<
-            std::endl;
-        LOG_ERRORF("[RHIVkDevice::AllocBuffer]: failed to create buffer! Size: {0}, Usage: {1}, Sharing: {2}",
-                   (UInt64)desc.size, (UInt32)desc.usage, (UInt32)desc.sharingMode);
-        return false;
-    }
+    auto state = std::make_unique<RHIVkBufferState>();
+    state->device = m_VkDevice;
+    state->allocator = m_MemoryAllocator->GetVmaAllocator();
+    CheckVkResult(vkCreateBuffer(m_VkDevice, &bufferInfo, nullptr, &state->buffer),
+                  "vkCreateBuffer", "VkDevice", GetVkObjectIdentity(m_VkDevice),
+                  handle.index, handle.generation);
 
     // Register for deferred deletion using a shared state object
-    buffer->state = new RHIVkBufferState();
-    buffer->state->device = m_VkDevice;
-    buffer->state->buffer = buffer->buffer;
-    buffer->state->allocator = m_MemoryAllocator->GetVmaAllocator();
+    auto* statePtr = state.get();
+    const RHIResourceHandle registryHandle = RegisterDeferredResource(*m_ResourceRegistry, std::move(state));
+
+    buffer->buffer = statePtr->buffer;
+    buffer->state = statePtr;
     buffer->memoryUsage = desc.memoryUsage;
     buffer->usage = desc.usage;
-    buffer->registryHandle = m_ResourceRegistry->Create(MakeDeferredDeleteItem(buffer->state));
+    buffer->registryHandle = registryHandle;
 
     return true;
 }
@@ -607,56 +691,40 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocBufferDeviceMemory(RHIBufferHandle han
 
     if (!m_MemoryAllocator->AllocateBufferMemory(buffer->buffer, usage, &newAlloc))
     {
-        std::cout << "AllocBufferDeviceMemory FAILED for buffer " << handle.index << " Usage: " << (int)buffer->
-            memoryUsage << std::endl;
         LOG_ERRORF("[RHIVkDevice::AllocBufferDeviceMemory]: Failed to allocate memory for buffer {0}. Usage: {1}",
                    (UInt64)handle.index, (int)buffer->memoryUsage);
         return false;
     }
+    ScopedVmaAllocation pendingAllocation{buffer->state->allocator, newAlloc};
 
     // If there was an old allocation, queue it for individual deletion
     if (buffer->state->allocation != VK_NULL_HANDLE)
     {
         auto deps = m_ResourceRegistry->GetTickets(buffer->registryHandle);
-        EnqueueDeferredDestroy(deps,
-                               [allocator = buffer->state->allocator, oldAlloc = buffer->state->allocation]()
-                               {
-                                   if (allocator != VK_NULL_HANDLE && oldAlloc != VK_NULL_HANDLE)
-                                   {
-                                       vmaFreeMemory(allocator, oldAlloc);
-                                   }
-                               });
+        std::function<void()> releaseOldAllocation =
+            [allocator = buffer->state->allocator, oldAlloc = buffer->state->allocation]()
+            {
+                if (allocator != VK_NULL_HANDLE && oldAlloc != VK_NULL_HANDLE)
+                    vmaFreeMemory(allocator, oldAlloc);
+            };
+        EnqueueDeferredDestroy(deps, releaseOldAllocation);
     }
 
-    buffer->state->allocation = newAlloc;
-    buffer->allocation = newAlloc; // Sync cache
+    buffer->state->allocation = pendingAllocation.Release();
+    buffer->allocation = buffer->state->allocation; // Sync cache
 
     return true;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::FreeBufferInternal(RHIBufferHandle handle)
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseBuffer(RHIBufferHandle handle)
 {
-    auto* buffer = m_BufferPool->Get(handle);
-    if (!buffer) return;
-
-    if (buffer->buffer != VK_NULL_HANDLE)
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_BufferPool->DeallocateAfter(handle, [this, handle](RHIVkBufferPoolItem* item)
     {
-        m_ResourceRegistry->Release(buffer->registryHandle);
-
-        buffer->buffer = VK_NULL_HANDLE;
-        buffer->allocation = VK_NULL_HANDLE;
-        buffer->state = nullptr;
-        buffer->registryHandle = RHIResourceHandle::Invalid();
-    }
-}
-
-void ArisenEngine::RHI::RHIVkDevice::ReleaseBuffer(RHIBufferHandle handle)
-{
-    FreeBufferInternal(handle);
-    if (!m_BufferPool->Deallocate(handle))
-    {
-        LOG_WARN("[RHIVkDevice::ReleaseBuffer]: Failed to deallocate handle (invalid or stale)!");
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseBuffer", "RHIBuffer", handle);
+    }) != nullptr;
 }
 
 // Optimized synchronization: uses TransferManager for batched, ring-buffer-backed staging.
@@ -674,20 +742,18 @@ void ArisenEngine::RHI::RHIVkDevice::BufferMemoryCopy(RHIBufferHandle handle, co
 
     if (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
     {
-        // Direct mapping possible
-        void* mappedData;
-        if (vmaMapMemory(m_MemoryAllocator->GetVmaAllocator(), buffer->allocation, &mappedData) == VK_SUCCESS)
+        ScopedVmaMapping mapping{m_MemoryAllocator->GetVmaAllocator(), buffer->allocation};
+        CheckVkResult(vmaMapMemory(mapping.allocator, mapping.allocation, &mapping.data),
+                      "vmaMapMemory", "RHIBuffer", GetVkObjectIdentity(buffer->buffer),
+                      handle.index, handle.generation);
+        memcpy(static_cast<uint8_t*>(mapping.data) + offset, src, size);
+
+        // Flush for non-coherent memory to ensure GPU visibility.
+        if (!(memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
         {
-            memcpy((uint8_t*)mappedData + offset, src, size);
-
-            // Flush for non-coherent memory to ensure GPU visibility
-            if (!(memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-            {
-                vmaFlushAllocation(m_MemoryAllocator->GetVmaAllocator(),
-                                   buffer->allocation, offset, size);
-            }
-
-            vmaUnmapMemory(m_MemoryAllocator->GetVmaAllocator(), buffer->allocation);
+            CheckVkResult(vmaFlushAllocation(mapping.allocator, mapping.allocation, offset, size),
+                          "vmaFlushAllocation", "RHIBuffer", GetVkObjectIdentity(buffer->buffer),
+                          handle.index, handle.generation);
         }
     }
     else
@@ -717,18 +783,17 @@ RHIGpuTicket ArisenEngine::RHI::RHIVkDevice::BufferMemoryCopyAsync(RHIBufferHand
     if (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
     {
         // Direct mapping - inherently synchronous, no ticket needed
-        void* mappedData;
-        if (vmaMapMemory(m_MemoryAllocator->GetVmaAllocator(), buffer->allocation, &mappedData) == VK_SUCCESS)
+        ScopedVmaMapping mapping{m_MemoryAllocator->GetVmaAllocator(), buffer->allocation};
+        CheckVkResult(vmaMapMemory(mapping.allocator, mapping.allocation, &mapping.data),
+                      "vmaMapMemory", "RHIBuffer", GetVkObjectIdentity(buffer->buffer),
+                      handle.index, handle.generation);
+        memcpy(static_cast<uint8_t*>(mapping.data) + offset, src, size);
+
+        if (!(memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
         {
-            memcpy((uint8_t*)mappedData + offset, src, size);
-
-            if (!(memFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-            {
-                vmaFlushAllocation(m_MemoryAllocator->GetVmaAllocator(),
-                                   buffer->allocation, offset, size);
-            }
-
-            vmaUnmapMemory(m_MemoryAllocator->GetVmaAllocator(), buffer->allocation);
+            CheckVkResult(vmaFlushAllocation(mapping.allocator, mapping.allocation, offset, size),
+                          "vmaFlushAllocation", "RHIBuffer", GetVkObjectIdentity(buffer->buffer),
+                          handle.index, handle.generation);
         }
         return 0; // No GPU work needed
     }
@@ -757,23 +822,18 @@ void* ArisenEngine::RHI::RHIVkDevice::MapBuffer(RHIBufferHandle handle)
     auto* buffer = m_BufferPool->Get(handle);
     if (!buffer || buffer->allocation == VK_NULL_HANDLE) return nullptr;
 
-    void* mappedData = nullptr;
-    if (vmaMapMemory(m_MemoryAllocator->GetVmaAllocator(), buffer->allocation, &mappedData) == VK_SUCCESS)
+    ScopedVmaMapping mapping{m_MemoryAllocator->GetVmaAllocator(), buffer->allocation};
+    CheckVkResult(vmaMapMemory(mapping.allocator, mapping.allocation, &mapping.data),
+                  "vmaMapMemory", "RHIBuffer", GetVkObjectIdentity(buffer->buffer),
+                  handle.index, handle.generation);
+    if (buffer->memoryUsage == ERHIMemoryUsage::Readback)
     {
-        if (buffer->memoryUsage == ERHIMemoryUsage::Readback &&
-            vmaInvalidateAllocation(
-                m_MemoryAllocator->GetVmaAllocator(),
-                buffer->allocation,
-                0,
-                VK_WHOLE_SIZE) != VK_SUCCESS)
-        {
-            vmaUnmapMemory(m_MemoryAllocator->GetVmaAllocator(), buffer->allocation);
-            return nullptr;
-        }
-
-        return mappedData;
+        CheckVkResult(vmaInvalidateAllocation(mapping.allocator, mapping.allocation, 0, VK_WHOLE_SIZE),
+                      "vmaInvalidateAllocation", "RHIBuffer", GetVkObjectIdentity(buffer->buffer),
+                      handle.index, handle.generation);
     }
-    return nullptr;
+
+    return mapping.Release();
 }
 
 void ArisenEngine::RHI::RHIVkDevice::UnmapBuffer(RHIBufferHandle handle)
@@ -856,12 +916,17 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImage(RHIImageHandle handle, RHIImageD
         imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
 
-    if (vkCreateImage(m_VkDevice, &imageInfo, nullptr, &image->image) != VK_SUCCESS)
-    {
-        LOG_ERROR("[RHIVkDevice::AllocImage]: failed to create image!");
-        return false;
-    }
+    auto state = std::make_unique<RHIVkImageState>();
+    state->device = m_VkDevice;
+    state->allocator = m_MemoryAllocator->GetVmaAllocator();
+    CheckVkResult(vkCreateImage(m_VkDevice, &imageInfo, nullptr, &state->image),
+                  "vkCreateImage", "VkDevice", GetVkObjectIdentity(m_VkDevice),
+                  handle.index, handle.generation);
 
+    auto* statePtr = state.get();
+    const RHIResourceHandle registryHandle = RegisterDeferredResource(*m_ResourceRegistry, std::move(state));
+
+    image->image = statePtr->image;
     image->width = desc.width;
     image->height = desc.height;
     image->mipLevels = desc.mipLevels;
@@ -870,13 +935,9 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImage(RHIImageHandle handle, RHIImageD
     image->bExportSharedWin32Handle = desc.bExportSharedWin32Handle;
 
     // Register for deferred deletion using a shared state object
-    image->state = new RHIVkImageState();
-    image->state->device = m_VkDevice;
-    image->state->image = image->image;
-    image->state->allocator = m_MemoryAllocator->GetVmaAllocator();
+    image->state = statePtr;
     image->memoryUsage = desc.memoryUsage;
-
-    image->registryHandle = m_ResourceRegistry->Create(MakeDeferredDeleteItem(image->state));
+    image->registryHandle = registryHandle;
 
     return true;
 }
@@ -914,33 +975,20 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageDeviceMemory(RHIImageHandle handl
         allocInfo.pNext = &exportInfo;
 
         VkDeviceMemory manualMemory = VK_NULL_HANDLE;
-        const VkResult allocationResult = vkAllocateMemory(
-            m_VkDevice,
-            &allocInfo,
-            nullptr,
-            &manualMemory);
-        if (allocationResult != VK_SUCCESS)
-        {
-            LOG_ERRORF(
-                "[RHIVkDevice::AllocImageDeviceMemory]: Failed to allocate shared memory. "
-                "VkResult={0}, Bytes={1}, MemoryType={2}",
-                static_cast<int>(allocationResult),
-                memReqs.size,
-                allocInfo.memoryTypeIndex);
-            return false;
-        }
+        CheckVkResult(vkAllocateMemory(m_VkDevice, &allocInfo, nullptr, &manualMemory),
+                      "vkAllocateMemory", "RHIImage", GetVkObjectIdentity(image->image),
+                      handle.index, handle.generation, "Shared Win32 image memory");
 
-        const VkResult bindResult = vkBindImageMemory(m_VkDevice, image->image, manualMemory, 0);
-        if (bindResult != VK_SUCCESS)
+        try
         {
-            LOG_ERRORF(
-                "[RHIVkDevice::AllocImageDeviceMemory]: Failed to bind shared image memory. "
-                "VkResult={0}, Bytes={1}, MemoryType={2}",
-                static_cast<int>(bindResult),
-                memReqs.size,
-                allocInfo.memoryTypeIndex);
+            CheckVkResult(vkBindImageMemory(m_VkDevice, image->image, manualMemory, 0),
+                          "vkBindImageMemory", "RHIImage", GetVkObjectIdentity(image->image),
+                          handle.index, handle.generation, "Shared Win32 image memory");
+        }
+        catch (...)
+        {
             vkFreeMemory(m_VkDevice, manualMemory, nullptr);
-            return false;
+            throw;
         }
 
         image->state->manualMemory = manualMemory;
@@ -975,62 +1023,35 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageDeviceMemory(RHIImageHandle handl
     {
         return false;
     }
+    ScopedVmaAllocation pendingAllocation{image->state->allocator, newAlloc};
 
     // If there was an old allocation, queue it for individual deletion
     if (image->state->allocation != VK_NULL_HANDLE)
     {
         auto deps = m_ResourceRegistry->GetTickets(image->registryHandle);
-        EnqueueDeferredDestroy(deps,
-                               [allocator = image->state->allocator, oldAlloc = image->state->allocation]()
-                               {
-                                   if (allocator != VK_NULL_HANDLE && oldAlloc != VK_NULL_HANDLE)
-                                   {
-                                       vmaFreeMemory(allocator, oldAlloc);
-                                   }
-                               });
+        std::function<void()> releaseOldAllocation =
+            [allocator = image->state->allocator, oldAlloc = image->state->allocation]()
+            {
+                if (allocator != VK_NULL_HANDLE && oldAlloc != VK_NULL_HANDLE)
+                    vmaFreeMemory(allocator, oldAlloc);
+            };
+        EnqueueDeferredDestroy(deps, releaseOldAllocation);
     }
 
-    image->state->allocation = newAlloc;
-    image->allocation = newAlloc; // Sync cache
+    image->state->allocation = pendingAllocation.Release();
+    image->allocation = image->state->allocation; // Sync cache
     return true;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::FreeImageInternal(RHIVkImagePoolItem* image)
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseImage(RHIImageHandle handle)
 {
-    if (!image) return;
-
-    if (image->sharedHandle != nullptr)
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_ImagePool->DeallocateAfter(handle, [this, handle](RHIVkImagePoolItem* item)
     {
-        ::CloseHandle((HANDLE)image->sharedHandle);
-        image->sharedHandle = nullptr;
-    }
-
-    if (image->image != VK_NULL_HANDLE && image->needDestroy)
-    {
-        m_ResourceRegistry->Release(image->registryHandle);
-
-        image->image = VK_NULL_HANDLE;
-        image->allocation = VK_NULL_HANDLE;
-        image->state = nullptr;
-        image->registryHandle = RHIResourceHandle::Invalid();
-        image->needDestroy = false;
-    }
-}
-
-void ArisenEngine::RHI::RHIVkDevice::ReleaseImage(RHIImageHandle handle)
-{
-    auto* image = m_ImagePool->Get(handle);
-    if (!image)
-    {
-        LOG_WARN("[RHIVkDevice::ReleaseImage]: Ignoring invalid or stale handle.");
-        return;
-    }
-
-    FreeImageInternal(image);
-    if (!m_ImagePool->Deallocate(handle))
-    {
-        LOG_WARN("[RHIVkDevice::ReleaseImage]: Failed to deallocate handle (invalid or stale)!");
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseImage", "RHIImage", handle);
+    }) != nullptr;
 }
 
 bool ArisenEngine::RHI::RHIVkDevice::AllocImageView(RHIImageViewHandle handle, RHIImageHandle imageHandle,
@@ -1045,22 +1066,10 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageView(RHIImageViewHandle handle, R
         imageItem->image, desc.viewType, desc.format, desc.aspectMask,
         desc.baseMipLevel, desc.levelCount, desc.baseArrayLayer, desc.layerCount);
 
-    if (vkCreateImageView(m_VkDevice, &viewInfo, nullptr, &viewItem->view) != VK_SUCCESS)
-    {
-        LOG_ERROR("[RHIVkDevice::AllocImageView]: failed to create image view!");
-        return false;
-    }
-
-    viewItem->format = desc.format;
-    viewItem->imageHandle = imageHandle;
-    viewItem->width = desc.width > 0 ? desc.width : imageItem->width;
-    viewItem->height = desc.height > 0 ? desc.height : imageItem->height;
-
-    // Register for deferred deletion
     struct DeferredVkImageView
     {
-        VkDevice device;
-        VkImageView view;
+        VkDevice device{VK_NULL_HANDLE};
+        VkImageView view{VK_NULL_HANDLE};
 
         ~DeferredVkImageView()
         {
@@ -1070,32 +1079,35 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageView(RHIImageViewHandle handle, R
             }
         }
     };
-    auto* deferred = new DeferredVkImageView{m_VkDevice, viewItem->view};
-    viewItem->registryHandle = m_ResourceRegistry->Create(MakeDeferredDeleteItem(deferred));
+
+    auto deferred = std::make_unique<DeferredVkImageView>();
+    deferred->device = m_VkDevice;
+    CheckVkResult(vkCreateImageView(m_VkDevice, &viewInfo, nullptr, &deferred->view),
+                  "vkCreateImageView", "RHIImage", GetVkObjectIdentity(imageItem->image),
+                  handle.index, handle.generation);
+
+    const VkImageView vkView = deferred->view;
+    const RHIResourceHandle registryHandle = RegisterDeferredResource(*m_ResourceRegistry, std::move(deferred));
+
+    viewItem->view = vkView;
+    viewItem->format = desc.format;
+    viewItem->imageHandle = imageHandle;
+    viewItem->width = desc.width > 0 ? desc.width : imageItem->width;
+    viewItem->height = desc.height > 0 ? desc.height : imageItem->height;
+    viewItem->registryHandle = registryHandle;
 
     return true;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::FreeImageViewInternal(RHIImageViewHandle handle)
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseImageView(RHIImageViewHandle handle)
 {
-    auto* viewItem = m_ImageViewPool->Get(handle);
-    if (!viewItem) return;
-
-    if (viewItem->view != VK_NULL_HANDLE)
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_ImageViewPool->DeallocateAfter(handle, [this, handle](RHIVkImageViewPoolItem* item)
     {
-        m_ResourceRegistry->Release(viewItem->registryHandle);
-        viewItem->view = VK_NULL_HANDLE;
-        viewItem->registryHandle = RHIResourceHandle::Invalid();
-    }
-}
-
-void ArisenEngine::RHI::RHIVkDevice::ReleaseImageView(RHIImageViewHandle handle)
-{
-    FreeImageViewInternal(handle);
-    if (!m_ImageViewPool->Deallocate(handle))
-    {
-        LOG_WARN("[RHIVkDevice::ReleaseImageView]: Failed to deallocate handle (invalid or stale)!");
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseImageView", "RHIImageView", handle);
+    }) != nullptr;
 }
 
 ArisenEngine::RHI::RHIImageViewHandle ArisenEngine::RHI::RHIVkDevice::FindImageViewForImage(RHIImageHandle imageHandle)
@@ -1106,104 +1118,77 @@ ArisenEngine::RHI::RHIImageViewHandle ArisenEngine::RHI::RHIVkDevice::FindImageV
     });
 }
 
-void ArisenEngine::RHI::RHIVkDevice::FreeSamplerInternal(RHISamplerHandle handle)
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseSampler(RHISamplerHandle handle)
 {
-    auto* sampler = m_SamplerPool->Get(handle);
-    if (sampler && sampler->sampler != VK_NULL_HANDLE)
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_SamplerPool->DeallocateAfter(handle, [this, handle](RHIVkSamplerPoolItem* item)
     {
-        m_ResourceRegistry->Release(sampler->registryHandle);
-        sampler->sampler = VK_NULL_HANDLE;
-        sampler->registryHandle = RHIResourceHandle::Invalid();
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseSampler", "RHISampler", handle);
+    }) != nullptr;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::ReleaseSampler(RHISamplerHandle handle)
-{
-    FreeSamplerInternal(handle);
-    if (!m_SamplerPool->Deallocate(handle))
-    {
-        LOG_WARN("[RHIVkDevice::ReleaseSampler]: Failed to deallocate handle (invalid or stale)!");
-    }
-}
-
-void ArisenEngine::RHI::RHIVkDevice::FreeSemaphoreInternal(RHISemaphoreHandle handle)
-{
-    auto* sem = m_SemaphorePool->Get(handle);
-    if (sem && sem->semaphore != VK_NULL_HANDLE)
-    {
-        m_ResourceRegistry->Release(sem->registryHandle);
-        sem->semaphore = VK_NULL_HANDLE;
-        sem->registryHandle = RHIResourceHandle::Invalid();
-    }
-}
-
-void ArisenEngine::RHI::RHIVkDevice::ReleaseSemaphore(
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseSemaphore(
     RHISemaphoreHandle handle)
 {
-    FreeSemaphoreInternal(handle);
-    if (!m_SemaphorePool->Deallocate(handle))
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_SemaphorePool->DeallocateAfter(handle, [this, handle](RHIVkSemaphorePoolItem* item)
     {
-        LOG_WARN("[RHIVkDevice::ReleaseSemaphore]: Failed to deallocate handle (invalid or stale)!");
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseSemaphore", "RHISemaphore", handle);
+    }) != nullptr;
 }
 
 
 
-void ArisenEngine::RHI::RHIVkDevice::FreeRenderPassInternal(RHIRenderPassHandle handle)
-{
-    auto* rp = m_RenderPassPool->Get(handle);
-    if (rp && rp->registryHandle.IsValid())
-    {
-        m_ResourceRegistry->Release(rp->registryHandle);
-        rp->registryHandle = RHIResourceHandle::Invalid();
-    }
-}
-
-void ArisenEngine::RHI::RHIVkDevice::ReleaseRenderPass(
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseRenderPass(
     RHIRenderPassHandle handle)
 {
-    FreeRenderPassInternal(handle);
-    if (!m_RenderPassPool->Deallocate(handle))
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_RenderPassPool->DeallocateAfter(handle, [this, handle](RHIVkRenderPassPoolItem* item)
     {
-        LOG_WARN("[RHIVkDevice::ReleaseRenderPass]: Failed to deallocate handle (invalid or stale)!");
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseRenderPass", "RHIRenderPass", handle);
+    }) != nullptr;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::FreeFrameBufferInternal(RHIFrameBufferHandle handle)
-{
-    auto* fb = m_FrameBufferPool->Get(handle);
-    if (fb && fb->registryHandle.IsValid())
-    {
-        m_ResourceRegistry->Release(fb->registryHandle);
-        fb->registryHandle = RHIResourceHandle::Invalid();
-    }
-}
-
-void ArisenEngine::RHI::RHIVkDevice::ReleaseFrameBuffer(
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseFrameBuffer(
     RHIFrameBufferHandle handle)
 {
-    FreeFrameBufferInternal(handle);
-    if (!m_FrameBufferPool->Deallocate(handle))
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_FrameBufferPool->DeallocateAfter(handle, [this, handle](RHIVkFrameBufferPoolItem* item)
     {
-        LOG_WARN("[RHIVkDevice::ReleaseFrameBuffer]: Failed to deallocate handle (invalid or stale)!");
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseFrameBuffer", "RHIFrameBuffer", handle);
+    }) != nullptr;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::ReleasePipeline(RHIPipelineHandle handle)
+bool ArisenEngine::RHI::RHIVkDevice::ReleasePipeline(RHIPipelineHandle handle)
 {
     if (!m_GPUPipelineManager)
     {
         LOG_WARN("[RHIVkDevice::ReleasePipeline]: Pipeline manager is unavailable.");
-        return;
+        return false;
     }
-    m_GPUPipelineManager->ReleasePipeline(handle);
+    return m_GPUPipelineManager->ReleasePipeline(handle);
 }
 
 ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
 {
     LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: Start destruction");
     // 1. Wait for GPU to be idle
-    DeviceWaitIdle();
+    const VkResult deviceIdleResult = m_VkDevice == VK_NULL_HANDLE
+                                          ? VK_SUCCESS
+                                          : vkDeviceWaitIdle(m_VkDevice);
+    if (deviceIdleResult != VK_SUCCESS)
+    {
+        LOG_ERRORF("[RHIVkDevice::~RHIVkDevice]: vkDeviceWaitIdle failed with {0} ({1}).",
+                   GetVkResultName(deviceIdleResult), static_cast<int>(deviceIdleResult));
+    }
 
     // 2. Drain FrameSync to ensure all submitted work is tracked as completed
     // 2. Drain FrameSync to ensure all submitted work is tracked as completed
@@ -1219,13 +1204,11 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
     LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: Deleting managers");
     if (m_GPUPipelineManager)
     {
-        delete m_GPUPipelineManager;
-        m_GPUPipelineManager = nullptr;
+        m_GPUPipelineManager.reset();
     }
     if (m_BindlessManager)
     {
-        delete m_BindlessManager;
-        m_BindlessManager = nullptr;
+        m_BindlessManager.reset();
     }
 
     // Explicitly destroy TransferManager before MemoryAllocator is destroyed,
@@ -1237,14 +1220,20 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
     }
 
     // Wait for queues to be idle before destroying anything
-    if (m_GraphicsQueue)
-        m_GraphicsQueue->WaitIdle();
-    if (m_ComputeQueue)
-        m_ComputeQueue->WaitIdle();
-    if (m_TransferQueue)
-        m_TransferQueue->WaitIdle();
-    if (m_PresentQueue)
-        m_PresentQueue->WaitIdle();
+    const auto waitQueueNoThrow = [](RHIQueue* queue, const char* queueName)
+    {
+        if (!queue) return;
+        const VkResult result = static_cast<RHIVkQueue*>(queue)->WaitIdleNoThrow();
+        if (result != VK_SUCCESS)
+        {
+            LOG_ERRORF("[RHIVkDevice::~RHIVkDevice]: {0} vkQueueWaitIdle failed with {1} ({2}).",
+                       queueName, GetVkResultName(result), static_cast<int>(result));
+        }
+    };
+    waitQueueNoThrow(m_GraphicsQueue.get(), "graphics");
+    waitQueueNoThrow(m_ComputeQueue.get(), "compute");
+    waitQueueNoThrow(m_TransferQueue.get(), "transfer");
+    waitQueueNoThrow(m_PresentQueue.get(), "present");
 
     m_FrameSync.reset();
 
@@ -1262,8 +1251,24 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
     // 4. Shut down the Resource Registry to enqueue all remaining resources for deferred destruction.
     if (m_ResourceRegistry)
     {
-        m_ResourceRegistry->Shutdown();
-        LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: Resource Registry shut down, remaining resources enqueued");
+        try
+        {
+            m_ResourceRegistry->Shutdown();
+            LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: Resource Registry shut down, remaining resources enqueued");
+        }
+        catch (const std::exception& error)
+        {
+            LOG_ERRORF(
+                "[RHIVkDevice::~RHIVkDevice]: Deferred resource publication failed after device idle: {0}",
+                error.what());
+            m_ResourceRegistry->DestroyAllImmediately();
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[RHIVkDevice::~RHIVkDevice]: Deferred resource publication failed with an unknown error after device idle.");
+            m_ResourceRegistry->DestroyAllImmediately();
+        }
     }
 
     // 5. Flush all deferred deletions now that we know the GPU is idle and all tickets are completed.
@@ -1281,8 +1286,7 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
     // 6. Now safe to destroy DescriptorPool (after deferred callbacks have completed)
     if (m_DescriptorPool)
     {
-        delete m_DescriptorPool;
-        m_DescriptorPool = nullptr;
+        m_DescriptorPool.reset();
     }
 
     // 7. Now safe to destroy the registry object and memory allocator
@@ -1292,15 +1296,13 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
     // IMPORTANT: Memory allocator must be deleted AFTER all resources that might use it are flushed.
     if (m_MemoryAllocator)
     {
-        delete m_MemoryAllocator;
-        m_MemoryAllocator = nullptr;
+        m_MemoryAllocator.reset();
         LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: m_MemoryAllocator deleted");
     }
 
     if (m_Factory)
     {
-        delete m_Factory;
-        m_Factory = nullptr;
+        m_Factory.reset();
         LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: m_Factory deleted");
     }
 
@@ -1341,80 +1343,74 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocFrameBuffer(RHIFrameBufferHandle handl
     framebufferInfo.height = viewItem->height;
     framebufferInfo.layers = 1;
 
-    if (vkCreateFramebuffer(m_VkDevice, &framebufferInfo, nullptr, &fbItem->framebuffer) != VK_SUCCESS)
-    {
-        LOG_ERROR("[RHIVkDevice::AllocFrameBuffer]: failed to create RHIFrameBuffer!");
-        return false;
-    }
-
-    fbItem->width = viewItem->width;
-    fbItem->height = viewItem->height;
-
-    // Register for deferred deletion
     struct DeferredVkFramebuffer
     {
-        VkDevice device;
-        VkFramebuffer RHIFrameBuffer;
+        VkDevice device{VK_NULL_HANDLE};
+        VkFramebuffer framebuffer{VK_NULL_HANDLE};
 
         ~DeferredVkFramebuffer()
         {
-            if (device != VK_NULL_HANDLE && RHIFrameBuffer != VK_NULL_HANDLE)
+            if (device != VK_NULL_HANDLE && framebuffer != VK_NULL_HANDLE)
             {
-                vkDestroyFramebuffer(device, RHIFrameBuffer, nullptr);
+                vkDestroyFramebuffer(device, framebuffer, nullptr);
             }
         }
     };
-    auto* deferred = new DeferredVkFramebuffer{m_VkDevice, fbItem->framebuffer};
-    fbItem->registryHandle = m_ResourceRegistry->Create(MakeDeferredDeleteItem(deferred));
+
+    auto deferred = std::make_unique<DeferredVkFramebuffer>();
+    deferred->device = m_VkDevice;
+    CheckVkResult(vkCreateFramebuffer(m_VkDevice, &framebufferInfo, nullptr, &deferred->framebuffer),
+                  "vkCreateFramebuffer", "VkRenderPass",
+                  GetVkObjectIdentity(framebufferInfo.renderPass), handle.index, handle.generation);
+
+    const VkFramebuffer framebuffer = deferred->framebuffer;
+    const RHIResourceHandle registryHandle = RegisterDeferredResource(*m_ResourceRegistry, std::move(deferred));
+
+    fbItem->framebuffer = framebuffer;
+    fbItem->width = viewItem->width;
+    fbItem->height = viewItem->height;
+    fbItem->registryHandle = registryHandle;
 
     return true;
 }
 
 
 
-void ArisenEngine::RHI::RHIVkDevice::ReleaseGPUProgram(RHIShaderProgramHandle handle)
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseGPUProgram(RHIShaderProgramHandle handle)
 {
-    auto* item = m_GPUProgramPool->Get(handle);
-    if (item)
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_GPUProgramPool->DeallocateAfter(handle, [this, handle](RHIVkGPUProgramPoolItem* item)
     {
-        if (item->registryHandle.IsValid())
-        m_ResourceRegistry->Release(item->registryHandle);
-
-        if (!m_GPUProgramPool->Deallocate(handle))
-        {
-            LOG_WARN("[RHIVkDevice::ReleaseGPUProgram]: Failed to deallocate handle (invalid or stale)!");
-        }
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseGPUProgram", "RHIShaderProgram", handle);
+    }) != nullptr;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::ReleaseCommandBufferPool(RHICommandBufferPoolHandle handle)
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseCommandBufferPool(RHICommandBufferPoolHandle handle)
 {
-    auto* item = m_CommandBufferPoolPool->Get(handle);
-    if (item)
-    {
-        if (item->registryHandle.IsValid())
-        m_ResourceRegistry->Release(item->registryHandle);
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
 
-        if (!m_CommandBufferPoolPool->Deallocate(handle))
+    return m_CommandBufferPoolPool->DeallocateAfter(
+        handle,
+        [this, handle](RHIVkCommandBufferPoolItem* item)
         {
-            LOG_WARN("[RHIVkDevice::ReleaseCommandBufferPool]: Failed to deallocate handle (invalid or stale)!");
-        }
-    }
+            ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                     "RHIVkDevice::ReleaseCommandBufferPool",
+                                     "RHICommandBufferPool", handle);
+        }) != nullptr;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::ReleaseCommandBuffer(RHICommandBufferHandle handle)
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseCommandBuffer(RHICommandBufferHandle handle)
 {
-    auto* item = m_CommandBufferPool->Get(handle);
-    if (item)
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_CommandBufferPool->DeallocateAfter(handle, [this, handle](RHIVkCommandBufferItem* item)
     {
-        if (item->registryHandle.IsValid())
-        m_ResourceRegistry->Release(item->registryHandle);
-
-        if (!m_CommandBufferPool->Deallocate(handle))
-        {
-            LOG_WARN("[RHIVkDevice::ReleaseCommandBuffer]: Failed to deallocate handle (invalid or stale)!");
-        }
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseCommandBuffer", "RHICommandBuffer", handle);
+    }) != nullptr;
 }
 
 void ArisenEngine::RHI::RHIVkDevice::GetAccelerationStructureBuildSizes(
@@ -1508,54 +1504,55 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocAccelerationStructure(RHIAccelerationS
     createInfo.size = size;
     createInfo.type = (VkAccelerationStructureTypeKHR)type;
 
-    VkAccelerationStructureKHR vkAS;
-    VkResult result = vkCreateAccelerationStructureKHR(m_VkDevice, &createInfo, nullptr, &vkAS);
-    if (result != VK_SUCCESS)
+    struct DeferredVkAccelerationStructure
     {
-        LOG_ERROR_AND_THROW(
-            String::Format(
-                "[RHIVkDevice::AllocAccelerationStructure]: failed to create acceleration structure! Result: %d", result
-            ));
-        m_AccelerationStructurePool->Deallocate(handle);
-        return false;
-    }
+        VkDevice device{VK_NULL_HANDLE};
+        PFN_vkDestroyAccelerationStructureKHR destroy{nullptr};
+        VkAccelerationStructureKHR accelerationStructure{VK_NULL_HANDLE};
+
+        ~DeferredVkAccelerationStructure()
+        {
+            if (device != VK_NULL_HANDLE && destroy && accelerationStructure != VK_NULL_HANDLE)
+                destroy(device, accelerationStructure, nullptr);
+        }
+    };
+
+    auto deferred = std::make_unique<DeferredVkAccelerationStructure>();
+    deferred->device = m_VkDevice;
+    deferred->destroy = vkDestroyAccelerationStructureKHR;
+    CheckVkResult(vkCreateAccelerationStructureKHR(
+                      m_VkDevice, &createInfo, nullptr, &deferred->accelerationStructure),
+                  "vkCreateAccelerationStructureKHR", "RHIBuffer",
+                  GetVkObjectIdentity(bufItem->buffer), handle.index, handle.generation);
 
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
     addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-    addressInfo.accelerationStructure = vkAS;
+    addressInfo.accelerationStructure = deferred->accelerationStructure;
 
-    asItem->accelerationStructure = vkAS;
+    const UInt64 deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(m_VkDevice, &addressInfo);
+    const VkAccelerationStructureKHR accelerationStructure = deferred->accelerationStructure;
+    const RHIResourceHandle registryHandle = RegisterDeferredResource(*m_ResourceRegistry, std::move(deferred));
+
+    asItem->accelerationStructure = accelerationStructure;
     asItem->bufferHandle = buffer;
     asItem->size = size;
-    asItem->deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(m_VkDevice, &addressInfo);
-
-    std::cout << "[RHIVkDevice::AllocAccelerationStructure] Created AS Handle: " << handle.index << ", VkHandle: " << (
-        UInt64)vkAS << ", Address: " << asItem->deviceAddress << std::endl;
-
-    struct DeferredASDeletion
-    {
-        RHIVkDevice* device;
-        RHIAccelerationStructureHandle handle;
-        ~DeferredASDeletion() { device->FreeAccelerationStructureInternal(handle); }
-    };
-    asItem->registryHandle = m_ResourceRegistry->Create(MakeDeferredDeleteItem(new DeferredASDeletion{this, handle}));
+    asItem->deviceAddress = deviceAddress;
+    asItem->registryHandle = registryHandle;
 
     return true;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::ReleaseAccelerationStructure(RHIAccelerationStructureHandle handle)
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseAccelerationStructure(RHIAccelerationStructureHandle handle)
 {
-    auto* item = m_AccelerationStructurePool->Get(handle);
-    if (item)
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_AccelerationStructurePool->DeallocateAfter(
+        handle, [this, handle](RHIVkAccelerationStructurePoolItem* item)
     {
-        if (item->registryHandle.IsValid())
-        m_ResourceRegistry->Release(item->registryHandle);
-
-        if (!m_AccelerationStructurePool->Deallocate(handle))
-        {
-            LOG_WARN("[RHIVkDevice::ReleaseAccelerationStructure]: Failed to deallocate handle (invalid or stale)!");
-        }
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseAccelerationStructure",
+                                 "RHIAccelerationStructure", handle);
+    }) != nullptr;
 }
 
 ArisenEngine::UInt64 ArisenEngine::RHI::RHIVkDevice::GetAccelerationStructureDeviceAddress(
@@ -1599,17 +1596,10 @@ void ArisenEngine::RHI::RHIVkDevice::GetRayTracingShaderGroupHandles(RHIPipeline
         return;
     }
 
-    vkGetRayTracingShaderGroupHandlesKHR(m_VkDevice, handle, firstGroup, groupCount, (size_t)size, pData);
-}
-
-void ArisenEngine::RHI::RHIVkDevice::FreeAccelerationStructureInternal(RHIAccelerationStructureHandle handle)
-{
-    auto* item = m_AccelerationStructurePool->Get(handle);
-    if (item && item->accelerationStructure != VK_NULL_HANDLE)
-    {
-        vkDestroyAccelerationStructureKHR(m_VkDevice, item->accelerationStructure, nullptr);
-        item->accelerationStructure = VK_NULL_HANDLE;
-    }
+    CheckVkResult(vkGetRayTracingShaderGroupHandlesKHR(
+                      m_VkDevice, handle, firstGroup, groupCount, static_cast<size_t>(size), pData),
+                  "vkGetRayTracingShaderGroupHandlesKHR", "RHIPipeline",
+                  GetVkObjectIdentity(handle), pipeline.index, pipeline.generation);
 }
 
 bool ArisenEngine::RHI::RHIVkDevice::AllocMemoryPool(RHIMemoryPoolHandle handle, UInt64 size, UInt32 usageBits)
@@ -1623,43 +1613,32 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocMemoryPool(RHIMemoryPoolHandle handle,
         usage = VMA_MEMORY_USAGE_GPU_ONLY;
     }
 
-    VmaAllocation allocation = VK_NULL_HANDLE;
-    if (!m_MemoryAllocator->AllocateMemory(size, usage, &allocation))
-    {
+    auto state = std::make_unique<RHIVkMemoryPoolState>();
+    state->allocator = m_MemoryAllocator->GetVmaAllocator();
+    state->size = size;
+    if (!m_MemoryAllocator->AllocateMemory(size, usage, &state->allocation))
         return false;
-    }
 
-    poolItem->state = new RHIVkMemoryPoolState();
-    poolItem->state->allocator = m_MemoryAllocator->GetVmaAllocator();
-    poolItem->state->allocation = allocation;
-    poolItem->state->size = size;
-    poolItem->allocation = allocation;
+    auto* statePtr = state.get();
+    const RHIResourceHandle registryHandle = RegisterDeferredResource(*m_ResourceRegistry, std::move(state));
+
+    poolItem->state = statePtr;
+    poolItem->allocation = statePtr->allocation;
     poolItem->size = size;
-
-    poolItem->registryHandle = m_ResourceRegistry->Create(MakeDeferredDeleteItem(poolItem->state));
+    poolItem->registryHandle = registryHandle;
 
     return true;
 }
 
-void ArisenEngine::RHI::RHIVkDevice::ReleaseMemoryPool(RHIMemoryPoolHandle handle)
+bool ArisenEngine::RHI::RHIVkDevice::ReleaseMemoryPool(RHIMemoryPoolHandle handle)
 {
-    FreeMemoryPoolInternal(handle);
-    if (!m_MemoryPoolPool->Deallocate(handle))
+    if (ConsumePooledResourceReleaseRejectionForTesting())
+        return false;
+    return m_MemoryPoolPool->DeallocateAfter(handle, [this, handle](RHIVkMemoryPoolPoolItem* item)
     {
-        LOG_WARN("[RHIVkDevice::ReleaseMemoryPool]: Failed to deallocate handle!");
-    }
-}
-
-void ArisenEngine::RHI::RHIVkDevice::FreeMemoryPoolInternal(RHIMemoryPoolHandle handle)
-{
-    auto* poolItem = m_MemoryPoolPool->Get(handle);
-    if (poolItem && poolItem->registryHandle.IsValid())
-    {
-        m_ResourceRegistry->Release(poolItem->registryHandle);
-        poolItem->state = nullptr;
-        poolItem->allocation = VK_NULL_HANDLE;
-        poolItem->registryHandle = RHIResourceHandle::Invalid();
-    }
+        ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
+                                 "RHIVkDevice::ReleaseMemoryPool", "RHIMemoryPool", handle);
+    }) != nullptr;
 }
 
 bool ArisenEngine::RHI::RHIVkDevice::AllocBufferAliased(RHIBufferHandle handle, RHIBufferDescriptor&& desc,
@@ -1682,28 +1661,26 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocBufferAliased(RHIBufferHandle handle, 
     buffer->range = desc.size;
     buffer->offset = offset;
 
-    if (vkCreateBuffer(m_VkDevice, &bufferInfo, nullptr, &buffer->buffer) != VK_SUCCESS)
-    {
-        LOG_ERROR("[RHIVkDevice::AllocBufferAliased]: failed to create buffer!");
-        return false;
-    }
-
-    if (!m_MemoryAllocator->BindBufferMemory(buffer->buffer, poolItem->allocation, offset))
-    {
-        vkDestroyBuffer(m_VkDevice, buffer->buffer, nullptr);
-        buffer->buffer = VK_NULL_HANDLE;
-        return false;
-    }
-
-    // Register for deferred deletion (buffer only, memory is shared)
     struct AliasedBufferState
     {
-        VkDevice device;
-        VkBuffer buffer;
+        VkDevice device{VK_NULL_HANDLE};
+        VkBuffer buffer{VK_NULL_HANDLE};
         ~AliasedBufferState() { if (device && buffer) vkDestroyBuffer(device, buffer, nullptr); }
     };
-    auto* state = new AliasedBufferState{m_VkDevice, buffer->buffer};
-    buffer->registryHandle = m_ResourceRegistry->Create(MakeDeferredDeleteItem(state));
+
+    auto state = std::make_unique<AliasedBufferState>();
+    state->device = m_VkDevice;
+    CheckVkResult(vkCreateBuffer(m_VkDevice, &bufferInfo, nullptr, &state->buffer),
+                  "vkCreateBuffer", "VkDevice", GetVkObjectIdentity(m_VkDevice),
+                  handle.index, handle.generation, "Aliased buffer");
+    if (!m_MemoryAllocator->BindBufferMemory(state->buffer, poolItem->allocation, offset))
+        return false;
+
+    const VkBuffer vkBuffer = state->buffer;
+    const RHIResourceHandle registryHandle = RegisterDeferredResource(*m_ResourceRegistry, std::move(state));
+
+    buffer->buffer = vkBuffer;
+    buffer->registryHandle = registryHandle;
     buffer->state = nullptr; // Important: we don't own the memory allocation here
     buffer->allocation = poolItem->allocation;
 
@@ -1728,34 +1705,31 @@ bool ArisenEngine::RHI::RHIVkDevice::AllocImageAliased(RHIImageHandle handle, RH
         desc.queueFamilyIndexCount,
         (const uint32_t*)desc.pQueueFamilyIndices);
 
-    if (vkCreateImage(m_VkDevice, &imageInfo, nullptr, &image->image) != VK_SUCCESS)
+    struct AliasedImageState
     {
-        LOG_ERROR("[RHIVkDevice::AllocImageAliased]: failed to create image!");
-        return false;
-    }
+        VkDevice device{VK_NULL_HANDLE};
+        VkImage image{VK_NULL_HANDLE};
+        ~AliasedImageState() { if (device && image) vkDestroyImage(device, image, nullptr); }
+    };
 
-    if (!m_MemoryAllocator->BindImageMemory(image->image, poolItem->allocation, offset))
-    {
-        vkDestroyImage(m_VkDevice, image->image, nullptr);
-        image->image = VK_NULL_HANDLE;
+    auto state = std::make_unique<AliasedImageState>();
+    state->device = m_VkDevice;
+    CheckVkResult(vkCreateImage(m_VkDevice, &imageInfo, nullptr, &state->image),
+                  "vkCreateImage", "VkDevice", GetVkObjectIdentity(m_VkDevice),
+                  handle.index, handle.generation, "Aliased image");
+    if (!m_MemoryAllocator->BindImageMemory(state->image, poolItem->allocation, offset))
         return false;
-    }
 
+    const VkImage vkImage = state->image;
+    const RHIResourceHandle registryHandle = RegisterDeferredResource(*m_ResourceRegistry, std::move(state));
+
+    image->image = vkImage;
     image->width = desc.width;
     image->height = desc.height;
     image->mipLevels = desc.mipLevels;
     image->currentLayout = static_cast<VkImageLayout>(desc.imageLayout);
     image->needDestroy = true;
-
-    // Register for deferred deletion (image only, memory is shared)
-    struct AliasedImageState
-    {
-        VkDevice device;
-        VkImage image;
-        ~AliasedImageState() { if (device && image) vkDestroyImage(device, image, nullptr); }
-    };
-    auto* state = new AliasedImageState{m_VkDevice, image->image};
-    image->registryHandle = m_ResourceRegistry->Create(MakeDeferredDeleteItem(state));
+    image->registryHandle = registryHandle;
     image->state = nullptr; // Important: we don't own the memory allocation here
     image->allocation = poolItem->allocation;
 
@@ -1797,41 +1771,46 @@ namespace ArisenEngine::RHI
     {
         ARISEN_PROFILE_ZONE("Vk::WaitSemaphoreValue");
         auto* item = m_SemaphorePool->Get(handle);
-        if (item && item->semaphore != VK_NULL_HANDLE)
-        {
-            VkSemaphoreWaitInfo waitInfo{};
-            waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-            waitInfo.semaphoreCount = 1;
-            waitInfo.pSemaphores = &item->semaphore;
-            waitInfo.pValues = &value;
-            vkWaitSemaphores(m_VkDevice, &waitInfo, UINT64_MAX);
-        }
+        if (!item || item->semaphore == VK_NULL_HANDLE)
+            ThrowInvalidHandle("vkWaitSemaphores", "RHISemaphore", handle.index, handle.generation);
+
+        VkSemaphoreWaitInfo waitInfo{};
+        waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        waitInfo.semaphoreCount = 1;
+        waitInfo.pSemaphores = &item->semaphore;
+        waitInfo.pValues = &value;
+        CheckVkResult(vkWaitSemaphores(m_VkDevice, &waitInfo, UINT64_MAX),
+                      "vkWaitSemaphores", "RHISemaphore", GetVkObjectIdentity(item->semaphore),
+                      handle.index, handle.generation);
     }
 
     void RHIVkDevice::SignalSemaphoreValue(RHISemaphoreHandle handle, UInt64 value)
     {
         ARISEN_PROFILE_ZONE("Vk::SignalSemaphoreValue");
         auto* item = m_SemaphorePool->Get(handle);
-        if (item && item->semaphore != VK_NULL_HANDLE)
-        {
-            VkSemaphoreSignalInfo signalInfo{};
-            signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
-            signalInfo.semaphore = item->semaphore;
-            signalInfo.value = value;
-            vkSignalSemaphore(m_VkDevice, &signalInfo);
-        }
+        if (!item || item->semaphore == VK_NULL_HANDLE)
+            ThrowInvalidHandle("vkSignalSemaphore", "RHISemaphore", handle.index, handle.generation);
+
+        VkSemaphoreSignalInfo signalInfo{};
+        signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
+        signalInfo.semaphore = item->semaphore;
+        signalInfo.value = value;
+        CheckVkResult(vkSignalSemaphore(m_VkDevice, &signalInfo),
+                      "vkSignalSemaphore", "RHISemaphore", GetVkObjectIdentity(item->semaphore),
+                      handle.index, handle.generation);
     }
 
     UInt64 RHIVkDevice::GetSemaphoreValue(RHISemaphoreHandle handle)
     {
         auto* item = m_SemaphorePool->Get(handle);
-        if (item && item->semaphore != VK_NULL_HANDLE)
-        {
-            uint64_t val = 0;
-            vkGetSemaphoreCounterValue(m_VkDevice, item->semaphore, &val);
-            return val;
-        }
-        return 0;
+        if (!item || item->semaphore == VK_NULL_HANDLE)
+            ThrowInvalidHandle("vkGetSemaphoreCounterValue", "RHISemaphore", handle.index, handle.generation);
+
+        uint64_t val = 0;
+        CheckVkResult(vkGetSemaphoreCounterValue(m_VkDevice, item->semaphore, &val),
+                      "vkGetSemaphoreCounterValue", "RHISemaphore", GetVkObjectIdentity(item->semaphore),
+                      handle.index, handle.generation);
+        return val;
     }
 
     RHIDescriptorHeap* RHIVkDevice::CreateDescriptorHeap(EDescriptorHeapType type, UInt32 descriptorCount)
@@ -1871,12 +1850,11 @@ namespace ArisenEngine::RHI
         handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 
         HANDLE win32Handle = nullptr;
-        if (vkGetMemoryWin32HandleKHR(m_VkDevice, &handleInfo, &win32Handle) != VK_SUCCESS)
-        {
-            LOG_ERRORF("[RHIVkDevice::GetSharedWin32Handle]: Failed to get Win32 handle for image {0}", image->name.c_str());
-            return nullptr;
-        }
+        CheckVkResult(vkGetMemoryWin32HandleKHR(m_VkDevice, &handleInfo, &win32Handle),
+                      "vkGetMemoryWin32HandleKHR", "RHIImage",
+                      GetVkObjectIdentity(image->image), handle.index, handle.generation);
 
+        image->state->sharedHandle = win32Handle;
         image->sharedHandle = win32Handle;
         LOG_INFOF("[RHIVkDevice::GetSharedWin32Handle]: Exported NT handle {0} for image {1} (Cached)", (void*)win32Handle, image->name.c_str());
         return win32Handle;

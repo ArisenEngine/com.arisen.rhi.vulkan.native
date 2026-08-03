@@ -13,7 +13,7 @@ namespace ArisenEngine::RHI
         void* GetHandle() const override;
 
     private:
-        VkSampler m_Sampler;
-        VkDevice m_VkDevice;
+        VkSampler m_Sampler{VK_NULL_HANDLE};
+        VkDevice m_VkDevice{VK_NULL_HANDLE};
     };
 }

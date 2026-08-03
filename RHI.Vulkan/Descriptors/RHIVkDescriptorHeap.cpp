@@ -1,12 +1,26 @@
 #include "Descriptors/RHIVkDescriptorHeap.h"
 #include "../Core/RHIVkDevice.h"
-#include <iostream>
+#include "Definitions/RHIVkError.h"
 
 namespace ArisenEngine::RHI
 {
     RHIVkDescriptorHeap::RHIVkDescriptorHeap(RHIVkDevice* device, EDescriptorHeapType type, UInt32 descriptorLimit)
         : m_Device(device), m_Type(type), m_Limit(descriptorLimit)
     {
+        const VkDevice vkDevice = static_cast<VkDevice>(m_Device->GetHandle());
+        struct PendingDescriptorHeap
+        {
+            VkDevice device{VK_NULL_HANDLE};
+            VkDescriptorPool pool{VK_NULL_HANDLE};
+            VkDescriptorSetLayout layout{VK_NULL_HANDLE};
+
+            ~PendingDescriptorHeap()
+            {
+                if (layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, layout, nullptr);
+                if (pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, pool, nullptr);
+            }
+        } pending{vkDevice};
+
         // 1. Create Descriptor Pool
         VkDescriptorPoolSize poolSizes[] = {
             {VK_DESCRIPTOR_TYPE_SAMPLER, descriptorLimit},
@@ -29,11 +43,9 @@ namespace ArisenEngine::RHI
         poolInfo.poolSizeCount = std::size(poolSizes);
         poolInfo.pPoolSizes = poolSizes;
 
-        if (vkCreateDescriptorPool(static_cast<VkDevice>(m_Device->GetHandle()), &poolInfo, nullptr, &m_Pool) !=
-            VK_SUCCESS)
-        {
-            std::cerr << "Failed to create bindless descriptor pool!" << std::endl;
-        }
+        CheckVkResult(vkCreateDescriptorPool(vkDevice, &poolInfo, nullptr, &pending.pool),
+                      "vkCreateDescriptorPool", "VkDevice", GetVkObjectIdentity(vkDevice),
+                      UINT32_MAX, 0, "Descriptor heap");
 
         // 2. Create Descriptor Set Layout
         // For bindless, we usually have a single binding that is an array of size 'descriptorLimit'
@@ -75,24 +87,27 @@ namespace ArisenEngine::RHI
         layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
         layoutInfo.pNext = &bindingFlagsInfo;
 
-        if (vkCreateDescriptorSetLayout(static_cast<VkDevice>(m_Device->GetHandle()), &layoutInfo, nullptr, &m_Layout)
-            != VK_SUCCESS)
-        {
-            std::cerr << "Failed to create bindless descriptor set layout!" << std::endl;
-        }
+        CheckVkResult(vkCreateDescriptorSetLayout(vkDevice, &layoutInfo, nullptr, &pending.layout),
+                      "vkCreateDescriptorSetLayout", "VkDevice", GetVkObjectIdentity(vkDevice),
+                      UINT32_MAX, 0, "Descriptor heap");
 
         // 3. Allocate Descriptor Set
         VkDescriptorSetAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocInfo.descriptorPool = m_Pool;
+        allocInfo.descriptorPool = pending.pool;
         allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &m_Layout;
+        allocInfo.pSetLayouts = &pending.layout;
 
-        if (vkAllocateDescriptorSets(static_cast<VkDevice>(m_Device->GetHandle()), &allocInfo, &m_DescriptorSet) !=
-            VK_SUCCESS)
-        {
-            std::cerr << "Failed to allocate bindless descriptor set!" << std::endl;
-        }
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        CheckVkResult(vkAllocateDescriptorSets(vkDevice, &allocInfo, &descriptorSet),
+                      "vkAllocateDescriptorSets", "VkDescriptorPool",
+                      GetVkObjectIdentity(pending.pool), UINT32_MAX, 0, "Descriptor heap");
+
+        m_Pool = pending.pool;
+        m_Layout = pending.layout;
+        m_DescriptorSet = descriptorSet;
+        pending.pool = VK_NULL_HANDLE;
+        pending.layout = VK_NULL_HANDLE;
     }
 
     RHIVkDescriptorHeap::~RHIVkDescriptorHeap()

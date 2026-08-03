@@ -51,6 +51,11 @@ namespace ArisenEngine::RHI
     void RHIVkPSOCache::Remove(UInt64 psoIdentity)
     {
         std::unique_lock lock(m_Mutex);
+        RemoveUnlocked(psoIdentity);
+    }
+
+    void RHIVkPSOCache::RemoveUnlocked(UInt64 psoIdentity)
+    {
         for (auto it = m_Pipelines.begin(); it != m_Pipelines.end();)
         {
             if (it->first.psoIdentity == psoIdentity)

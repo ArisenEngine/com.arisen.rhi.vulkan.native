@@ -10,6 +10,7 @@
 #include "Descriptors/RHIVkDescriptorPool.h"
 #include "RHI/Resources/RHIResourcePool.h"
 #include "Handles/RHIVkResourcePools.h"
+#include <atomic>
 #include <mutex>
 #include <memory>
 #include <functional>
@@ -89,14 +90,14 @@ namespace ArisenEngine::RHI
 
         RHIPipelineCache* GetPipelineCache() const override
         {
-            return m_GPUPipelineManager;
+            return m_GPUPipelineManager.get();
         }
 
         const RHIResourceStats& GetResourceStats() const override { return m_Stats; }
 
         RHIDescriptorPool* GetDescriptorPool() const override
         {
-            return m_DescriptorPool;
+            return m_DescriptorPool.get();
         }
 
         RHIDescriptorPoolHandle GetDescriptorPoolHandle() const override { return m_DescriptorPoolHandle; }
@@ -126,9 +127,9 @@ namespace ArisenEngine::RHI
         UInt32 RegisterBindlessResource(RHIImageViewHandle image);
         UInt32 RegisterBindlessResource(RHIBufferHandle buffer);
         UInt32 RegisterBindlessResource(RHISamplerHandle sampler);
-        void UnregisterBindlessResourceImage(UInt32 bindlessIndex);
-        void UnregisterBindlessResourceBuffer(UInt32 bindlessIndex);
-        void UnregisterBindlessResourceSampler(UInt32 bindlessIndex);
+        bool UnregisterBindlessResourceImage(UInt32 bindlessIndex);
+        bool UnregisterBindlessResourceBuffer(UInt32 bindlessIndex);
+        bool UnregisterBindlessResourceSampler(UInt32 bindlessIndex);
 
         // Debug & Naming
         void SetObjectName(ERHIObjectType type, UInt64 handle, const char* name) override;
@@ -137,7 +138,7 @@ namespace ArisenEngine::RHI
         void* GetSharedWin32Handle(RHIImageHandle imageHandle);
 
     private:
-        RHIVkBindlessManager* GetBindlessManager() const { return m_BindlessManager; }
+        RHIVkBindlessManager* GetBindlessManager() const { return m_BindlessManager.get(); }
         UInt32 GetGraphicsFamilyIndex() const { return m_GraphicsFamilyIndex; }
         UInt32 GetTransferFamilyIndex() const { return m_TransferFamilyIndex; }
         UInt32 GetComputeFamilyIndex() const { return m_ComputeFamilyIndex; }
@@ -146,19 +147,19 @@ namespace ArisenEngine::RHI
     private:
         // Internal methods hidden from public interface
         void EnqueueDeferredDestroy(const RHIDeletionDependencies& deps, RHIDeferredDeleteItem item);
-        void EnqueueDeferredDestroy(const RHIDeletionDependencies& deps, std::function<void()>&& fn);
+        void EnqueueDeferredDestroy(const RHIDeletionDependencies& deps, std::function<void()>& fn);
         RHIResourceRegistry* GetResourceRegistry() const { return m_ResourceRegistry.get(); } // Made private
 
         friend class RHIVkInstance;
         friend class RHIVkFactory;
         friend class RHIVkTransferManager;
         friend class RHIVkStagingRingBuffer;
-        RHIVkGPUPipelineManager* m_GPUPipelineManager;
-        RHIVkDescriptorPool* m_DescriptorPool;
+        std::unique_ptr<RHIVkGPUPipelineManager> m_GPUPipelineManager;
+        std::unique_ptr<RHIVkDescriptorPool> m_DescriptorPool;
         RHIDescriptorPoolHandle m_DescriptorPoolHandle;
-        RHIVkMemoryAllocator* m_MemoryAllocator;
-        RHIVkBindlessManager* m_BindlessManager;
-        RHIVkFactory* m_Factory;
+        std::unique_ptr<RHIVkMemoryAllocator> m_MemoryAllocator;
+        std::unique_ptr<RHIVkBindlessManager> m_BindlessManager;
+        std::unique_ptr<RHIVkFactory> m_Factory;
         VkQueue m_VkGraphicQueue;
         VkQueue m_VkPresentQueue;
         VkQueue m_VkComputeQueue;
@@ -201,6 +202,7 @@ namespace ArisenEngine::RHI
         std::unique_ptr<RHIResourcePool<RHIAccelerationStructureHandle, RHIVkAccelerationStructurePoolItem>>
         m_AccelerationStructurePool;
         std::unique_ptr<RHIResourcePool<RHIDescriptorPoolHandle, RHIVkDescriptorPoolPoolItem>> m_DescriptorPoolPool;
+        std::atomic<bool> m_RejectNextPooledResourceReleaseForTesting{false};
 
         // TODO(Design-P2): public: immediately follows private: section, causing fuzzy boundaries between internal and external interfaces.
         // Consider unifying Pool Accessors into an internal access level exposed via an internal interface class.
@@ -209,7 +211,7 @@ namespace ArisenEngine::RHI
     private:
         bool AllocBuffer(RHIBufferHandle handle, RHIBufferDescriptor&& desc) override;
         bool AllocBufferDeviceMemory(RHIBufferHandle handle) override;
-        void ReleaseBuffer(RHIBufferHandle handle) override;
+        bool ReleaseBuffer(RHIBufferHandle handle) override;
         void BufferMemoryCopy(RHIBufferHandle handle, const void* src, UInt64 size, UInt64 offset = 0);
         RHIGpuTicket BufferMemoryCopyAsync(RHIBufferHandle handle, const void* src, UInt64 size, UInt64 offset = 0);
         RHIGpuTicket FlushTransfers();
@@ -223,10 +225,10 @@ namespace ArisenEngine::RHI
 
         bool AllocImage(RHIImageHandle handle, RHIImageDescriptor&& desc) override;
         bool AllocImageDeviceMemory(RHIImageHandle handle) override;
-        void ReleaseImage(RHIImageHandle handle) override;
+        bool ReleaseImage(RHIImageHandle handle) override;
 
         bool AllocMemoryPool(RHIMemoryPoolHandle handle, UInt64 size, UInt32 usageBits) override;
-        void ReleaseMemoryPool(RHIMemoryPoolHandle handle) override;
+        bool ReleaseMemoryPool(RHIMemoryPoolHandle handle) override;
 
         bool AllocBufferAliased(RHIBufferHandle handle, RHIBufferDescriptor&& desc, RHIMemoryPoolHandle pool,
                                 UInt64 offset) override;
@@ -234,8 +236,8 @@ namespace ArisenEngine::RHI
                                UInt64 offset) override;
 
         bool AllocImageView(RHIImageViewHandle handle, RHIImageHandle imageHandle, RHIImageViewDesc&& desc) override;
-        void ReleaseImageView(RHIImageViewHandle handle) override;
-        void ReleaseAccelerationStructure(RHIAccelerationStructureHandle handle) override;
+        bool ReleaseImageView(RHIImageViewHandle handle) override;
+        bool ReleaseAccelerationStructure(RHIAccelerationStructureHandle handle) override;
         bool AllocAccelerationStructure(RHIAccelerationStructureHandle handle, ERHIAccelerationStructureType type,
                                         UInt64 size, RHIBufferHandle buffer, UInt64 offset) override;
         RHIImageViewHandle FindImageViewForImage(RHIImageHandle imageHandle);
@@ -243,16 +245,16 @@ namespace ArisenEngine::RHI
         UInt32 GetImageViewWidth(RHIImageViewHandle handle);
         UInt32 GetImageViewHeight(RHIImageViewHandle handle);
 
-        void ReleaseSampler(RHISamplerHandle handle) override;
-        void ReleaseSemaphore(RHISemaphoreHandle handle) override;
+        bool ReleaseSampler(RHISamplerHandle handle) override;
+        bool ReleaseSemaphore(RHISemaphoreHandle handle) override;
 
-        void ReleaseRenderPass(RHIRenderPassHandle handle) override;
-        void ReleaseFrameBuffer(RHIFrameBufferHandle handle) override;
-        void ReleasePipeline(RHIPipelineHandle handle) override;
+        bool ReleaseRenderPass(RHIRenderPassHandle handle) override;
+        bool ReleaseFrameBuffer(RHIFrameBufferHandle handle) override;
+        bool ReleasePipeline(RHIPipelineHandle handle) override;
 
-        void ReleaseGPUProgram(RHIShaderProgramHandle handle);
-        void ReleaseCommandBufferPool(RHICommandBufferPoolHandle handle);
-        void ReleaseCommandBuffer(RHICommandBufferHandle handle);
+        bool ReleaseGPUProgram(RHIShaderProgramHandle handle);
+        bool ReleaseCommandBufferPool(RHICommandBufferPoolHandle handle);
+        bool ReleaseCommandBuffer(RHICommandBufferHandle handle);
 
         bool AllocFrameBuffer(RHIFrameBufferHandle handle, UInt32 frameIndex, RHIImageViewHandle viewHandle,
                               RHIRenderPassHandle renderPassHandle) override;
@@ -274,6 +276,21 @@ namespace ArisenEngine::RHI
                                                  const void* data);
 
     public:
+        void RejectNextPooledResourceReleaseForTesting() noexcept
+        {
+            m_RejectNextPooledResourceReleaseForTesting.store(true, std::memory_order_release);
+        }
+
+        void RejectNextCommandBufferPoolReleaseForTesting() noexcept
+        {
+            RejectNextPooledResourceReleaseForTesting();
+        }
+
+        RHIResourceRegistry* GetResourceRegistryForTesting() const
+        {
+            return m_ResourceRegistry.get();
+        }
+
         // Pool Accessors (Restricted)
         RHIResourcePool<RHIBufferHandle, RHIVkBufferPoolItem>* GetBufferPool() const { return m_BufferPool.get(); }
         RHIResourcePool<RHIImageHandle, RHIVkImagePoolItem>* GetImagePool() const { return m_ImagePool.get(); }
@@ -385,16 +402,10 @@ namespace ArisenEngine::RHI
         PFN_vkCmdSetStencilOpEXT vkCmdSetStencilOpEXT = nullptr;
 
     private:
-        // Internal low-level destruction (Vulkan/Memory only, via Registry)
-        void FreeBufferInternal(RHIBufferHandle handle);
-        void FreeImageInternal(RHIVkImagePoolItem* image);
-        void FreeImageViewInternal(RHIImageViewHandle handle);
-        void FreeSamplerInternal(RHISamplerHandle handle);
-        void FreeSemaphoreInternal(RHISemaphoreHandle handle);
-
-        void FreeRenderPassInternal(RHIRenderPassHandle handle);
-        void FreeFrameBufferInternal(RHIFrameBufferHandle handle);
-        void FreeAccelerationStructureInternal(RHIAccelerationStructureHandle handle);
-        void FreeMemoryPoolInternal(RHIMemoryPoolHandle handle);
+        bool ConsumePooledResourceReleaseRejectionForTesting() noexcept
+        {
+            return m_RejectNextPooledResourceReleaseForTesting.exchange(
+                false, std::memory_order_acq_rel);
+        }
     };
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include <mutex>
+#include <stdexcept>
 #include <utility>
 #include "Presentation/RHIVkSurface.h"
 #include "RHI/Handles/RHIHandle.h"
@@ -9,6 +10,7 @@
 namespace ArisenEngine::RHI
 {
     class RHIVkSurface;
+    class RHIVkQueue;
 
     class RHIVkSwapChain final : public RHISwapChain
     {
@@ -20,6 +22,7 @@ namespace ArisenEngine::RHI
         void CreateSwapChainWithDesc(RHISwapChainDescriptor desc) override;
         RHIImageHandle BeginFrame(UInt32 frameIndex) override;
         void EndFrame(UInt32 frameIndex) override;
+        RHIGpuTicket RetireFrame(UInt32 frameIndex) override;
 
         RHISemaphoreHandle GetImageAvailableSemaphore(UInt32 frameIndex) const override;
         RHISemaphoreHandle GetRenderFinishSemaphore(UInt32 frameIndex) const override;
@@ -28,9 +31,38 @@ namespace ArisenEngine::RHI
         void Cleanup() override;
         void Present(UInt32 frameIndex) override;
         bool HasAcquiredImage(UInt32 frameIndex) const;
+        void InjectNextPresentResultForTesting(VkResult result)
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+            if (static_cast<int32_t>(result) >= 0 ||
+                result == VK_ERROR_OUT_OF_DATE_KHR)
+            {
+                throw std::invalid_argument(
+                    "Injected presentation results must require terminal generation fail-stop");
+            }
+            if (m_InjectedPresentResult != VK_SUCCESS ||
+                m_TerminalPresentResult != VK_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "A presentation failure is already pending or terminal");
+            }
+            m_InjectedPresentResult = result;
+        }
+        VkResult GetTerminalPresentResultForTesting() const
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+            return m_TerminalPresentResult;
+        }
+        RHISwapChainFrameState GetFrameStateForTesting(UInt32 frameIndex) const
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+            const auto& lifecycle = m_FrameLifecycles[frameIndex % m_MaxFramesInFlight];
+            return lifecycle.frameIndex == frameIndex
+                ? lifecycle.state
+                : RHISwapChainFrameState::Idle;
+        }
         bool RequiresAcquireSemaphoreWait() const { return m_VkSurface != VK_NULL_HANDLE; }
         RHISemaphoreHandle GetExternalConsumerWaitSemaphore(UInt32 frameIndex) const;
-        void NotifyFrameSubmitted(UInt32 frameIndex, RHIGpuTicket ticket);
         void* GetSharedWin32Handle(UInt32 index) override;
         UInt64 GetSharedMemorySize(UInt32 index) override;
         void* GetRenderFinishedSemaphoreWin32Handle(UInt32 frameIndex) override;
@@ -38,6 +70,7 @@ namespace ArisenEngine::RHI
         void CompleteConsumedSemaphoreWin32Handle(void* handle) override;
         void ReleaseConsumedSemaphoreWin32Handle(void* handle) override;
         bool AcknowledgeExternalConsumerRelease() override;
+        bool PrepareForSurfaceRelease();
         void SetResolution(UInt32 width, UInt32 height) override;
         bool TrySetResolution(UInt32 width, UInt32 height) override;
 
@@ -46,6 +79,27 @@ namespace ArisenEngine::RHI
         void RecreateSwapChainIfNeeded() override;
 
     private:
+        friend class RHIVkQueue;
+
+        struct FrameSubmissionPlan
+        {
+            RHISemaphoreHandle waitSemaphore{RHISemaphoreHandle::Invalid()};
+            RHISemaphoreHandle signalSemaphore{RHISemaphoreHandle::Invalid()};
+            bool waitsForAcquire{false};
+            bool signalsFrameComplete{false};
+        };
+
+        struct FrameRetirementPlan
+        {
+            VkSemaphore waitSemaphore{VK_NULL_HANDLE};
+            VkSemaphore signalSemaphore{VK_NULL_HANDLE};
+            VkCommandBuffer commandBuffer{VK_NULL_HANDLE};
+            RHIGpuTicket previousTicket{0};
+            bool terminal{false};
+            bool requiresQueueSubmit{false};
+            bool requiresPresent{false};
+        };
+
         struct VirtualFrameSynchronization
         {
             bool producerSubmitted{false};
@@ -58,6 +112,38 @@ namespace ArisenEngine::RHI
             UInt32 consumerFrameIndex{0};
         };
 
+        struct FrameLifecycle
+        {
+            RHISwapChainFrameState state{RHISwapChainFrameState::Idle};
+            UInt32 frameIndex{UINT32_MAX};
+            RHIGpuTicket submitTicket{0};
+            bool acquireWaitSubmitted{false};
+            bool submissionPending{false};
+            bool pendingWaitForAcquire{false};
+            bool pendingSignalFrameComplete{false};
+            bool retirementPending{false};
+        };
+
+        FrameSubmissionPlan PrepareFrameSubmission(
+            UInt32 frameIndex,
+            bool waitsForAcquire,
+            bool signalsFrameComplete);
+        void CommitFrameSubmission(UInt32 frameIndex, RHIGpuTicket ticket) noexcept;
+        void CancelFrameSubmission(UInt32 frameIndex) noexcept;
+        FrameRetirementPlan PrepareFrameRetirement(UInt32 frameIndex);
+        VkResult CommitFrameRetirement(
+            UInt32 frameIndex,
+            RHIGpuTicket ticket,
+            const FrameRetirementPlan& plan) noexcept;
+        void CancelFrameRetirement(UInt32 frameIndex) noexcept;
+        VkResult PresentRealFrame(UInt32 currentFrame, VkSemaphore waitSemaphore) noexcept;
+        VkCommandBuffer PrepareRealRetirementCommandBuffer(UInt32 currentFrame);
+        bool HasActiveFrameOwnershipLocked() const noexcept;
+        void PublishPendingRetirement();
+        UInt32 RequireConsumedSemaphoreHandleSlotLocked(
+            void* handle,
+            const char* operation) const;
+
         VkSwapchainKHR m_VkSwapChain{VK_NULL_HANDLE};
         RHIDevice* m_Device;
         VkDevice m_VkDevice;
@@ -66,19 +152,34 @@ namespace ArisenEngine::RHI
         Containers::Vector<RHIImageHandle> m_ImageHandles;
         Containers::Vector<RHIImageViewHandle> m_ImageViewHandles;
         Containers::Vector<void*> m_SharedHandles;
+        Containers::Vector<RHIImageHandle> m_PendingRetiredImages;
+        Containers::Vector<RHIImageViewHandle> m_PendingRetiredImageViews;
+        Containers::Vector<void*> m_PendingRetiredSharedHandles;
+        VkSwapchainKHR m_PendingRetiredSwapChain{VK_NULL_HANDLE};
+        bool m_PendingRetiredRealGenerationRegistryOwned{false};
+        RHIGpuTicket m_PendingRetiredGraphicsTicket{0};
 
         Containers::Vector<RHISemaphoreHandle> m_ImageAvailableSemaphores;
         Containers::Vector<void*> m_ImageAvailableSemaphoreSharedHandles;
         Containers::Vector<RHISemaphoreHandle> m_RenderFinishSemaphores;
         Containers::Vector<void*> m_RenderFinishSemaphoreSharedHandles;
         Containers::Vector<VirtualFrameSynchronization> m_VirtualFrameSynchronization;
+        Containers::Vector<FrameLifecycle> m_FrameLifecycles;
         Containers::Vector<uint32_t> m_AcquiredImageIndices;
         Containers::Vector<VkResult> m_AcquisitionResults;
+        Containers::Vector<VkCommandBuffer> m_RetirementCommandBuffers;
+        Containers::Vector<RHIGpuTicket> m_RetirementCommandBufferTickets;
+        VkCommandPool m_RetirementCommandPool{VK_NULL_HANDLE};
         VkQueue m_VkPresentQueue;
         RHISwapChainDescriptor m_Desc{};
         bool m_SwapChainIsOutDate{false};
         bool m_LastCreationSucceeded{false};
+        bool m_LastCreationRetiredPrevious{false};
+        bool m_RealGenerationRegistryOwned{false};
         bool m_ExternalConsumerReleaseAcknowledged{false};
+        VkResult m_InjectedPresentResult{VK_SUCCESS};
+        VkResult m_TerminalPresentResult{VK_SUCCESS};
+        RHIGpuTicket m_LastOwnedGraphicsTicket{0};
         UInt32 m_ActiveWidth{0};
         UInt32 m_ActiveHeight{0};
         mutable std::recursive_mutex m_Mutex;

@@ -4,6 +4,7 @@
 // #include "../Handles/RHIVkBufferHandle.h"
 #include "Samplers/RHIVkSampler.h"
 #include "Utils/RHIVkInitializer.h"
+#include "Definitions/RHIVkError.h"
 
 namespace ArisenEngine::RHI
 {
@@ -13,6 +14,9 @@ namespace ArisenEngine::RHI
         m_ImageFreeList.capacity = MAX_BINDLESS_IMAGES;
         m_SamplerFreeList.capacity = MAX_BINDLESS_SAMPLERS;
         m_BufferFreeList.capacity = MAX_BINDLESS_BUFFERS;
+        m_ImageFreeList.allocated.resize(m_ImageFreeList.capacity, 0);
+        m_SamplerFreeList.allocated.resize(m_SamplerFreeList.capacity, 0);
+        m_BufferFreeList.allocated.resize(m_BufferFreeList.capacity, 0);
     }
 
     RHIVkBindlessManager::~RHIVkBindlessManager()
@@ -75,10 +79,9 @@ namespace ArisenEngine::RHI
         layoutBindingFlags.pBindingFlags = bindingFlags;
         layoutInfo.pNext = &layoutBindingFlags;
 
-        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_DescriptorSetLayout) != VK_SUCCESS)
-        {
-            LOG_FATAL_AND_THROW("[RHIVkBindlessManager]: failed to create descriptor set layout!");
-        }
+        CheckVkResult(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &m_DescriptorSetLayout),
+                      "vkCreateDescriptorSetLayout", "VkDevice", GetVkObjectIdentity(device),
+                      UINT32_MAX, 0, "Bindless descriptor layout");
 
         // 2. Create Descriptor Pool
         VkDescriptorPoolSize poolSizes[3];
@@ -96,10 +99,9 @@ namespace ArisenEngine::RHI
         poolInfo.poolSizeCount = 3;
         poolInfo.pPoolSizes = poolSizes;
 
-        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DescriptorPool) != VK_SUCCESS)
-        {
-            LOG_FATAL_AND_THROW("[RHIVkBindlessManager]: failed to create descriptor pool!");
-        }
+        CheckVkResult(vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_DescriptorPool),
+                      "vkCreateDescriptorPool", "VkDevice", GetVkObjectIdentity(device),
+                      UINT32_MAX, 0, "Bindless descriptor pool");
 
         // 3. Allocate Descriptor Set
         VkDescriptorSetVariableDescriptorCountAllocateInfo variableDescriptorCountAllocInfo{};
@@ -116,11 +118,10 @@ namespace ArisenEngine::RHI
         allocInfo.pSetLayouts = &m_DescriptorSetLayout;
         allocInfo.pNext = &variableDescriptorCountAllocInfo;
 
-        if (vkAllocateDescriptorSets(device, &allocInfo, &m_DescriptorSet) != VK_SUCCESS)
-        {
-            LOG_FATAL_AND_THROW("[RHIVkBindlessManager]: failed to allocate descriptor set!");
-        }
-        std::cout << "[DEBUG] RHIVkBindlessManager::Initialize END" << std::endl;
+        CheckVkResult(vkAllocateDescriptorSets(device, &allocInfo, &m_DescriptorSet),
+                      "vkAllocateDescriptorSets", "VkDescriptorPool",
+                      GetVkObjectIdentity(m_DescriptorPool), UINT32_MAX, 0,
+                      "Bindless descriptor set");
     }
 
     void RHIVkBindlessManager::Shutdown()
@@ -236,19 +237,19 @@ namespace ArisenEngine::RHI
         return index;
     }
 
-    void RHIVkBindlessManager::UnregisterImage(UInt32 index)
+    bool RHIVkBindlessManager::UnregisterImage(UInt32 index)
     {
-        ReleaseIndex(m_ImageFreeList, index);
+        return ReleaseIndex(m_ImageFreeList, index);
     }
 
-    void RHIVkBindlessManager::UnregisterSampler(UInt32 index)
+    bool RHIVkBindlessManager::UnregisterSampler(UInt32 index)
     {
-        ReleaseIndex(m_SamplerFreeList, index);
+        return ReleaseIndex(m_SamplerFreeList, index);
     }
 
-    void RHIVkBindlessManager::UnregisterBuffer(UInt32 index)
+    bool RHIVkBindlessManager::UnregisterBuffer(UInt32 index)
     {
-        ReleaseIndex(m_BufferFreeList, index);
+        return ReleaseIndex(m_BufferFreeList, index);
     }
 
     UInt32 RHIVkBindlessManager::AcquireIndex(FreeList& list)
@@ -258,25 +259,29 @@ namespace ArisenEngine::RHI
         {
             UInt32 index = list.freeIndices.back();
             list.freeIndices.pop_back();
+            list.allocated[index] = 1;
             return index;
         }
 
         if (list.nextIndex < list.capacity)
         {
-            return list.nextIndex++;
+            const UInt32 index = list.nextIndex++;
+            list.allocated[index] = 1;
+            return index;
         }
 
         return 0xFFFFFFFF;
     }
 
-    void RHIVkBindlessManager::ReleaseIndex(FreeList& list, UInt32 index)
+    bool RHIVkBindlessManager::ReleaseIndex(FreeList& list, UInt32 index)
     {
-        if (index == 0xFFFFFFFF || index >= list.capacity)
-        {
-            return;
-        }
-
         std::lock_guard<std::mutex> lock(list.mutex);
+        if (index == 0xFFFFFFFF || index >= list.nextIndex || index >= list.capacity ||
+            list.allocated[index] == 0)
+            return false;
+
+        list.allocated[index] = 0;
         list.freeIndices.push_back(index);
+        return true;
     }
 }

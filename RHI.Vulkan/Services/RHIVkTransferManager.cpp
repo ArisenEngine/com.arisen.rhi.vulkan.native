@@ -8,6 +8,7 @@
 #include "Commands/RHIVkCommandBuffer.h"
 #include "RHI/Commands/RHICommandBufferPool.h"
 #include "RHI/Handles/RHIHandle.h"
+#include "Definitions/RHIVkError.h"
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -51,7 +52,12 @@ RHIVkTransferManager::~RHIVkTransferManager()
 
     if (m_TransferQueue)
     {
-        m_TransferQueue->WaitIdle();
+        const VkResult result = m_TransferQueue->WaitIdleNoThrow();
+        if (result != VK_SUCCESS)
+        {
+            LOG_ERRORF("[RHIVkTransferManager::~RHIVkTransferManager]: vkQueueWaitIdle failed with {0} ({1}).",
+                       GetVkResultName(result), static_cast<int>(result));
+        }
     }
 
     if (m_TransferCommandPool.IsValid())

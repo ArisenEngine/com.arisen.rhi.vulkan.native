@@ -65,22 +65,9 @@ namespace ArisenEngine::RHI
         VmaAllocator allocator{VK_NULL_HANDLE};
         VmaAllocation allocation{VK_NULL_HANDLE};
         VkDeviceMemory manualMemory{VK_NULL_HANDLE};
+        void* sharedHandle{nullptr};
 
-        ~RHIVkImageState()
-        {
-            if (device != VK_NULL_HANDLE && image != VK_NULL_HANDLE)
-            {
-                vkDestroyImage(device, image, nullptr);
-            }
-            if (allocator != VK_NULL_HANDLE && allocation != VK_NULL_HANDLE)
-            {
-                vmaFreeMemory(allocator, allocation);
-            }
-            if (device != VK_NULL_HANDLE && manualMemory != VK_NULL_HANDLE)
-            {
-                vkFreeMemory(device, manualMemory, nullptr);
-            }
-        }
+        ~RHIVkImageState();
     };
 
     /**

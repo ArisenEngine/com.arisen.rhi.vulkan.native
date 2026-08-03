@@ -2,6 +2,9 @@
   "id": "com.arisen.rhi.vulkan.native",
   "name": "Arisen Vulkan RHI Backend",
   "version": "1.0.0",
+  "engine": {
+    "minVersion": "0.1.0"
+  },
   "layer": "driver",
   "description": "C\u002B\u002B payload for the Vulkan rendering hardware interface driver backend.",
   "type": "hybrid",

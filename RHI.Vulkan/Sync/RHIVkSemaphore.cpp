@@ -1,11 +1,13 @@
 #include "Sync/RHIVkSemaphore.h"
 
 #include "Logger/Logger.h"
+#include "Definitions/RHIVkError.h"
 
 ArisenEngine::RHI::RHIVkSemaphore::~RHIVkSemaphore() noexcept
 {
     LOG_DEBUG("[RHIVkSemaphore::~RHIVkSemaphore]: ~RHIVkSemaphore");
-    vkDestroySemaphore(m_VkDevice, m_VkSemaphore, nullptr);
+    if (m_VkDevice != VK_NULL_HANDLE && m_VkSemaphore != VK_NULL_HANDLE)
+        vkDestroySemaphore(m_VkDevice, m_VkSemaphore, nullptr);
     LOG_DEBUG("## Destroy Vulkan Semaphore ##");
 }
 
@@ -24,10 +26,8 @@ ArisenEngine::RHI::RHIVkSemaphore::RHIVkSemaphore(VkDevice device, bool isTimeli
         semaphoreInfo.pNext = &typeInfo;
     }
 
-    if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &m_VkSemaphore) != VK_SUCCESS)
-    {
-        LOG_FATAL_AND_THROW("[RHIVkSemaphore::RHIVkSemaphore]: failed to create semaphore!");
-    }
+    CheckVkResult(vkCreateSemaphore(device, &semaphoreInfo, nullptr, &m_VkSemaphore),
+                  "vkCreateSemaphore", "RHIVkSemaphore", GetVkObjectIdentity(device));
 }
 
 void ArisenEngine::RHI::RHIVkSemaphore::Wait(uint64_t value)
@@ -40,7 +40,8 @@ void ArisenEngine::RHI::RHIVkSemaphore::Wait(uint64_t value)
     waitInfo.pSemaphores = &m_VkSemaphore;
     waitInfo.pValues = &value;
 
-    vkWaitSemaphores(m_VkDevice, &waitInfo, UINT64_MAX);
+    CheckVkResult(vkWaitSemaphores(m_VkDevice, &waitInfo, UINT64_MAX),
+                  "vkWaitSemaphores", "RHIVkSemaphore", GetVkObjectIdentity(m_VkSemaphore));
 }
 
 void ArisenEngine::RHI::RHIVkSemaphore::Signal(uint64_t value)
@@ -52,7 +53,8 @@ void ArisenEngine::RHI::RHIVkSemaphore::Signal(uint64_t value)
     signalInfo.semaphore = m_VkSemaphore;
     signalInfo.value = value;
 
-    vkSignalSemaphore(m_VkDevice, &signalInfo);
+    CheckVkResult(vkSignalSemaphore(m_VkDevice, &signalInfo),
+                  "vkSignalSemaphore", "RHIVkSemaphore", GetVkObjectIdentity(m_VkSemaphore));
 }
 
 uint64_t ArisenEngine::RHI::RHIVkSemaphore::GetValue()
@@ -60,6 +62,7 @@ uint64_t ArisenEngine::RHI::RHIVkSemaphore::GetValue()
     if (!m_IsTimeline) return 0;
 
     uint64_t value = 0;
-    vkGetSemaphoreCounterValue(m_VkDevice, m_VkSemaphore, &value);
+    CheckVkResult(vkGetSemaphoreCounterValue(m_VkDevice, m_VkSemaphore, &value),
+                  "vkGetSemaphoreCounterValue", "RHIVkSemaphore", GetVkObjectIdentity(m_VkSemaphore));
     return value;
 }

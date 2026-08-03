@@ -8,6 +8,134 @@ using namespace ArisenEngine;
 #include "RHI/Enums/Image/ECompositeAlphaFlagBits.h"
 #include "RHI/Enums/Image/EImageAspectFlagBits.h"
 #include "Core/RHIVkInstance.h"
+#include "Definitions/RHIVkError.h"
+#include "Queues/RHIVkQueue.h"
+
+namespace
+{
+    struct RHIVkSwapChainGenerationState final
+    {
+        VkDevice device{VK_NULL_HANDLE};
+        VkSwapchainKHR swapchain{VK_NULL_HANDLE};
+        ArisenEngine::Containers::Vector<VkImageView> imageViews;
+        bool ownsVulkanObjects{false};
+
+        ~RHIVkSwapChainGenerationState()
+        {
+            if (!ownsVulkanObjects)
+                return;
+
+            for (auto it = imageViews.rbegin(); it != imageViews.rend(); ++it)
+            {
+                if (device != VK_NULL_HANDLE && *it != VK_NULL_HANDLE)
+                    vkDestroyImageView(device, *it, nullptr);
+            }
+            imageViews.clear();
+
+            if (device != VK_NULL_HANDLE && swapchain != VK_NULL_HANDLE)
+                vkDestroySwapchainKHR(device, swapchain, nullptr);
+            swapchain = VK_NULL_HANDLE;
+        }
+    };
+
+    bool ReleaseSwapChainResources(
+        ArisenEngine::RHI::RHIVkDevice* device,
+        VkDevice vkDevice,
+        VkSwapchainKHR& swapchain,
+        ArisenEngine::Containers::Vector<ArisenEngine::RHI::RHIImageHandle>& images,
+        ArisenEngine::Containers::Vector<ArisenEngine::RHI::RHIImageViewHandle>& imageViews,
+        ArisenEngine::Containers::Vector<void*>& sharedHandles,
+        bool destroyVulkanObjectsDirectly) noexcept
+    {
+        auto* factory = device->GetFactory();
+        while (!imageViews.empty())
+        {
+            const auto handle = imageViews.back();
+            if (destroyVulkanObjectsDirectly)
+            {
+                auto* viewItem = device->GetImageViewPool()->Get(handle);
+                if (viewItem && viewItem->view != VK_NULL_HANDLE)
+                {
+                    vkDestroyImageView(vkDevice, viewItem->view, nullptr);
+                    viewItem->view = VK_NULL_HANDLE;
+                    viewItem->registryHandle = ArisenEngine::RHI::RHIResourceHandle::Invalid();
+                }
+            }
+
+            try
+            {
+                if (!factory->ReleaseImageView(handle))
+                {
+                    LOG_ERRORF(
+                        "[ReleaseSwapChainResources]: Failed to release image view {0}:{1}.",
+                        handle.index,
+                        handle.generation);
+                    return false;
+                }
+            }
+            catch (const std::exception& error)
+            {
+                LOG_ERRORF(
+                    "[ReleaseSwapChainResources]: Image view {0}:{1} release failed: {2}",
+                    handle.index,
+                    handle.generation,
+                    error.what());
+                return false;
+            }
+            catch (...)
+            {
+                LOG_ERRORF(
+                    "[ReleaseSwapChainResources]: Image view {0}:{1} release failed with an unknown error.",
+                    handle.index,
+                    handle.generation);
+                return false;
+            }
+            imageViews.pop_back();
+        }
+
+        while (!images.empty())
+        {
+            const auto handle = images.back();
+            try
+            {
+                if (!factory->ReleaseImage(handle))
+                {
+                    LOG_ERRORF(
+                        "[ReleaseSwapChainResources]: Failed to release image {0}:{1}.",
+                        handle.index,
+                        handle.generation);
+                    return false;
+                }
+            }
+            catch (const std::exception& error)
+            {
+                LOG_ERRORF(
+                    "[ReleaseSwapChainResources]: Image {0}:{1} release failed: {2}",
+                    handle.index,
+                    handle.generation,
+                    error.what());
+                return false;
+            }
+            catch (...)
+            {
+                LOG_ERRORF(
+                    "[ReleaseSwapChainResources]: Image {0}:{1} release failed with an unknown error.",
+                    handle.index,
+                    handle.generation);
+                return false;
+            }
+            images.pop_back();
+        }
+        sharedHandles.clear();
+
+        if (destroyVulkanObjectsDirectly && swapchain != VK_NULL_HANDLE && vkDevice != VK_NULL_HANDLE)
+        {
+            vkDestroySwapchainKHR(vkDevice, swapchain, nullptr);
+        }
+        swapchain = VK_NULL_HANDLE;
+        return true;
+    }
+}
 
 ArisenEngine::RHI::RHIVkSwapChain::RHIVkSwapChain(RHIDevice* device, const RHIVkSurface* surface,
                                                   UInt32 maxFramesInFlight):
@@ -17,6 +145,9 @@ ArisenEngine::RHI::RHIVkSwapChain::RHIVkSwapChain(RHIDevice* device, const RHIVk
 {
     auto* factory = m_Device->GetFactory();
     m_VirtualFrameSynchronization.resize(m_MaxFramesInFlight);
+    m_FrameLifecycles.resize(m_MaxFramesInFlight);
+    m_RetirementCommandBuffers.resize(m_MaxFramesInFlight, VK_NULL_HANDLE);
+    m_RetirementCommandBufferTickets.resize(m_MaxFramesInFlight, 0);
     for (int i = 0; i < (int)m_MaxFramesInFlight; ++i)
     {
         m_ImageAvailableSemaphores.emplace_back(factory->CreateSemaphore());
@@ -49,11 +180,65 @@ ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
 
     m_Surface = nullptr;
 
-    // Every semaphore below may still be referenced by a queued submission.
+    // Wait only for graphics work owned by this swapchain. Real presentation has
+    // no core Vulkan ticket, so its queue requires an explicit completion boundary.
     if (m_Device)
     {
-        m_Device->GraphicQueueWaitIdle();
-        m_Device->PresentQueueWaitIdle();
+        auto* graphicsQueue = static_cast<RHIVkQueue*>(
+            m_Device->GetQueue(RHIQueueType::Graphics));
+        if (graphicsQueue && m_LastOwnedGraphicsTicket != 0)
+        {
+            try
+            {
+                graphicsQueue->WaitForTicket(m_LastOwnedGraphicsTicket);
+            }
+            catch (const std::exception& error)
+            {
+                LOG_ERRORF(
+                    "[RHIVkSwapChain::~RHIVkSwapChain]: Waiting for graphics ticket {0} failed: {1}",
+                    m_LastOwnedGraphicsTicket,
+                    error.what());
+            }
+        }
+
+        if (m_VkSurface != VK_NULL_HANDLE)
+        {
+            auto* presentQueue = static_cast<RHIVkQueue*>(
+                m_Device->GetQueue(RHIQueueType::Present));
+            const VkResult result = presentQueue
+                ? presentQueue->WaitIdleNoThrow()
+                : VK_ERROR_INITIALIZATION_FAILED;
+            if (result != VK_SUCCESS)
+            {
+                LOG_ERRORF(
+                    "[RHIVkSwapChain::~RHIVkSwapChain]: Present completion failed with {0} ({1}).",
+                    GetVkResultName(result),
+                    static_cast<int>(result));
+            }
+        }
+    }
+
+    try
+    {
+        PublishPendingRetirement();
+    }
+    catch (const std::exception& error)
+    {
+        LOG_ERRORF(
+            "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to publish retained virtual resources: {0}",
+            error.what());
+    }
+    catch (...)
+    {
+        LOG_ERROR(
+            "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to publish retained virtual resources with an unknown error.");
+    }
+
+    if (m_RetirementCommandPool != VK_NULL_HANDLE && m_VkDevice != VK_NULL_HANDLE)
+    {
+        vkDestroyCommandPool(m_VkDevice, m_RetirementCommandPool, nullptr);
+        m_RetirementCommandPool = VK_NULL_HANDLE;
+        std::fill(m_RetirementCommandBuffers.begin(), m_RetirementCommandBuffers.end(), VK_NULL_HANDLE);
     }
 
     auto* factory = m_Device->GetFactory();
@@ -66,171 +251,498 @@ ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
     m_RenderFinishSemaphores.clear();
     m_RenderFinishSemaphoreSharedHandles.clear();
     m_VirtualFrameSynchronization.clear();
+    m_FrameLifecycles.clear();
 
     Cleanup();
+
+    // Cleanup publishes the physical generation only after its wrapper owners
+    // are released. Completion was established above, so flush that publication
+    // before RHIVkSurface destroys the parent VkSurfaceKHR.
+    if (m_VkSurface != VK_NULL_HANDLE && m_Device)
+    {
+        auto* graphicsQueue = static_cast<RHIVkQueue*>(
+            m_Device->GetQueue(RHIQueueType::Graphics));
+        if (graphicsQueue)
+        {
+            try
+            {
+                graphicsQueue->Update();
+            }
+            catch (const std::exception& error)
+            {
+                LOG_ERRORF(
+                    "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to flush released swapchain ownership: {0}",
+                    error.what());
+            }
+            catch (...)
+            {
+                LOG_ERROR(
+                    "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to flush released swapchain ownership with an unknown error.");
+            }
+        }
+    }
 }
 
 void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDescriptor desc)
 {
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     m_LastCreationSucceeded = false;
-    m_Desc = desc;
+    m_LastCreationRetiredPrevious = false;
+
+    if (m_TerminalPresentResult != VK_SUCCESS)
+    {
+        ThrowVkFailure(
+            "vkCreateSwapchainKHR",
+            m_TerminalPresentResult,
+            "RHIVkSwapChain",
+            reinterpret_cast<uint64_t>(this),
+            UINT32_MAX,
+            0,
+            "A terminal presentation failure requires destruction of this swapchain generation");
+    }
+
+    if (m_VkSwapChain != VK_NULL_HANDLE || !m_ImageHandles.empty() ||
+        !m_ImageViewHandles.empty() || !m_SharedHandles.empty() ||
+        m_PendingRetiredSwapChain != VK_NULL_HANDLE ||
+        !m_PendingRetiredImages.empty() ||
+        !m_PendingRetiredImageViews.empty() ||
+        !m_PendingRetiredSharedHandles.empty())
+    {
+        ThrowInvalidState(
+            "RHIVkSwapChain::CreateSwapChainWithDesc",
+            "RHIVkSwapChain",
+            reinterpret_cast<uint64_t>(this),
+            "Swapchain creation target still owns a previous resource generation");
+    }
+
     auto* factory = m_Device->GetFactory();
     auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+    RHISwapChainDescriptor pendingDesc = desc;
 
     if (m_VkSurface != VK_NULL_HANDLE)
     {
         auto* vkInstance = static_cast<RHIVkInstance*>(vkDevice->GetInstance());
-        VkSurfaceCapabilitiesKHR surfaceCapabilities;
-        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vkInstance->GetPhysicalDevice(), m_VkSurface, &surfaceCapabilities);
+        VkSurfaceCapabilitiesKHR surfaceCapabilities{};
+        CheckVkResult(
+            vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+                vkInstance->GetPhysicalDevice(), m_VkSurface, &surfaceCapabilities),
+            "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+            "VkSurfaceKHR",
+            GetVkObjectIdentity(m_VkSurface));
 
         VkExtent2D swapchainExtent = surfaceCapabilities.currentExtent;
         if (swapchainExtent.width == 0xFFFFFFFF)
         {
-            swapchainExtent.width = std::clamp(m_Desc.width, surfaceCapabilities.minImageExtent.width,
+            swapchainExtent.width = std::clamp(pendingDesc.width, surfaceCapabilities.minImageExtent.width,
                                                surfaceCapabilities.maxImageExtent.width);
-            swapchainExtent.height = std::clamp(m_Desc.height, surfaceCapabilities.minImageExtent.height,
+            swapchainExtent.height = std::clamp(pendingDesc.height, surfaceCapabilities.minImageExtent.height,
                                                 surfaceCapabilities.maxImageExtent.height);
         }
 
-        // Synchronize: Ensure the descriptor reflects the actual physical dimensions used for recreation.
-        // This ensures the engine's viewport/scissor (which likely use m_Desc) match the swapchain.
-        m_Desc.width = swapchainExtent.width;
-        m_Desc.height = swapchainExtent.height;
+        pendingDesc.width = swapchainExtent.width;
+        pendingDesc.height = swapchainExtent.height;
 
         LOG_INFOF(
             "[RHIVkSwapChain::CreateSwapChainWithDesc]: Swapping to {0}x{1} (Physical: {2}x{3})",
-            m_Desc.width, m_Desc.height, swapchainExtent.width, swapchainExtent.height);
+            pendingDesc.width, pendingDesc.height, swapchainExtent.width, swapchainExtent.height);
+
+        if (swapchainExtent.width == 0 || swapchainExtent.height == 0)
+        {
+            LOG_WARN(
+                "[RHIVkSwapChain::CreateSwapChainWithDesc]: Skipping swapchain creation due to zero physical extent.");
+            return;
+        }
+
+        const auto queueFamilyIndices = m_Surface->GetQueueFamilyIndices();
+        if (!queueFamilyIndices.graphicsFamily.has_value() ||
+            !queueFamilyIndices.presentFamily.has_value())
+        {
+            ThrowInvalidState(
+                "vkCreateSwapchainKHR",
+                "VkSurfaceKHR",
+                GetVkObjectIdentity(m_VkSurface),
+                "Surface does not expose both graphics and present queue families");
+        }
+
+        const uint32_t queueFamilies[] = {
+            queueFamilyIndices.graphicsFamily.value(),
+            queueFamilyIndices.presentFamily.value()
+        };
+        if (pendingDesc.sharingMode == SHARING_MODE_CONCURRENT &&
+            pendingDesc.queueFamilyIndexCount != std::size(queueFamilies))
+        {
+            ThrowInvalidState(
+                "vkCreateSwapchainKHR",
+                "RHISwapChainDescriptor",
+                reinterpret_cast<uint64_t>(this),
+                "Concurrent swapchain sharing requires graphics and present queue-family indices");
+        }
+        if (pendingDesc.sharingMode == SHARING_MODE_EXCLUSIVE &&
+            pendingDesc.queueFamilyIndexCount != 0)
+        {
+            ThrowInvalidState(
+                "vkCreateSwapchainKHR",
+                "RHISwapChainDescriptor",
+                reinterpret_cast<uint64_t>(this),
+                "Exclusive swapchain sharing must not provide queue-family indices");
+        }
 
         VkSwapchainCreateInfoKHR createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         createInfo.pNext = VK_NULL_HANDLE;
-        createInfo.flags = static_cast<VkSwapchainCreateFlagsKHR>(m_Desc.swapChainCreateFlags);
+        createInfo.flags = static_cast<VkSwapchainCreateFlagsKHR>(pendingDesc.swapChainCreateFlags);
         createInfo.surface = m_VkSurface;
-        createInfo.minImageCount = m_Desc.imageCount;
-        createInfo.imageFormat = static_cast<VkFormat>(m_Desc.colorFormat);
-        createInfo.imageColorSpace = static_cast<VkColorSpaceKHR>(m_Desc.colorSpace);
-        createInfo.imageExtent = swapchainExtent; // ALWAYS use the actual physical extent from surface capabilities
-        createInfo.imageArrayLayers = m_Desc.imageArrayLayers;
-        createInfo.imageUsage = m_Desc.imageUsageFlagBits;
-        createInfo.imageSharingMode = static_cast<VkSharingMode>(m_Desc.sharingMode);
-        createInfo.queueFamilyIndexCount = m_Desc.queueFamilyIndexCount;
-        auto queueSurfaceFamilyIndices = m_Surface->GetQueueFamilyIndices();
-        uint32_t queueFamilyIndices[] = {
-            queueSurfaceFamilyIndices.graphicsFamily.value(), queueSurfaceFamilyIndices.presentFamily.value()
-        };
-        createInfo.pQueueFamilyIndices = queueFamilyIndices;
-        createInfo.preTransform = static_cast<VkSurfaceTransformFlagBitsKHR>(m_Desc.surfaceTransformFlagBits);
-        createInfo.compositeAlpha = static_cast<VkCompositeAlphaFlagBitsKHR>(m_Desc.compositeAlphaFlagBits);
-        createInfo.presentMode = static_cast<VkPresentModeKHR>(m_Desc.presentMode);
-        createInfo.clipped = static_cast<VkBool32>(m_Desc.clipped);
-        createInfo.oldSwapchain = VK_NULL_HANDLE;
+        createInfo.minImageCount = pendingDesc.imageCount;
+        createInfo.imageFormat = static_cast<VkFormat>(pendingDesc.colorFormat);
+        createInfo.imageColorSpace = static_cast<VkColorSpaceKHR>(pendingDesc.colorSpace);
+        createInfo.imageExtent = swapchainExtent;
+        createInfo.imageArrayLayers = pendingDesc.imageArrayLayers;
+        createInfo.imageUsage = pendingDesc.imageUsageFlagBits;
+        createInfo.imageSharingMode = static_cast<VkSharingMode>(pendingDesc.sharingMode);
+        createInfo.queueFamilyIndexCount = pendingDesc.queueFamilyIndexCount;
+        createInfo.pQueueFamilyIndices = pendingDesc.queueFamilyIndexCount > 0 ? queueFamilies : nullptr;
+        createInfo.preTransform = static_cast<VkSurfaceTransformFlagBitsKHR>(pendingDesc.surfaceTransformFlagBits);
+        createInfo.compositeAlpha = static_cast<VkCompositeAlphaFlagBitsKHR>(pendingDesc.compositeAlphaFlagBits);
+        createInfo.presentMode = static_cast<VkPresentModeKHR>(pendingDesc.presentMode);
+        createInfo.clipped = static_cast<VkBool32>(pendingDesc.clipped);
+        createInfo.oldSwapchain = reinterpret_cast<VkSwapchainKHR>(pendingDesc.customData);
 
-        // Bulletproof Guard: Final check for zero extent before talking to Vulkan.
-        // VUID-VkSwapchainCreateInfoKHR-imageExtent-01689 requires width and height to be non-zero.
-        if (swapchainExtent.width == 0 || swapchainExtent.height == 0)
+        struct PendingRealSwapChain
         {
-            LOG_WARN("[RHIVkSwapChain::CreateSwapChainWithDesc]: Skipping SwapChain creation due to zero physical extent.");
-            return;
-        }
+            RHIVkDevice* device;
+            VkDevice vkDevice;
+            VkSwapchainKHR swapchain{VK_NULL_HANDLE};
+            Containers::Vector<RHIImageHandle> images;
+            Containers::Vector<RHIImageViewHandle> imageViews;
+            Containers::Vector<void*> sharedHandles;
+            bool vulkanObjectsRegistryOwned{false};
+            bool committed{false};
 
-        // Zero-Stall: Check if we have an old swapchain passed via customData
-        if (m_Desc.customData != nullptr)
-        {
-            createInfo.oldSwapchain = (VkSwapchainKHR)m_Desc.customData;
-        }
+            ~PendingRealSwapChain()
+            {
+                if (!committed)
+                {
+                    if (!ReleaseSwapChainResources(
+                            device,
+                            vkDevice,
+                            swapchain,
+                            images,
+                            imageViews,
+                            sharedHandles,
+                            !vulkanObjectsRegistryOwned))
+                    {
+                        LOG_ERROR(
+                            "[PendingRealSwapChain]: Failed to release an uncommitted swapchain generation.");
+                    }
+                }
+            }
+        } pending{vkDevice, m_VkDevice};
 
-        if (vkCreateSwapchainKHR(m_VkDevice, &createInfo, nullptr, &m_VkSwapChain) != VK_SUCCESS)
-        {
-            LOG_FATAL_AND_THROW("[RHIVkSwapChain::CreateSwapChainWithDesc]: failed to create swap chain!");
-        }
+        CheckVkResult(
+            vkCreateSwapchainKHR(m_VkDevice, &createInfo, nullptr, &pending.swapchain),
+            "vkCreateSwapchainKHR",
+            "VkSurfaceKHR",
+            GetVkObjectIdentity(m_VkSurface));
+        m_LastCreationRetiredPrevious = createInfo.oldSwapchain != VK_NULL_HANDLE;
 
         LOG_DEBUG("[RHIVkSwapChain::CreateSwapChainWithDesc]: vkSwapchain Created .");
 
-        UInt32 actualImageCount = 0;
         Containers::Vector<VkImage> images;
-
-        if (vkGetSwapchainImagesKHR(m_VkDevice, m_VkSwapChain, &actualImageCount, nullptr) != VK_SUCCESS)
+        for (;;)
         {
-            LOG_FATAL_AND_THROW("[RHIVkSwapChain::CreateSwapChainWithDesc]: failed to query image count !");
+            UInt32 imageCount = 0;
+            CheckVkResult(
+                vkGetSwapchainImagesKHR(m_VkDevice, pending.swapchain, &imageCount, nullptr),
+                "vkGetSwapchainImagesKHR",
+                "VkSwapchainKHR",
+                GetVkObjectIdentity(pending.swapchain));
+            if (imageCount == 0)
+            {
+                ThrowInvalidState(
+                    "vkGetSwapchainImagesKHR",
+                    "VkSwapchainKHR",
+                    GetVkObjectIdentity(pending.swapchain),
+                    "Swapchain reported zero presentable images");
+            }
+
+            images.resize(imageCount);
+            UInt32 writtenImageCount = imageCount;
+            const VkResult result = vkGetSwapchainImagesKHR(
+                m_VkDevice, pending.swapchain, &writtenImageCount, images.data());
+            if (result == VK_INCOMPLETE)
+                continue;
+            CheckVkResult(
+                result,
+                "vkGetSwapchainImagesKHR",
+                "VkSwapchainKHR",
+                GetVkObjectIdentity(pending.swapchain));
+            if (writtenImageCount == 0)
+            {
+                ThrowInvalidState(
+                    "vkGetSwapchainImagesKHR",
+                    "VkSwapchainKHR",
+                    GetVkObjectIdentity(pending.swapchain),
+                    "Swapchain image enumeration completed with zero images");
+            }
+            images.resize(writtenImageCount);
+            break;
         }
 
-        m_ImageHandles.resize(actualImageCount);
-        m_ImageViewHandles.resize(actualImageCount);
-        m_SharedHandles.resize(actualImageCount, nullptr);
-        images.resize(actualImageCount);
+        pending.images.reserve(images.size());
+        pending.imageViews.reserve(images.size());
+        pending.sharedHandles.reserve(images.size());
 
-        if (vkGetSwapchainImagesKHR(m_VkDevice, m_VkSwapChain, &actualImageCount, images.data()) != VK_SUCCESS)
+        for (size_t i = 0; i < images.size(); ++i)
         {
-            LOG_FATAL_AND_THROW("[RHIVkSwapChain::CreateSwapChainWithDesc]: failed to query images !");
-        }
-
-        for (int i = 0; i < images.size(); ++i)
-        {
-            // For RHISwapChain images, we manually allocate a handle since they are not created via factory
-            m_ImageHandles[i] = vkDevice->GetImagePool()->Allocate([&images, i, this](RHIVkImagePoolItem* imageItem)
+            const RHIImageHandle imageHandle = vkDevice->GetImagePool()->Allocate(
+                [&images, i, &pendingDesc](RHIVkImagePoolItem* imageItem)
             {
                 *imageItem = RHIVkImagePoolItem();
                 imageItem->image = images[i];
-                imageItem->width = m_Desc.width;
-                imageItem->height = m_Desc.height;
-                imageItem->name = String::Format("SwapChainImage_%d", i);
-                imageItem->needDestroy = false; // RHISwapChain owns these images
+                imageItem->width = pendingDesc.width;
+                imageItem->height = pendingDesc.height;
+                imageItem->name = String::Format("SwapChainImage_%d", static_cast<int>(i));
+                imageItem->needDestroy = false;
             });
+            pending.images.push_back(imageHandle);
 
-            RHIImageViewDesc viewDesc;
-            viewDesc.viewType = IMAGE_VIEW_TYPE_2D;
-            viewDesc.format = m_Desc.colorFormat;
-            viewDesc.aspectMask = IMAGE_ASPECT_COLOR_BIT;
-            viewDesc.baseMipLevel = 0;
-            viewDesc.levelCount = 1;
-            viewDesc.baseArrayLayer = 0;
-            viewDesc.layerCount = 1;
-            viewDesc.width = m_Desc.width;
-            viewDesc.height = m_Desc.height;
+            VkImageViewCreateInfo viewInfo{};
+            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewInfo.image = images[i];
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = static_cast<VkFormat>(pendingDesc.colorFormat);
+            viewInfo.components = {
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY
+            };
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.baseMipLevel = 0;
+            viewInfo.subresourceRange.levelCount = 1;
+            viewInfo.subresourceRange.baseArrayLayer = 0;
+            viewInfo.subresourceRange.layerCount = pendingDesc.imageArrayLayers;
 
-            m_ImageViewHandles[i] = factory->CreateImageView(m_ImageHandles[i], std::move(viewDesc));
-            
-            // Pre-populate if necessary for interop
-            if (m_Desc.bExportSharedWin32Handle)
+            VkImageView vkImageView = VK_NULL_HANDLE;
+            CheckVkResult(
+                vkCreateImageView(m_VkDevice, &viewInfo, nullptr, &vkImageView),
+                "vkCreateImageView",
+                "VkImage",
+                GetVkObjectIdentity(images[i]),
+                imageHandle.index,
+                imageHandle.generation,
+                "Swapchain image view");
+
+            RHIImageViewHandle imageViewHandle = RHIImageViewHandle::Invalid();
+            try
             {
-                m_SharedHandles[i] = vkDevice->GetSharedWin32Handle(m_ImageHandles[i]);
+                imageViewHandle = vkDevice->GetImageViewPool()->Allocate(
+                    [vkImageView, imageHandle, &pendingDesc, i](RHIVkImageViewPoolItem* viewItem)
+                    {
+                        *viewItem = RHIVkImageViewPoolItem();
+                        viewItem->view = vkImageView;
+                        viewItem->imageHandle = imageHandle;
+                        viewItem->format = pendingDesc.colorFormat;
+                        viewItem->width = pendingDesc.width;
+                        viewItem->height = pendingDesc.height;
+                        viewItem->name = String::Format("SwapChainImageView_%d", static_cast<int>(i));
+                        viewItem->registryHandle = RHIResourceHandle::Invalid();
+                    });
+            }
+            catch (...)
+            {
+                vkDestroyImageView(m_VkDevice, vkImageView, nullptr);
+                throw;
+            }
+            pending.imageViews.push_back(imageViewHandle);
+
+            void* sharedHandle = nullptr;
+            if (pendingDesc.bExportSharedWin32Handle)
+            {
+                sharedHandle = vkDevice->GetSharedWin32Handle(imageHandle);
+                if (sharedHandle == nullptr)
+                {
+                    ThrowInvalidState(
+                        "vkGetMemoryWin32HandleKHR",
+                        "RHIImage",
+                        GetVkObjectIdentity(images[i]),
+                        "Failed to export a swapchain image");
+                }
+            }
+            pending.sharedHandles.push_back(sharedHandle);
+        }
+
+        Containers::Vector<RHIVkImagePoolItem*> generationImages;
+        Containers::Vector<RHIVkImageViewPoolItem*> generationImageViews;
+        generationImages.reserve(pending.images.size());
+        generationImageViews.reserve(pending.imageViews.size());
+
+        auto generationState = std::make_unique<RHIVkSwapChainGenerationState>();
+        generationState->device = m_VkDevice;
+        generationState->swapchain = pending.swapchain;
+        generationState->imageViews.reserve(pending.imageViews.size());
+
+        for (const auto imageHandle : pending.images)
+        {
+            auto* imageItem = vkDevice->GetImagePool()->Get(imageHandle);
+            if (!imageItem)
+            {
+                ThrowInvalidState(
+                    "RHIVkSwapChain::CreateSwapChainWithDesc",
+                    "RHIImage",
+                    GetVkObjectIdentity(pending.swapchain),
+                    "A newly allocated swapchain image became unavailable before publication",
+                    imageHandle.index,
+                    imageHandle.generation);
+            }
+            generationImages.push_back(imageItem);
+        }
+
+        for (const auto imageViewHandle : pending.imageViews)
+        {
+            auto* imageViewItem = vkDevice->GetImageViewPool()->Get(imageViewHandle);
+            if (!imageViewItem || imageViewItem->view == VK_NULL_HANDLE)
+            {
+                ThrowInvalidState(
+                    "RHIVkSwapChain::CreateSwapChainWithDesc",
+                    "RHIImageView",
+                    GetVkObjectIdentity(pending.swapchain),
+                    "A newly allocated swapchain image view became unavailable before publication",
+                    imageViewHandle.index,
+                    imageViewHandle.generation);
+            }
+            generationImageViews.push_back(imageViewItem);
+            generationState->imageViews.push_back(imageViewItem->view);
+        }
+
+        auto* registry = vkDevice->GetResourceRegistry();
+        if (!registry)
+        {
+            ThrowInvalidState(
+                "RHIVkSwapChain::CreateSwapChainWithDesc",
+                "VkSwapchainKHR",
+                GetVkObjectIdentity(pending.swapchain),
+                "The deferred resource registry is unavailable");
+        }
+
+        auto* generationStatePtr = generationState.get();
+        const RHIResourceHandle generationRegistryHandle = registry->Create(
+            MakeDeferredDeleteItem(generationStatePtr));
+        generationState.release();
+
+        const size_t wrapperOwnerCount = generationImages.size() + generationImageViews.size();
+        size_t seededOwnerCount = 1;
+        try
+        {
+            for (; seededOwnerCount < wrapperOwnerCount; ++seededOwnerCount)
+            {
+                if (!registry->Retain(generationRegistryHandle))
+                {
+                    ThrowInvalidState(
+                        "RHIVkSwapChain::CreateSwapChainWithDesc",
+                        "VkSwapchainKHR",
+                        GetVkObjectIdentity(pending.swapchain),
+                        "The swapchain generation owner became stale while seeding wrapper ownership");
+                }
             }
         }
+        catch (...)
+        {
+            while (seededOwnerCount > 0)
+            {
+                try
+                {
+                    if (!registry->Release(generationRegistryHandle))
+                    {
+                        LOG_ERROR(
+                            "[RHIVkSwapChain::CreateSwapChainWithDesc]: Failed to roll back a generation-owner reference.");
+                        break;
+                    }
+                }
+                catch (const std::exception& error)
+                {
+                    LOG_ERRORF(
+                        "[RHIVkSwapChain::CreateSwapChainWithDesc]: Generation-owner rollback failed: {0}",
+                        error.what());
+                    break;
+                }
+                catch (...)
+                {
+                    LOG_ERROR(
+                        "[RHIVkSwapChain::CreateSwapChainWithDesc]: Generation-owner rollback failed with an unknown error.");
+                    break;
+                }
+                --seededOwnerCount;
+            }
+            throw;
+        }
+
+        for (auto* imageItem : generationImages)
+            imageItem->registryHandle = generationRegistryHandle;
+        for (auto* imageViewItem : generationImageViews)
+            imageViewItem->registryHandle = generationRegistryHandle;
+
+        generationStatePtr->ownsVulkanObjects = true;
+        pending.vulkanObjectsRegistryOwned = true;
+
+        m_VkSwapChain = std::exchange(pending.swapchain, VK_NULL_HANDLE);
+        m_ImageHandles = std::move(pending.images);
+        m_ImageViewHandles = std::move(pending.imageViews);
+        m_SharedHandles = std::move(pending.sharedHandles);
+        m_RealGenerationRegistryOwned = true;
+        pending.committed = true;
     }
     else
     {
-        // Virtual SwapChain logic - Allocate shared images manually
-        LOG_INFOF("[RHIVkSwapChain::CreateSwapChainWithDesc]: Creating Virtual SwapChain ({0}x{1}, {2} images)", m_Desc.width, m_Desc.height, m_Desc.imageCount);
-        UInt32 actualImageCount = m_Desc.imageCount;
-        Containers::Vector<RHIImageHandle> imageHandles;
-        Containers::Vector<RHIImageViewHandle> imageViewHandles;
-        Containers::Vector<void*> sharedHandles;
-        imageHandles.reserve(actualImageCount);
-        imageViewHandles.reserve(actualImageCount);
-        sharedHandles.reserve(actualImageCount);
+        LOG_INFOF(
+            "[RHIVkSwapChain::CreateSwapChainWithDesc]: Creating Virtual SwapChain ({0}x{1}, {2} images)",
+            pendingDesc.width,
+            pendingDesc.height,
+            pendingDesc.imageCount);
 
-        const auto releaseCreatedImages = [&]()
+        struct PendingVirtualSwapChain
         {
-            for (auto handle : imageViewHandles) factory->ReleaseImageView(handle);
-            for (auto handle : imageHandles) factory->ReleaseImage(handle);
-        };
+            RHIVkDevice* device;
+            VkDevice vkDevice;
+            VkSwapchainKHR swapchain{VK_NULL_HANDLE};
+            Containers::Vector<RHIImageHandle> images;
+            Containers::Vector<RHIImageViewHandle> imageViews;
+            Containers::Vector<void*> sharedHandles;
+            bool committed{false};
 
-        for (int i = 0; i < actualImageCount; ++i)
+            ~PendingVirtualSwapChain()
+            {
+                if (!committed)
+                {
+                    if (!ReleaseSwapChainResources(
+                            device, vkDevice, swapchain, images, imageViews, sharedHandles, false))
+                    {
+                        LOG_ERROR(
+                            "[PendingVirtualSwapChain]: Failed to release an uncommitted swapchain generation.");
+                    }
+                }
+            }
+        } pending{vkDevice, m_VkDevice};
+
+        pending.images.reserve(pendingDesc.imageCount);
+        pending.imageViews.reserve(pendingDesc.imageCount);
+        pending.sharedHandles.reserve(pendingDesc.imageCount);
+
+        for (UInt32 i = 0; i < pendingDesc.imageCount; ++i)
         {
             RHIImageDescriptor imgDesc{};
-            imgDesc.width = m_Desc.width;
-            imgDesc.height = m_Desc.height;
+            imgDesc.width = pendingDesc.width;
+            imgDesc.height = pendingDesc.height;
             imgDesc.depth = 1;
             imgDesc.mipLevels = 1;
-            imgDesc.arrayLayers = m_Desc.imageArrayLayers > 0 ? m_Desc.imageArrayLayers : 1;
-            imgDesc.format = m_Desc.colorFormat;
-            imgDesc.usage = m_Desc.imageUsageFlagBits;
+            imgDesc.arrayLayers = pendingDesc.imageArrayLayers > 0 ? pendingDesc.imageArrayLayers : 1;
+            imgDesc.format = pendingDesc.colorFormat;
+            imgDesc.usage = pendingDesc.imageUsageFlagBits;
             imgDesc.imageType = IMAGE_TYPE_2D;
             imgDesc.sampleCount = SAMPLE_COUNT_1_BIT;
             imgDesc.tiling = IMAGE_TILING_OPTIMAL;
-            imgDesc.sharingMode = m_Desc.sharingMode;
-            imgDesc.bExportSharedWin32Handle = true; // Enable interop
+            imgDesc.sharingMode = pendingDesc.sharingMode;
+            imgDesc.bExportSharedWin32Handle = true;
 
             RHIImageHandle imageHandle = factory->CreateImage(std::move(imgDesc));
             if (!imageHandle.IsValid())
@@ -238,20 +750,20 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
                 LOG_ERRORF(
                     "[RHIVkSwapChain::CreateSwapChainWithDesc]: Failed to allocate virtual image {0}; preserving the previous swapchain.",
                     i);
-                releaseCreatedImages();
                 return;
             }
+            pending.images.push_back(imageHandle);
 
             RHIImageViewDesc viewDesc;
             viewDesc.viewType = IMAGE_VIEW_TYPE_2D;
-            viewDesc.format = m_Desc.colorFormat;
+            viewDesc.format = pendingDesc.colorFormat;
             viewDesc.aspectMask = IMAGE_ASPECT_COLOR_BIT;
             viewDesc.baseMipLevel = 0;
             viewDesc.levelCount = 1;
             viewDesc.baseArrayLayer = 0;
             viewDesc.layerCount = 1;
-            viewDesc.width = m_Desc.width;
-            viewDesc.height = m_Desc.height;
+            viewDesc.width = pendingDesc.width;
+            viewDesc.height = pendingDesc.height;
 
             RHIImageViewHandle viewHandle = factory->CreateImageView(imageHandle, std::move(viewDesc));
             if (!viewHandle.IsValid())
@@ -259,10 +771,9 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
                 LOG_ERRORF(
                     "[RHIVkSwapChain::CreateSwapChainWithDesc]: Failed to allocate virtual image view {0}; preserving the previous swapchain.",
                     i);
-                factory->ReleaseImage(imageHandle);
-                releaseCreatedImages();
                 return;
             }
+            pending.imageViews.push_back(viewHandle);
 
             void* sharedHandle = vkDevice->GetSharedWin32Handle(imageHandle);
             if (sharedHandle == nullptr)
@@ -270,25 +781,22 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
                 LOG_ERRORF(
                     "[RHIVkSwapChain::CreateSwapChainWithDesc]: Failed to export virtual image {0}; preserving the previous swapchain.",
                     i);
-                factory->ReleaseImageView(viewHandle);
-                factory->ReleaseImage(imageHandle);
-                releaseCreatedImages();
                 return;
             }
-
-            imageHandles.push_back(imageHandle);
-            imageViewHandles.push_back(viewHandle);
-            sharedHandles.push_back(sharedHandle);
+            pending.sharedHandles.push_back(sharedHandle);
         }
 
-        m_ImageHandles = std::move(imageHandles);
-        m_ImageViewHandles = std::move(imageViewHandles);
-        m_SharedHandles = std::move(sharedHandles);
+        m_ImageHandles = std::move(pending.images);
+        m_ImageViewHandles = std::move(pending.imageViews);
+        m_SharedHandles = std::move(pending.sharedHandles);
+        pending.committed = true;
     }
 
+    pendingDesc.customData = nullptr;
+    m_Desc = pendingDesc;
     m_LastCreationSucceeded = true;
-    m_ActiveWidth = m_Desc.width;
-    m_ActiveHeight = m_Desc.height;
+    m_ActiveWidth = pendingDesc.width;
+    m_ActiveHeight = pendingDesc.height;
 }
 
 ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::BeginFrame(UInt32 frameIndex)
@@ -299,6 +807,20 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::BeginFrame(
 void ArisenEngine::RHI::RHIVkSwapChain::EndFrame(UInt32 frameIndex)
 {
     Present(frameIndex);
+}
+
+ArisenEngine::RHI::RHIGpuTicket ArisenEngine::RHI::RHIVkSwapChain::RetireFrame(UInt32 frameIndex)
+{
+    auto* queue = m_Device
+                      ? static_cast<RHIVkQueue*>(m_Device->GetQueue(RHIQueueType::Graphics))
+                      : nullptr;
+    if (!queue)
+    {
+        ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Graphics queue is unavailable for frame retirement");
+    }
+    return queue->RetireSwapChainFrame(this, frameIndex);
 }
 
 ArisenEngine::RHI::RHISemaphoreHandle ArisenEngine::RHI::RHIVkSwapChain::GetImageAvailableSemaphore(
@@ -317,6 +839,11 @@ ArisenEngine::RHI::RHIImageViewHandle ArisenEngine::RHI::RHIVkSwapChain::GetImag
 {
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     auto currentFrame = frameIndex % m_MaxFramesInFlight;
+    const auto& lifecycle = m_FrameLifecycles[currentFrame];
+    if (lifecycle.frameIndex != frameIndex ||
+        (lifecycle.state != RHISwapChainFrameState::Acquired &&
+         lifecycle.state != RHISwapChainFrameState::Submitted))
+        return RHIImageViewHandle::Invalid();
     if (m_AcquiredImageIndices[currentFrame] >= m_ImageViewHandles.size()) return RHIImageViewHandle::Invalid();
     return m_ImageViewHandles[m_AcquiredImageIndices[currentFrame]];
 }
@@ -325,10 +852,53 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
 {
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     ARISEN_PROFILE_ZONE("RHI::VulkanAcquireImage");
+    PublishPendingRetirement();
+    if (m_TerminalPresentResult != VK_SUCCESS)
+    {
+        ThrowVkFailure(
+            "vkAcquireNextImageKHR",
+            m_TerminalPresentResult,
+            "RHIVkSwapChain",
+            reinterpret_cast<uint64_t>(this),
+            UINT32_MAX,
+            0,
+            "Swapchain generation cannot acquire after terminal presentation failure");
+    }
     auto currentFrame = frameIndex % m_MaxFramesInFlight;
+    auto& lifecycle = m_FrameLifecycles[currentFrame];
+
+    if (lifecycle.state == RHISwapChainFrameState::Acquired ||
+        lifecycle.state == RHISwapChainFrameState::Submitted ||
+        lifecycle.submissionPending ||
+        lifecycle.retirementPending)
+    {
+        ThrowInvalidState("vkAcquireNextImageKHR", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Swapchain frame slot is still owned by an unfinished frame");
+    }
+
+    m_AcquisitionResults[currentFrame] = VK_NOT_READY;
 
     if (m_VkSurface == VK_NULL_HANDLE)
     {
+        if (lifecycle.state == RHISwapChainFrameState::Retired && lifecycle.submitTicket != 0)
+        {
+            auto* graphicsQueue = static_cast<RHIVkQueue*>(
+                m_Device->GetQueue(RHIQueueType::Graphics));
+            if (!graphicsQueue)
+            {
+                ThrowInvalidState("vkAcquireNextImageKHR", "RHIQueue", 0,
+                                  "Graphics queue is unavailable for retired-frame reuse");
+            }
+
+            graphicsQueue->Update();
+            if (graphicsQueue->GetCompletedTicket() < lifecycle.submitTicket)
+            {
+                m_AcquisitionResults[currentFrame] = VK_NOT_READY;
+                return RHIImageHandle::Invalid();
+            }
+        }
+
         auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
         if (synchronization.preparedForReuse && synchronization.preparedFrameIndex != frameIndex)
         {
@@ -358,8 +928,9 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
         uint32_t imageIndex = (uint32_t)(frameIndex % imageCount);
         m_AcquiredImageIndices[currentFrame] = imageIndex;
         m_AcquisitionResults[currentFrame] = VK_SUCCESS;
-        
-        LOG_DEBUG(String::Format("[RHIVkSwapChain::AcquireCurrentImage]: Virtual Acquire - Frame %d -> Image %d", frameIndex, imageIndex));
+        lifecycle = FrameLifecycle{};
+        lifecycle.state = RHISwapChainFrameState::Acquired;
+        lifecycle.frameIndex = frameIndex;
         
         return m_ImageHandles[imageIndex];
     }
@@ -396,7 +967,12 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
 
     auto hSem = m_ImageAvailableSemaphores[currentFrame];
     auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(hSem);
-    VkSemaphore vkSem = semItem ? semItem->semaphore : VK_NULL_HANDLE;
+    if (!semItem || semItem->semaphore == VK_NULL_HANDLE)
+    {
+        ThrowInvalidHandle("vkAcquireNextImageKHR", "RHISemaphore", hSem.index, hSem.generation,
+                           "Image-available semaphore is invalid");
+    }
+    VkSemaphore vkSem = semItem->semaphore;
 
     uint32_t imageIndex_local = 0;
     // Spec-Compliance: Use a finite timeout (1 second) instead of UINT64_MAX. 
@@ -414,53 +990,57 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
         return RHIImageHandle::Invalid();
     }
 
-    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+    if (result == VK_SUBOPTIMAL_KHR)
     {
-        // Only log serious failures, skip logging for expected timeout/not-ready during transitions.
-        if (result != VK_TIMEOUT && result != VK_NOT_READY)
-        {
-            String msg = String::Format(
-                "[RHIVkSwapChain::AcquireCurrentImage]: failed to acquire next image (frame %d) result: %d", frameIndex,
-                result);
-            LOG_ERROR(msg);
-        }
+        // The acquired image remains usable, but the next frame must replace
+        // the degraded swapchain generation.
+        m_SwapChainIsOutDate = true;
+    }
+    else if (IsVkAcquireRetryResult(result))
+    {
         return RHIImageHandle::Invalid();
+    }
+    else
+    {
+        CheckVkResult(result, "vkAcquireNextImageKHR", "RHIVkSwapChain",
+                      GetVkObjectIdentity(m_VkSwapChain), UINT32_MAX, 0,
+                      "Failed to acquire a presentable image");
+    }
+    if (imageIndex_local >= m_ImageHandles.size())
+    {
+        ThrowInvalidState("vkAcquireNextImageKHR", "VkSwapchainKHR",
+                          GetVkObjectIdentity(m_VkSwapChain),
+                          "Vulkan returned an acquired image index outside the swapchain image range");
     }
 
     m_AcquisitionResults[currentFrame] = result;
     m_AcquiredImageIndices[currentFrame] = imageIndex_local;
+    lifecycle = FrameLifecycle{};
+    lifecycle.state = RHISwapChainFrameState::Acquired;
+    lifecycle.frameIndex = frameIndex;
     return m_ImageHandles[imageIndex_local];
 }
 
 void ArisenEngine::RHI::RHIVkSwapChain::Cleanup()
 {
-    auto* factory = m_Device->GetFactory();
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
-
-    for (auto h : m_ImageViewHandles)
+    const bool destroyVulkanObjectsDirectly =
+        m_VkSurface != VK_NULL_HANDLE && !m_RealGenerationRegistryOwned;
+    if (ReleaseSwapChainResources(
+            vkDevice,
+            m_VkDevice,
+            m_VkSwapChain,
+            m_ImageHandles,
+            m_ImageViewHandles,
+            m_SharedHandles,
+            destroyVulkanObjectsDirectly))
     {
-        factory->ReleaseImageView(h);
+        m_RealGenerationRegistryOwned = false;
     }
-    for (auto h : m_ImageHandles)
+    else
     {
-        // RHISwapChain images are not created via Factory, so we should not call factory->ReleaseImage(h) 
-        // if it tries to do full liberation. However, our ReleaseImage in factory calls Device::ReleaseImage.
-        // For RHISwapChain images, needDestroy is false, so it's safe.
-        factory->ReleaseImage(h);
-    }
-    m_ImageHandles.clear();
-    m_ImageViewHandles.clear();
-
-    // Shared image handles are cached and closed by RHIVkDevice::ReleaseImage.
-    m_SharedHandles.clear();
-
-    // Do NOT destroy semaphores here. They are reused across Valid/Recreated swapchains.
-    // They should be destroyed in Destructor.
-
-    if (m_VkSwapChain != VK_NULL_HANDLE && m_VkDevice != VK_NULL_HANDLE)
-    {
-        LOG_INFO("[RHIVkSwapChain::~RHIVkSwapChain]: Destroy Vulkan RHISwapChain");
-        vkDestroySwapchainKHR(m_VkDevice, m_VkSwapChain, nullptr);
+        LOG_ERROR("[RHIVkSwapChain::Cleanup]: Swapchain generation release remains incomplete.");
     }
 }
 
@@ -468,70 +1048,139 @@ void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
 {
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     ARISEN_PROFILE_ZONE("RHI::VulkanPresent");
+    const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+    auto& lifecycle = m_FrameLifecycles[currentFrame];
+    if (lifecycle.frameIndex != frameIndex ||
+        lifecycle.state != RHISwapChainFrameState::Submitted ||
+        lifecycle.submissionPending ||
+        lifecycle.retirementPending)
+    {
+        ThrowInvalidState("vkQueuePresentKHR", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Swapchain frame must be submitted before presentation");
+    }
+
     if (m_VkSurface == VK_NULL_HANDLE)
     {
-                        // Headless swapchain doesn't present to a surface. Avalonia's Vulkan
+        // Headless swapchain doesn't present to a surface. Avalonia's Vulkan
         // compositor imports the external memory as a transfer source (matching
         // the official Avalonia Vulkan interop sample), so the RenderGraph must
         // leave the image in TRANSFER_SRC_OPTIMAL before this point.
-
-
-        UInt32 index = m_AcquiredImageIndices[frameIndex % m_MaxFramesInFlight];
+        UInt32 index = m_AcquiredImageIndices[currentFrame];
+        if (index >= m_ImageHandles.size())
+        {
+            ThrowInvalidState("RHIVkSwapChain::Present", "RHIImage",
+                              reinterpret_cast<uint64_t>(this),
+                              "Virtual swapchain acquired image index is out of range");
+        }
         RHIImageHandle hImage = m_ImageHandles[index];
-        
+
         auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
         auto* imageItem = vkDevice->GetImagePool()->Get(hImage);
-        
-        if (imageItem && imageItem->image != VK_NULL_HANDLE)
+        if (!imageItem || imageItem->image == VK_NULL_HANDLE)
         {
-                                    // Track the layout that the RenderGraph exported for Avalonia.
-            if (imageItem->currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
-
-            {
-                // We don't submit a separate command buffer here to avoid overhead.
-                // Instead, we trust the engine's RenderGraph to have transitioned it.
-                // However, we UPDATE the tracked layout so the RHI knows its state.
-                                imageItem->currentLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            }
+            ThrowInvalidHandle("RHIVkSwapChain::Present", "RHIImage", hImage.index,
+                               hImage.generation, "Virtual swapchain image is stale");
         }
+
+        if (imageItem->currentLayout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+        {
+            ThrowInvalidState("RHIVkSwapChain::Present", "RHIImage",
+                              GetVkObjectIdentity(imageItem->image),
+                              "Virtual swapchain image was not transitioned to TRANSFER_SRC_OPTIMAL");
+        }
+
+        m_AcquisitionResults[currentFrame] = VK_NOT_READY;
+        lifecycle.state = RHISwapChainFrameState::Presented;
 
         return;
     }
 
-    auto currentFrame = frameIndex % m_MaxFramesInFlight;
-
-    // Bulletproof Guard: If acquisition failed for this frame (e.g. out of date), 
-    // we MUST NOT attempt to present or we will trigger validation errors.
-    VkResult acquireResult = m_AcquisitionResults[currentFrame];
-    if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR)
+    const UInt32 imageIndex = m_AcquiredImageIndices[currentFrame];
+    if (imageIndex >= m_ImageHandles.size())
     {
+        ThrowInvalidState("vkQueuePresentKHR", "RHIImage",
+                          reinterpret_cast<uint64_t>(this),
+                          "Real swapchain acquired image index is out of range");
+    }
+    const RHIImageHandle imageHandle = m_ImageHandles[imageIndex];
+    auto* imageItem = static_cast<RHIVkDevice*>(m_Device)->GetImagePool()->Get(imageHandle);
+    if (!imageItem || imageItem->image == VK_NULL_HANDLE)
+    {
+        ThrowInvalidHandle("vkQueuePresentKHR", "RHIImage", imageHandle.index,
+                           imageHandle.generation, "Real swapchain image is stale");
+    }
+    if (imageItem->currentLayout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+    {
+        ThrowInvalidState("vkQueuePresentKHR", "RHIImage",
+                          GetVkObjectIdentity(imageItem->image),
+                          "Real swapchain image was not transitioned to PRESENT_SRC_KHR");
+    }
+
+    auto hSem = m_RenderFinishSemaphores[currentFrame];
+    auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(hSem);
+    if (!semItem || semItem->semaphore == VK_NULL_HANDLE)
+    {
+        ThrowInvalidHandle("vkQueuePresentKHR", "RHISemaphore", hSem.index, hSem.generation,
+                           "Render-finished semaphore is invalid");
+    }
+    const VkSemaphore semaphore = semItem->semaphore;
+    const VkResult presentResult = PresentRealFrame(currentFrame, semaphore);
+    lifecycle.state = presentResult == VK_SUCCESS || IsVkSwapChainRecreateResult(presentResult)
+        ? RHISwapChainFrameState::Presented
+        : RHISwapChainFrameState::Retired;
+    if (IsVkSwapChainRecreateResult(presentResult))
+    {
+        m_SwapChainIsOutDate = true;
         return;
+    }
+    CheckVkResult(presentResult, "vkQueuePresentKHR", "RHIVkSwapChain",
+                  GetVkObjectIdentity(m_VkSwapChain));
+}
+
+VkResult ArisenEngine::RHI::RHIVkSwapChain::PresentRealFrame(
+    UInt32 currentFrame,
+    VkSemaphore waitSemaphore) noexcept
+{
+    if (m_VkPresentQueue == VK_NULL_HANDLE ||
+        m_VkSwapChain == VK_NULL_HANDLE ||
+        waitSemaphore == VK_NULL_HANDLE ||
+        currentFrame >= m_AcquiredImageIndices.size())
+    {
+        if (m_TerminalPresentResult == VK_SUCCESS)
+            m_TerminalPresentResult = VK_ERROR_INITIALIZATION_FAILED;
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
 
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-
     presentInfo.waitSemaphoreCount = 1;
-    auto hSem = m_RenderFinishSemaphores[currentFrame];
-    auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(hSem);
-    const VkSemaphore semaphore = semItem ? semItem->semaphore : VK_NULL_HANDLE;
-    presentInfo.pWaitSemaphores = &semaphore;
-
-    VkSwapchainKHR swapChains[] = {m_VkSwapChain};
+    presentInfo.pWaitSemaphores = &waitSemaphore;
     presentInfo.swapchainCount = 1;
-    presentInfo.pSwapchains = swapChains;
-
+    presentInfo.pSwapchains = &m_VkSwapChain;
     presentInfo.pImageIndices = &m_AcquiredImageIndices[currentFrame];
 
-    vkQueuePresentKHR(m_VkPresentQueue, &presentInfo);
+    const VkResult injectedResult = std::exchange(m_InjectedPresentResult, VK_SUCCESS);
+    const VkResult result = injectedResult != VK_SUCCESS
+                                ? injectedResult
+                                : vkQueuePresentKHR(m_VkPresentQueue, &presentInfo);
+    m_AcquisitionResults[currentFrame] = VK_NOT_READY;
+    if (IsVkSwapChainRecreateResult(result))
+        m_SwapChainIsOutDate = true;
+    else if (result != VK_SUCCESS && m_TerminalPresentResult == VK_SUCCESS)
+        m_TerminalPresentResult = result;
+    return result;
 }
 
 bool ArisenEngine::RHI::RHIVkSwapChain::HasAcquiredImage(UInt32 frameIndex) const
 {
-    if (m_VkSurface == VK_NULL_HANDLE) return true;
-    auto currentFrame = frameIndex % m_MaxFramesInFlight;
-    VkResult res = m_AcquisitionResults[currentFrame];
-    return res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR;
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+    const auto& lifecycle = m_FrameLifecycles[currentFrame];
+    const VkResult result = m_AcquisitionResults[currentFrame];
+    return lifecycle.frameIndex == frameIndex &&
+        lifecycle.state == RHISwapChainFrameState::Acquired &&
+        (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR);
 }
 
 void ArisenEngine::RHI::RHIVkSwapChain::SetResolution(UInt32 width, UInt32 height)
@@ -542,10 +1191,24 @@ void ArisenEngine::RHI::RHIVkSwapChain::SetResolution(UInt32 width, UInt32 heigh
 bool ArisenEngine::RHI::RHIVkSwapChain::TrySetResolution(UInt32 width, UInt32 height)
 {
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    PublishPendingRetirement();
+    if (m_TerminalPresentResult != VK_SUCCESS)
+    {
+        LOG_ERRORF(
+            "[RHIVkSwapChain::TrySetResolution]: Refusing generation reuse after terminal presentation failure {0} ({1}).",
+            GetVkResultName(m_TerminalPresentResult),
+            static_cast<int>(m_TerminalPresentResult));
+        return false;
+    }
     if (m_ActiveWidth == width && m_ActiveHeight == height)
     {
-        m_ExternalConsumerReleaseAcknowledged = false;
         return true;
+    }
+    if (HasActiveFrameOwnershipLocked())
+    {
+        LOG_ERROR(
+            "[RHIVkSwapChain::TrySetResolution]: Refusing recreation while a frame is active.");
+        return false;
     }
 
     m_LastCreationSucceeded = false;
@@ -610,31 +1273,439 @@ ArisenEngine::RHI::RHIVkSwapChain::GetExternalConsumerWaitSemaphore(UInt32 frame
         : RHISemaphoreHandle::Invalid();
 }
 
-void ArisenEngine::RHI::RHIVkSwapChain::NotifyFrameSubmitted(UInt32 frameIndex, RHIGpuTicket ticket)
+ArisenEngine::RHI::RHIVkSwapChain::FrameSubmissionPlan
+ArisenEngine::RHI::RHIVkSwapChain::PrepareFrameSubmission(
+    UInt32 frameIndex,
+    bool waitsForAcquire,
+    bool signalsFrameComplete)
 {
-    (void)ticket;
-    if (m_VkSurface != VK_NULL_HANDLE) return;
-
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
-    auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
-
-    if (synchronization.preparedForReuse)
+    auto& lifecycle = m_FrameLifecycles[currentFrame];
+    if (lifecycle.frameIndex != frameIndex ||
+        lifecycle.state != RHISwapChainFrameState::Acquired)
     {
-        if (synchronization.preparedFrameIndex != frameIndex)
-        {
-            LOG_ERROR("[RHIVkSwapChain::NotifyFrameSubmitted]: Submitted frame does not match the prepared virtual slot.");
-            return;
-        }
-
-        synchronization.preparedForReuse = false;
-        synchronization.preparedFrameIndex = 0;
-        synchronization.consumerUpdateQueued = false;
-        synchronization.consumerFrameIndex = 0;
+        ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Submitted swapchain frame does not own the selected frame slot");
+    }
+    if (lifecycle.submissionPending || lifecycle.retirementPending)
+    {
+        ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Another frame operation already owns the selected frame slot");
+    }
+    if (waitsForAcquire && lifecycle.acquireWaitSubmitted)
+    {
+        ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "The frame-acquire wait was already submitted");
+    }
+    if (signalsFrameComplete && !waitsForAcquire && !lifecycle.acquireWaitSubmitted)
+    {
+        ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Frame completion cannot be signaled before the acquire wait is submitted");
     }
 
-    synchronization.producerSubmitted = true;
-    synchronization.producerFrameIndex = frameIndex;
+    FrameSubmissionPlan plan{};
+    plan.waitsForAcquire = waitsForAcquire;
+    plan.signalsFrameComplete = signalsFrameComplete;
+    if (waitsForAcquire)
+    {
+        if (m_VkSurface != VK_NULL_HANDLE)
+        {
+            plan.waitSemaphore = m_ImageAvailableSemaphores[currentFrame];
+        }
+        else
+        {
+            const auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
+            if (synchronization.preparedForReuse &&
+                synchronization.preparedFrameIndex == frameIndex)
+            {
+                plan.waitSemaphore = m_ImageAvailableSemaphores[currentFrame];
+            }
+        }
+    }
+    if (signalsFrameComplete)
+        plan.signalSemaphore = m_RenderFinishSemaphores[currentFrame];
+
+    lifecycle.submissionPending = true;
+    lifecycle.pendingWaitForAcquire = waitsForAcquire;
+    lifecycle.pendingSignalFrameComplete = signalsFrameComplete;
+    return plan;
+}
+
+void ArisenEngine::RHI::RHIVkSwapChain::CommitFrameSubmission(
+    UInt32 frameIndex,
+    RHIGpuTicket ticket) noexcept
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+    auto& lifecycle = m_FrameLifecycles[currentFrame];
+    if (lifecycle.frameIndex != frameIndex || !lifecycle.submissionPending)
+    {
+        LOG_ERROR("[RHIVkSwapChain::CommitFrameSubmission]: Frame reservation was lost after queue submission.");
+        return;
+    }
+
+    if (lifecycle.pendingWaitForAcquire)
+    {
+        lifecycle.acquireWaitSubmitted = true;
+        if (m_VkSurface == VK_NULL_HANDLE)
+        {
+            auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
+            synchronization.preparedForReuse = false;
+            synchronization.preparedFrameIndex = 0;
+            synchronization.consumerUpdateQueued = false;
+            synchronization.consumerFrameIndex = 0;
+        }
+    }
+
+    if (lifecycle.pendingSignalFrameComplete)
+    {
+        if (m_VkSurface == VK_NULL_HANDLE)
+        {
+            auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
+            synchronization.producerSubmitted = true;
+            synchronization.producerFrameIndex = frameIndex;
+        }
+        lifecycle.state = RHISwapChainFrameState::Submitted;
+    }
+
+    lifecycle.submitTicket = ticket;
+    if (ticket > m_LastOwnedGraphicsTicket)
+        m_LastOwnedGraphicsTicket = ticket;
+    lifecycle.submissionPending = false;
+    lifecycle.pendingWaitForAcquire = false;
+    lifecycle.pendingSignalFrameComplete = false;
+}
+
+void ArisenEngine::RHI::RHIVkSwapChain::CancelFrameSubmission(UInt32 frameIndex) noexcept
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+    auto& lifecycle = m_FrameLifecycles[currentFrame];
+    if (lifecycle.frameIndex != frameIndex || !lifecycle.submissionPending)
+        return;
+    lifecycle.submissionPending = false;
+    lifecycle.pendingWaitForAcquire = false;
+    lifecycle.pendingSignalFrameComplete = false;
+}
+
+VkCommandBuffer ArisenEngine::RHI::RHIVkSwapChain::PrepareRealRetirementCommandBuffer(
+    UInt32 currentFrame)
+{
+    if (m_VkSurface == VK_NULL_HANDLE || currentFrame >= m_RetirementCommandBuffers.size())
+    {
+        ThrowInvalidState("vkBeginCommandBuffer", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "A real swapchain retirement command buffer was requested for an invalid slot");
+    }
+
+    auto* graphicsQueue = static_cast<RHIVkQueue*>(m_Device->GetQueue(RHIQueueType::Graphics));
+    if (!graphicsQueue)
+    {
+        ThrowInvalidState("vkBeginCommandBuffer", "RHIQueue", 0,
+                          "Graphics queue is unavailable for frame retirement");
+    }
+    const RHIGpuTicket previousTicket = m_RetirementCommandBufferTickets[currentFrame];
+    if (previousTicket != 0)
+        graphicsQueue->WaitForTicket(previousTicket);
+
+    if (m_RetirementCommandPool == VK_NULL_HANDLE)
+    {
+        const auto queueIndices = m_Surface->GetQueueFamilyIndices();
+        if (!queueIndices.graphicsFamily.has_value())
+        {
+            ThrowInvalidState("vkCreateCommandPool", "RHIVkSwapChain",
+                              reinterpret_cast<uint64_t>(this),
+                              "Graphics queue family is unavailable for frame retirement");
+        }
+
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
+            VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolInfo.queueFamilyIndex = queueIndices.graphicsFamily.value();
+        VkCommandPool commandPool = VK_NULL_HANDLE;
+        CheckVkResult(
+            vkCreateCommandPool(m_VkDevice, &poolInfo, nullptr, &commandPool),
+            "vkCreateCommandPool",
+            "RHIVkSwapChain",
+            reinterpret_cast<uint64_t>(this));
+
+        Containers::Vector<VkCommandBuffer> commandBuffers(
+            m_RetirementCommandBuffers.size(),
+            VK_NULL_HANDLE);
+        VkCommandBufferAllocateInfo allocateInfo{};
+        allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocateInfo.commandPool = commandPool;
+        allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocateInfo.commandBufferCount = static_cast<uint32_t>(commandBuffers.size());
+        const VkResult allocationResult = vkAllocateCommandBuffers(
+            m_VkDevice,
+            &allocateInfo,
+            commandBuffers.data());
+        if (allocationResult != VK_SUCCESS)
+        {
+            vkDestroyCommandPool(m_VkDevice, commandPool, nullptr);
+            CheckVkResult(
+                allocationResult,
+                "vkAllocateCommandBuffers",
+                "RHIVkSwapChain",
+                reinterpret_cast<uint64_t>(this));
+        }
+
+        m_RetirementCommandPool = commandPool;
+        m_RetirementCommandBuffers = std::move(commandBuffers);
+    }
+
+    const UInt32 imageIndex = m_AcquiredImageIndices[currentFrame];
+    if (imageIndex >= m_ImageHandles.size())
+    {
+        ThrowInvalidState("vkBeginCommandBuffer", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Retiring frame references an invalid acquired image");
+    }
+    auto* imageItem = static_cast<RHIVkDevice*>(m_Device)->GetImagePool()->Get(m_ImageHandles[imageIndex]);
+    if (!imageItem || imageItem->image == VK_NULL_HANDLE)
+    {
+        const auto imageHandle = m_ImageHandles[imageIndex];
+        ThrowInvalidHandle("vkBeginCommandBuffer", "RHIImage", imageHandle.index,
+                           imageHandle.generation, "Retiring swapchain image is stale");
+    }
+
+    VkCommandBuffer commandBuffer = m_RetirementCommandBuffers[currentFrame];
+    CheckVkResult(
+        vkResetCommandBuffer(commandBuffer, 0),
+        "vkResetCommandBuffer",
+        "RHIVkSwapChain",
+        reinterpret_cast<uint64_t>(this));
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    CheckVkResult(
+        vkBeginCommandBuffer(commandBuffer, &beginInfo),
+        "vkBeginCommandBuffer",
+        "RHIVkSwapChain",
+        reinterpret_cast<uint64_t>(this));
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = 0;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = imageItem->image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = m_Desc.imageArrayLayers > 0
+                                              ? m_Desc.imageArrayLayers
+                                              : 1;
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0,
+        0,
+        nullptr,
+        0,
+        nullptr,
+        1,
+        &barrier);
+
+    CheckVkResult(
+        vkEndCommandBuffer(commandBuffer),
+        "vkEndCommandBuffer",
+        "RHIVkSwapChain",
+        reinterpret_cast<uint64_t>(this));
+    return commandBuffer;
+}
+
+ArisenEngine::RHI::RHIVkSwapChain::FrameRetirementPlan
+ArisenEngine::RHI::RHIVkSwapChain::PrepareFrameRetirement(UInt32 frameIndex)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+    auto& lifecycle = m_FrameLifecycles[currentFrame];
+    if (lifecycle.frameIndex != frameIndex)
+    {
+        ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Retirement frame does not own the selected frame slot");
+    }
+
+    FrameRetirementPlan plan{};
+    plan.previousTicket = lifecycle.submitTicket;
+    if (lifecycle.state == RHISwapChainFrameState::Retired ||
+        (lifecycle.state == RHISwapChainFrameState::Presented && m_VkSurface != VK_NULL_HANDLE))
+    {
+        plan.terminal = true;
+        return plan;
+    }
+    if (lifecycle.state != RHISwapChainFrameState::Acquired &&
+        lifecycle.state != RHISwapChainFrameState::Submitted &&
+        lifecycle.state != RHISwapChainFrameState::Presented)
+    {
+        ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Only an acquired, submitted, or virtual presented frame can be retired");
+    }
+    if (lifecycle.submissionPending || lifecycle.retirementPending)
+    {
+        ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                          reinterpret_cast<uint64_t>(this),
+                          "Another frame operation already owns the selected frame slot");
+    }
+
+    const auto resolveSemaphore = [&](RHISemaphoreHandle handle, const char* purpose)
+    {
+        auto* item = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(handle);
+        if (!item || item->semaphore == VK_NULL_HANDLE)
+        {
+            ThrowInvalidHandle("vkQueueSubmit", "RHISemaphore", handle.index, handle.generation, purpose);
+        }
+        return item->semaphore;
+    };
+
+    if (m_VkSurface != VK_NULL_HANDLE)
+    {
+        if (m_VkSwapChain == VK_NULL_HANDLE || m_VkPresentQueue == VK_NULL_HANDLE ||
+            currentFrame >= m_AcquiredImageIndices.size())
+        {
+            ThrowInvalidState("vkQueuePresentKHR", "RHIVkSwapChain",
+                              reinterpret_cast<uint64_t>(this),
+                              "Real swapchain presentation state is unavailable for retirement");
+        }
+
+        plan.signalSemaphore = resolveSemaphore(
+            m_RenderFinishSemaphores[currentFrame],
+            "Frame-retirement present semaphore is stale");
+        plan.requiresPresent = true;
+        if (lifecycle.state == RHISwapChainFrameState::Acquired)
+        {
+            plan.requiresQueueSubmit = true;
+            plan.commandBuffer = PrepareRealRetirementCommandBuffer(currentFrame);
+            if (!lifecycle.acquireWaitSubmitted)
+            {
+                plan.waitSemaphore = resolveSemaphore(
+                    m_ImageAvailableSemaphores[currentFrame],
+                    "Frame-retirement acquire semaphore is stale");
+            }
+        }
+    }
+    else
+    {
+        auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
+        if (synchronization.consumerHandleLeased)
+        {
+            ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                              reinterpret_cast<uint64_t>(this),
+                              "Cannot retire a frame while the external consumer owns its semaphore handle");
+        }
+
+        if (lifecycle.state == RHISwapChainFrameState::Acquired)
+        {
+            if (!lifecycle.acquireWaitSubmitted && synchronization.preparedForReuse)
+            {
+                if (synchronization.preparedFrameIndex != frameIndex)
+                {
+                    ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                                      reinterpret_cast<uint64_t>(this),
+                                      "Virtual retirement frame does not match the prepared consumer wait");
+                }
+                plan.waitSemaphore = resolveSemaphore(
+                    m_ImageAvailableSemaphores[currentFrame],
+                    "Virtual frame-retirement consumer semaphore is stale");
+                plan.requiresQueueSubmit = true;
+            }
+        }
+        else
+        {
+            if (synchronization.consumerUpdateQueued)
+            {
+                ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                                  reinterpret_cast<uint64_t>(this),
+                                  "Cannot retire a frame after external-consumer submission");
+            }
+            if (!synchronization.producerSubmitted ||
+                synchronization.producerFrameIndex != frameIndex)
+            {
+                ThrowInvalidState("vkQueueSubmit", "RHIVkSwapChain",
+                                  reinterpret_cast<uint64_t>(this),
+                                  "Virtual frame producer synchronization is not owned by the retiring frame");
+            }
+            plan.waitSemaphore = resolveSemaphore(
+                m_RenderFinishSemaphores[currentFrame],
+                "Virtual frame-retirement producer semaphore is stale");
+            plan.requiresQueueSubmit = true;
+        }
+    }
+
+    lifecycle.retirementPending = true;
+    return plan;
+}
+
+VkResult ArisenEngine::RHI::RHIVkSwapChain::CommitFrameRetirement(
+    UInt32 frameIndex,
+    RHIGpuTicket ticket,
+    const FrameRetirementPlan& plan) noexcept
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+    auto& lifecycle = m_FrameLifecycles[currentFrame];
+    if (lifecycle.frameIndex != frameIndex || !lifecycle.retirementPending)
+    {
+        LOG_ERROR("[RHIVkSwapChain::CommitFrameRetirement]: Frame reservation was lost during retirement.");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkResult result = VK_SUCCESS;
+    if (plan.commandBuffer != VK_NULL_HANDLE && currentFrame < m_AcquiredImageIndices.size())
+    {
+        const UInt32 imageIndex = m_AcquiredImageIndices[currentFrame];
+        if (imageIndex < m_ImageHandles.size())
+        {
+            auto* imageItem = static_cast<RHIVkDevice*>(m_Device)->GetImagePool()->Get(
+                m_ImageHandles[imageIndex]);
+            if (imageItem)
+                imageItem->currentLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        }
+    }
+    if (plan.requiresPresent)
+        result = PresentRealFrame(currentFrame, plan.signalSemaphore);
+    else if (m_VkSurface == VK_NULL_HANDLE)
+        m_VirtualFrameSynchronization[currentFrame] = VirtualFrameSynchronization{};
+
+    m_AcquisitionResults[currentFrame] = VK_NOT_READY;
+    lifecycle.state = RHISwapChainFrameState::Retired;
+    if (plan.commandBuffer != VK_NULL_HANDLE)
+        m_RetirementCommandBufferTickets[currentFrame] = ticket;
+    if (ticket > lifecycle.submitTicket)
+        lifecycle.submitTicket = ticket;
+    if (ticket > m_LastOwnedGraphicsTicket)
+        m_LastOwnedGraphicsTicket = ticket;
+    lifecycle.acquireWaitSubmitted = false;
+    lifecycle.submissionPending = false;
+    lifecycle.pendingWaitForAcquire = false;
+    lifecycle.pendingSignalFrameComplete = false;
+    lifecycle.retirementPending = false;
+    return result;
+}
+
+void ArisenEngine::RHI::RHIVkSwapChain::CancelFrameRetirement(UInt32 frameIndex) noexcept
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+    auto& lifecycle = m_FrameLifecycles[currentFrame];
+    if (lifecycle.frameIndex == frameIndex)
+        lifecycle.retirementPending = false;
 }
 
 void* ArisenEngine::RHI::RHIVkSwapChain::GetRenderFinishedSemaphoreWin32Handle(UInt32 frameIndex)
@@ -656,14 +1727,26 @@ void* ArisenEngine::RHI::RHIVkSwapChain::GetRenderFinishedSemaphoreWin32Handle(U
     }
 
     auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(m_RenderFinishSemaphores[currentFrame]);
-    if (!semItem || semItem->semaphore == VK_NULL_HANDLE) return nullptr;
+    const auto semaphoreHandle = m_RenderFinishSemaphores[currentFrame];
+    if (!semItem || semItem->semaphore == VK_NULL_HANDLE)
+    {
+        ThrowInvalidHandle(
+            "vkGetSemaphoreWin32HandleKHR",
+            "RHISemaphore",
+            semaphoreHandle.index,
+            semaphoreHandle.generation,
+            "Render-finished semaphore is stale");
+    }
 
     auto vkGetSemaphoreWin32HandleKHR =
         (PFN_vkGetSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(m_VkDevice, "vkGetSemaphoreWin32HandleKHR");
     if (!vkGetSemaphoreWin32HandleKHR)
     {
-        LOG_ERROR("[RHIVkSwapChain::GetRenderFinishedSemaphoreWin32Handle]: vkGetSemaphoreWin32HandleKHR proc not found!");
-        return nullptr;
+        ThrowInvalidState(
+            "vkGetSemaphoreWin32HandleKHR",
+            "VkDevice",
+            GetVkObjectIdentity(m_VkDevice),
+            "Vulkan semaphore Win32 export entry point is unavailable");
     }
 
     VkSemaphoreGetWin32HandleInfoKHR handleInfo{};
@@ -672,11 +1755,14 @@ void* ArisenEngine::RHI::RHIVkSwapChain::GetRenderFinishedSemaphoreWin32Handle(U
     handleInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 
     HANDLE win32Handle = nullptr;
-    if (vkGetSemaphoreWin32HandleKHR(m_VkDevice, &handleInfo, &win32Handle) != VK_SUCCESS)
-    {
-        LOG_ERROR("[RHIVkSwapChain::GetRenderFinishedSemaphoreWin32Handle]: Failed to export render-finished semaphore handle.");
-        return nullptr;
-    }
+    CheckVkResult(
+        vkGetSemaphoreWin32HandleKHR(m_VkDevice, &handleInfo, &win32Handle),
+        "vkGetSemaphoreWin32HandleKHR",
+        "RHISemaphore",
+        GetVkObjectIdentity(semItem->semaphore),
+        semaphoreHandle.index,
+        semaphoreHandle.generation,
+        "Render-finished semaphore export");
 
     m_RenderFinishSemaphoreSharedHandles[currentFrame] = win32Handle;
     return win32Handle;
@@ -710,16 +1796,27 @@ void* ArisenEngine::RHI::RHIVkSwapChain::CreateConsumedSemaphoreWin32Handle(UInt
         return m_ImageAvailableSemaphoreSharedHandles[currentFrame];
     }
 
-    auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(
-        m_ImageAvailableSemaphores[currentFrame]);
-    if (!semItem || semItem->semaphore == VK_NULL_HANDLE) return nullptr;
+    const auto semaphoreHandle = m_ImageAvailableSemaphores[currentFrame];
+    auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(semaphoreHandle);
+    if (!semItem || semItem->semaphore == VK_NULL_HANDLE)
+    {
+        ThrowInvalidHandle(
+            "vkGetSemaphoreWin32HandleKHR",
+            "RHISemaphore",
+            semaphoreHandle.index,
+            semaphoreHandle.generation,
+            "External-consumer semaphore is stale");
+    }
 
     auto vkGetSemaphoreWin32HandleKHR =
         (PFN_vkGetSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(m_VkDevice, "vkGetSemaphoreWin32HandleKHR");
     if (!vkGetSemaphoreWin32HandleKHR)
     {
-        LOG_ERROR("[RHIVkSwapChain::CreateConsumedSemaphoreWin32Handle]: vkGetSemaphoreWin32HandleKHR proc not found!");
-        return nullptr;
+        ThrowInvalidState(
+            "vkGetSemaphoreWin32HandleKHR",
+            "VkDevice",
+            GetVkObjectIdentity(m_VkDevice),
+            "Vulkan semaphore Win32 export entry point is unavailable");
     }
 
     VkSemaphoreGetWin32HandleInfoKHR handleInfo{};
@@ -728,11 +1825,14 @@ void* ArisenEngine::RHI::RHIVkSwapChain::CreateConsumedSemaphoreWin32Handle(UInt
     handleInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 
     HANDLE win32Handle = nullptr;
-    if (vkGetSemaphoreWin32HandleKHR(m_VkDevice, &handleInfo, &win32Handle) != VK_SUCCESS)
-    {
-        LOG_ERROR("[RHIVkSwapChain::CreateConsumedSemaphoreWin32Handle]: Failed to export consumed semaphore handle.");
-        return nullptr;
-    }
+    CheckVkResult(
+        vkGetSemaphoreWin32HandleKHR(m_VkDevice, &handleInfo, &win32Handle),
+        "vkGetSemaphoreWin32HandleKHR",
+        "RHISemaphore",
+        GetVkObjectIdentity(semItem->semaphore),
+        semaphoreHandle.index,
+        semaphoreHandle.generation,
+        "External-consumer semaphore export");
 
     m_ImageAvailableSemaphoreSharedHandles[currentFrame] = win32Handle;
     synchronization.consumerHandleLeased = true;
@@ -743,43 +1843,72 @@ void* ArisenEngine::RHI::RHIVkSwapChain::CreateConsumedSemaphoreWin32Handle(UInt
 void ArisenEngine::RHI::RHIVkSwapChain::CompleteConsumedSemaphoreWin32Handle(void* handle)
 {
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
-    if (!handle) return;
-
-    for (UInt32 currentFrame = 0; currentFrame < m_ImageAvailableSemaphoreSharedHandles.size(); ++currentFrame)
+    constexpr const char* Operation =
+        "RHIVkSwapChain::CompleteConsumedSemaphoreWin32Handle";
+    const UInt32 currentFrame = RequireConsumedSemaphoreHandleSlotLocked(handle, Operation);
+    auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
+    if (!synchronization.consumerHandleLeased)
     {
-        if (m_ImageAvailableSemaphoreSharedHandles[currentFrame] == handle)
-        {
-            auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
-            if (!synchronization.consumerHandleLeased)
-            {
-                LOG_ERROR("[RHIVkSwapChain::CompleteConsumedSemaphoreWin32Handle]: Consumer handle is not leased.");
-                return;
-            }
-
-            synchronization.consumerFrameIndex = synchronization.consumerHandleLeaseFrameIndex;
-            synchronization.consumerUpdateQueued = true;
-            synchronization.consumerHandleLeased = false;
-            synchronization.consumerHandleLeaseFrameIndex = 0;
-            return;
-        }
+        ThrowInvalidState(
+            Operation,
+            "Win32SemaphoreHandle",
+            reinterpret_cast<uint64_t>(handle),
+            "Consumed semaphore handle is not leased");
     }
+
+    synchronization.consumerFrameIndex = synchronization.consumerHandleLeaseFrameIndex;
+    synchronization.consumerUpdateQueued = true;
+    synchronization.consumerHandleLeased = false;
+    synchronization.consumerHandleLeaseFrameIndex = 0;
 }
 
 void ArisenEngine::RHI::RHIVkSwapChain::ReleaseConsumedSemaphoreWin32Handle(void* handle)
 {
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
-    if (!handle) return;
+    constexpr const char* Operation =
+        "RHIVkSwapChain::ReleaseConsumedSemaphoreWin32Handle";
+    const UInt32 currentFrame = RequireConsumedSemaphoreHandleSlotLocked(handle, Operation);
+    auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
+    if (!synchronization.consumerHandleLeased)
+    {
+        ThrowInvalidState(
+            Operation,
+            "Win32SemaphoreHandle",
+            reinterpret_cast<uint64_t>(handle),
+            "Consumed semaphore handle is not leased");
+    }
 
-    for (UInt32 currentFrame = 0; currentFrame < m_ImageAvailableSemaphoreSharedHandles.size(); ++currentFrame)
+    synchronization.consumerHandleLeased = false;
+    synchronization.consumerHandleLeaseFrameIndex = 0;
+}
+
+UInt32 ArisenEngine::RHI::RHIVkSwapChain::RequireConsumedSemaphoreHandleSlotLocked(
+    void* handle,
+    const char* operation) const
+{
+    if (!handle)
+    {
+        ThrowInvalidParameter(
+            operation,
+            "handle",
+            "Consumed semaphore handle must be non-null");
+    }
+
+    for (UInt32 currentFrame = 0;
+         currentFrame < m_ImageAvailableSemaphoreSharedHandles.size();
+         ++currentFrame)
     {
         if (m_ImageAvailableSemaphoreSharedHandles[currentFrame] == handle)
-        {
-            auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
-            synchronization.consumerHandleLeased = false;
-            synchronization.consumerHandleLeaseFrameIndex = 0;
-            return;
-        }
+            return currentFrame;
     }
+
+    ThrowInvalidHandle(
+        operation,
+        "Win32SemaphoreHandle",
+        UINT32_MAX,
+        0,
+        "Consumed semaphore handle is not owned by this swapchain",
+        reinterpret_cast<uint64_t>(handle));
 }
 
 bool ArisenEngine::RHI::RHIVkSwapChain::AcknowledgeExternalConsumerRelease()
@@ -787,6 +1916,13 @@ bool ArisenEngine::RHI::RHIVkSwapChain::AcknowledgeExternalConsumerRelease()
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
     if (m_VkSurface != VK_NULL_HANDLE)
         return true;
+
+    if (HasActiveFrameOwnershipLocked())
+    {
+        LOG_ERROR(
+            "[RHIVkSwapChain::AcknowledgeExternalConsumerRelease]: Refusing release while a frame is active.");
+        return false;
+    }
 
     for (const auto& synchronization : m_VirtualFrameSynchronization)
     {
@@ -824,8 +1960,7 @@ bool ArisenEngine::RHI::RHIVkSwapChain::AcknowledgeExternalConsumerRelease()
     }
 
     auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
-    auto* graphicsQueue = vkDevice->GetQueue(RHIQueueType::Graphics);
-    const RHIGpuTicket retirementTicket = graphicsQueue ? graphicsQueue->GetLatestTicket() : 0;
+    const RHIGpuTicket retirementTicket = m_LastOwnedGraphicsTicket;
     auto retireSemaphore = [&](RHISemaphoreHandle semaphore)
     {
         if (!semaphore.IsValid()) return;
@@ -864,6 +1999,11 @@ bool ArisenEngine::RHI::RHIVkSwapChain::AcknowledgeExternalConsumerRelease()
     {
         synchronization = VirtualFrameSynchronization{};
     }
+    for (auto& lifecycle : m_FrameLifecycles)
+    {
+        lifecycle = FrameLifecycle{};
+    }
+    std::fill(m_AcquisitionResults.begin(), m_AcquisitionResults.end(), VK_NOT_READY);
 
     m_ExternalConsumerReleaseAcknowledged = true;
     LOG_INFOF(
@@ -872,10 +2012,164 @@ bool ArisenEngine::RHI::RHIVkSwapChain::AcknowledgeExternalConsumerRelease()
     return true;
 }
 
-void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
+bool ArisenEngine::RHI::RHIVkSwapChain::PrepareForSurfaceRelease()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    if (HasActiveFrameOwnershipLocked())
+    {
+        LOG_ERROR(
+            "[RHIVkSwapChain::PrepareForSurfaceRelease]: Refusing release while a frame is active.");
+        return false;
+    }
 
+    if (m_VkSurface == VK_NULL_HANDLE && !m_ImageHandles.empty() &&
+        !m_ExternalConsumerReleaseAcknowledged)
+    {
+        return AcknowledgeExternalConsumerRelease();
+    }
+
+    if (m_VkSurface != VK_NULL_HANDLE)
+    {
+        auto* graphicsQueue = static_cast<RHIVkQueue*>(
+            m_Device->GetQueue(RHIQueueType::Graphics));
+        if (!graphicsQueue)
+        {
+            ThrowInvalidState(
+                "RHIVkSwapChain::PrepareForSurfaceRelease",
+                "RHIQueue",
+                reinterpret_cast<uint64_t>(this),
+                "Physical surface release requires a graphics queue");
+        }
+        if (m_LastOwnedGraphicsTicket != 0)
+            graphicsQueue->WaitForTicket(m_LastOwnedGraphicsTicket);
+
+        auto* presentQueue = static_cast<RHIVkQueue*>(
+            m_Device->GetQueue(RHIQueueType::Present));
+        CheckVkResult(
+            presentQueue ? presentQueue->WaitIdleNoThrow() : VK_ERROR_INITIALIZATION_FAILED,
+            "vkQueueWaitIdle",
+            "RHIVkSwapChain",
+            reinterpret_cast<uint64_t>(this),
+            UINT32_MAX,
+            0,
+            "Physical surface release requires completed presentation ownership");
+
+        PublishPendingRetirement();
+        Cleanup();
+        if (m_VkSwapChain != VK_NULL_HANDLE || !m_ImageHandles.empty() ||
+            !m_ImageViewHandles.empty() || !m_SharedHandles.empty())
+        {
+            LOG_ERROR(
+                "[RHIVkSwapChain::PrepareForSurfaceRelease]: Physical generation release remains incomplete.");
+            return false;
+        }
+
+        // Cleanup publishes the shared generation owner with its maximum graphics
+        // ticket. Update synchronously runs that completed publication before the
+        // parent VkSurfaceKHR is allowed to be destroyed.
+        graphicsQueue->Update();
+    }
+    return true;
+}
+
+bool ArisenEngine::RHI::RHIVkSwapChain::HasActiveFrameOwnershipLocked() const noexcept
+{
+    for (const auto& lifecycle : m_FrameLifecycles)
+    {
+        if (lifecycle.state == RHISwapChainFrameState::Acquired ||
+            lifecycle.state == RHISwapChainFrameState::Submitted ||
+            lifecycle.submissionPending ||
+            lifecycle.retirementPending)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ArisenEngine::RHI::RHIVkSwapChain::PublishPendingRetirement()
+{
+    if (m_PendingRetiredSwapChain != VK_NULL_HANDLE)
+    {
+        auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+        if (!ReleaseSwapChainResources(
+                vkDevice,
+                m_VkDevice,
+                m_PendingRetiredSwapChain,
+                m_PendingRetiredImages,
+                m_PendingRetiredImageViews,
+                m_PendingRetiredSharedHandles,
+                !m_PendingRetiredRealGenerationRegistryOwned))
+        {
+            ThrowInvalidState(
+                "RHIVkSwapChain::PublishPendingRetirement",
+                "VkSwapchainKHR",
+                GetVkObjectIdentity(m_PendingRetiredSwapChain),
+                "Physical swapchain generation release did not commit");
+        }
+        m_PendingRetiredRealGenerationRegistryOwned = false;
+    }
+
+    if (m_PendingRetiredImages.empty() &&
+        m_PendingRetiredImageViews.empty() &&
+        m_PendingRetiredSharedHandles.empty())
+    {
+        m_PendingRetiredGraphicsTicket = 0;
+        return;
+    }
+
+    auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+    RHIDeletionDependencies dependencies;
+    dependencies.tickets[static_cast<int>(RHIQueueType::Graphics)] =
+        m_PendingRetiredGraphicsTicket;
+
+    // Keep the member vectors authoritative until publication commits. The
+    // callback copies handle values only; registry ownership moves when it runs.
+    std::function<void()> releaseRetiredGeneration =
+        [vkDevice,
+         device = m_VkDevice,
+         images = m_PendingRetiredImages,
+         imageViews = m_PendingRetiredImageViews,
+         sharedHandles = m_PendingRetiredSharedHandles]() mutable
+        {
+            VkSwapchainKHR noSwapchain = VK_NULL_HANDLE;
+            ReleaseSwapChainResources(
+                vkDevice,
+                device,
+                noSwapchain,
+                images,
+                imageViews,
+                sharedHandles,
+                false);
+        };
+
+    vkDevice->EnqueueDeferredDestroy(dependencies, releaseRetiredGeneration);
+    m_PendingRetiredImages.clear();
+    m_PendingRetiredImageViews.clear();
+    m_PendingRetiredSharedHandles.clear();
+    m_PendingRetiredGraphicsTicket = 0;
+}
+
+void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
 {
     ARISEN_PROFILE_ZONE("RHI::VulkanRecreateSwapChain");
+    PublishPendingRetirement();
+
+    if (m_TerminalPresentResult != VK_SUCCESS)
+    {
+        LOG_ERRORF(
+            "[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Refusing generation reuse after terminal presentation failure {0} ({1}).",
+            GetVkResultName(m_TerminalPresentResult),
+            static_cast<int>(m_TerminalPresentResult));
+        return;
+    }
+
+    if (HasActiveFrameOwnershipLocked())
+    {
+        LOG_ERROR(
+            "[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Refusing recreation while a frame is active.");
+        return;
+    }
     if (m_VkSurface == VK_NULL_HANDLE && !m_ImageHandles.empty() &&
         !m_ExternalConsumerReleaseAcknowledged)
     {
@@ -898,7 +2192,6 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
     }
 
     LOG_INFOF("[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Resizing SwapChain to {0}x{1}", m_Desc.width, m_Desc.height);
-    // Zero-Stall: Do NOT wait idle.
     // Handle minimized or zero-sized windows
     if (m_Desc.width == 0 || m_Desc.height == 0)
     {
@@ -916,89 +2209,145 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
         }
     }
 
-    // Zero-Stall: Do not call DeviceWaitIdle() here.
-    // We recreate the swapchain using the 'oldSwapchain' parameter and defer the destruction 
-    // of the old one until the GPU is done with it.
+    // Real presentation has no core Vulkan completion ticket. Drain only the present
+    // queue before replacing its swapchain; virtual surfaces stay ticket-deferred.
+    if (m_VkSurface != VK_NULL_HANDLE && m_VkSwapChain != VK_NULL_HANDLE)
+    {
+        auto* presentQueue = static_cast<RHIVkQueue*>(
+            m_Device->GetQueue(RHIQueueType::Present));
+        const VkResult result = presentQueue
+            ? presentQueue->WaitIdleNoThrow()
+            : VK_ERROR_INITIALIZATION_FAILED;
+        if (result != VK_SUCCESS)
+        {
+            LOG_ERRORF(
+                "[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Present completion failed with {0} ({1}); preserving the previous swapchain.",
+                GetVkResultName(result),
+                static_cast<int>(result));
+            return;
+        }
+    }
 
-    VkSwapchainKHR oldSwapchain = m_VkSwapChain;
+    const RHISwapChainDescriptor requestedDesc = m_Desc;
+    RHISwapChainDescriptor previousDesc = m_Desc;
+    previousDesc.width = m_ActiveWidth;
+    previousDesc.height = m_ActiveHeight;
+    previousDesc.customData = nullptr;
+
+    VkSwapchainKHR oldSwapchain = std::exchange(m_VkSwapChain, VK_NULL_HANDLE);
+    const bool oldRealGenerationRegistryOwned =
+        std::exchange(m_RealGenerationRegistryOwned, false);
     const UInt32 oldActiveWidth = m_ActiveWidth;
     const UInt32 oldActiveHeight = m_ActiveHeight;
-    m_VkSwapChain = VK_NULL_HANDLE; // Prevent Cleanup from destroying the old swapchain immediately
+    const bool oldOutOfDate = m_SwapChainIsOutDate;
 
-    // Virtual recreation is reached only after Avalonia has released the old imports.
-    // Capture the producer resources here so GPU destruction can follow the exact ticket horizon.
     Containers::Vector<RHIImageHandle> oldImages = std::move(m_ImageHandles);
     Containers::Vector<RHIImageViewHandle> oldImageViews = std::move(m_ImageViewHandles);
     Containers::Vector<void*> oldSharedHandles = std::move(m_SharedHandles);
 
-    Cleanup(); // This now operates on empty vectors for images/views/handles, but cleans up other state.
-
-    // Reset tracking state to prevent using stale data from the old swapchain
-    for (auto& idx : m_AcquiredImageIndices) idx = 0;
-    // VERY IMPORTANT: Initialize to NOT_READY or OUT_OF_DATE during recreation. 
-    // This ensures that HasAcquiredImage() correctly returns false until the NEW swapchain acquires something.
-    for (auto& res : m_AcquisitionResults) res = VK_NOT_READY; 
-
-    // Pass old swapchain to Create functions
-    m_Desc.customData = (void*)oldSwapchain;
-    CreateSwapChainWithDesc(m_Desc);
-    m_Desc.customData = nullptr; // Clear after use
-
-    if (!m_LastCreationSucceeded)
+    const auto restorePreviousGeneration = [&]()
     {
-        Cleanup();
         m_VkSwapChain = oldSwapchain;
         m_ImageHandles = std::move(oldImages);
         m_ImageViewHandles = std::move(oldImageViews);
         m_SharedHandles = std::move(oldSharedHandles);
+        m_RealGenerationRegistryOwned = oldRealGenerationRegistryOwned;
         m_ActiveWidth = oldActiveWidth;
         m_ActiveHeight = oldActiveHeight;
-        if (oldSwapchain != VK_NULL_HANDLE || !m_ImageHandles.empty())
+        m_Desc = previousDesc;
+        m_SwapChainIsOutDate = oldOutOfDate;
+    };
+
+    RHISwapChainDescriptor creationDesc = requestedDesc;
+    creationDesc.customData = oldSwapchain;
+    try
+    {
+        CreateSwapChainWithDesc(creationDesc);
+    }
+    catch (...)
+    {
+        if (!m_LastCreationRetiredPrevious)
         {
-            m_Desc.width = oldActiveWidth;
-            m_Desc.height = oldActiveHeight;
-            m_SwapChainIsOutDate = false;
+            restorePreviousGeneration();
         }
+        else
+        {
+            // A successful vkCreateSwapchainKHR retires oldSwapchain. It must not
+            // be restored if later replacement publication fails.
+            m_PendingRetiredSwapChain = oldSwapchain;
+            m_PendingRetiredImages = std::move(oldImages);
+            m_PendingRetiredImageViews = std::move(oldImageViews);
+            m_PendingRetiredSharedHandles = std::move(oldSharedHandles);
+            m_PendingRetiredRealGenerationRegistryOwned =
+                oldRealGenerationRegistryOwned;
+            try
+            {
+                PublishPendingRetirement();
+            }
+            catch (const std::exception& error)
+            {
+                LOG_ERRORF(
+                    "[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Replaced generation remains pending after creation failure: {0}",
+                    error.what());
+            }
+            catch (...)
+            {
+                LOG_ERROR(
+                    "[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Replaced generation remains pending after creation failure.");
+            }
+            m_ActiveWidth = 0;
+            m_ActiveHeight = 0;
+            m_Desc = requestedDesc;
+            m_Desc.customData = nullptr;
+            m_SwapChainIsOutDate = true;
+        }
+        throw;
+    }
+
+    if (!m_LastCreationSucceeded)
+    {
+        restorePreviousGeneration();
         LOG_ERROR("[RHIVkSwapChain::RecreateSwapChainIfNeeded]: Recreation failed; previous swapchain remains active.");
         return;
     }
 
-    // Transition State: If we have a valid swapchain again, we are no longer out of date.
-    if (m_VkSwapChain != VK_NULL_HANDLE)
-    {
-        m_SwapChainIsOutDate = false;
-    }
+    // The replacement generation is already committed. Publish its frame
+    // state before any fallible retirement of the previous virtual generation.
+    for (auto& index : m_AcquiredImageIndices) index = 0;
+    for (auto& result : m_AcquisitionResults) result = VK_NOT_READY;
+    for (auto& lifecycle : m_FrameLifecycles) lifecycle = FrameLifecycle{};
+    m_SwapChainIsOutDate = false;
+    m_LastCreationRetiredPrevious = false;
 
-    // Defer destroy oldSwapchain and images
-    auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
-    auto* factory = m_Device->GetFactory();
-    
-    // The render-thread boundary gives the exact producer horizon. Virtual resources
-    // reach this point only after Avalonia has acknowledged and disposed the old imports.
-    auto* graphicsQueue = vkDevice->GetQueue(RHIQueueType::Graphics);
-    auto ticket = graphicsQueue ? graphicsQueue->GetLatestTicket() : 0;
-    
-    RHIDeletionDependencies deps;
-    deps.tickets[(int)RHIQueueType::Graphics] = ticket;
-    
-    // 1. Defer SwapChain destruction
     if (oldSwapchain != VK_NULL_HANDLE)
     {
-        vkDevice->EnqueueDeferredDestroy(deps,
-                                         [dev = m_VkDevice, sw = oldSwapchain]()
-                                         {
-                                             vkDestroySwapchainKHR(dev, sw, nullptr);
-                                         });
+        // Keep the old generation authoritative until every wrapper release
+        // commits. A failed publication is retried on the next boundary.
+        m_PendingRetiredSwapChain = oldSwapchain;
+        m_PendingRetiredImages = std::move(oldImages);
+        m_PendingRetiredImageViews = std::move(oldImageViews);
+        m_PendingRetiredSharedHandles = std::move(oldSharedHandles);
+        m_PendingRetiredRealGenerationRegistryOwned =
+            oldRealGenerationRegistryOwned;
+        PublishPendingRetirement();
     }
-
-    // 2. Defer Virtual Images and Views destruction
-    if (!oldImages.empty())
+    else if (!oldImages.empty() || !oldImageViews.empty() || !oldSharedHandles.empty())
     {
-        vkDevice->EnqueueDeferredDestroy(deps,
-                                         [factory, images = std::move(oldImages), views = std::move(oldImageViews)]()
-                                         {
-                                             for (auto h : views) factory->ReleaseImageView(h);
-                                             for (auto h : images) factory->ReleaseImage(h);
-                                         });
+        if (!m_PendingRetiredImages.empty() ||
+            !m_PendingRetiredImageViews.empty() ||
+            !m_PendingRetiredSharedHandles.empty())
+        {
+            ThrowInvalidState(
+                "RHIVkSwapChain::RecreateSwapChainIfNeeded",
+                "RHIVkSwapChain",
+                reinterpret_cast<uint64_t>(this),
+                "A previous virtual generation still awaits deferred-retirement publication");
+        }
+
+        m_PendingRetiredImages = std::move(oldImages);
+        m_PendingRetiredImageViews = std::move(oldImageViews);
+        m_PendingRetiredSharedHandles = std::move(oldSharedHandles);
+        m_PendingRetiredGraphicsTicket = m_LastOwnedGraphicsTicket;
+        PublishPendingRetirement();
     }
 }

@@ -5,6 +5,7 @@
 #include "Core/RHIVkDevice.h"
 #include "Logger/Logger.h"
 #include "Utils/RHIVkInitializer.h"
+#include "Definitions/RHIVkError.h"
 // #include "RHI/Memory/ImageView.h"
 #include <thread>
 #include <chrono>
@@ -39,8 +40,26 @@ namespace
 }
 
 ArisenEngine::RHI::RHIVkDescriptorPool::RHIVkDescriptorPool(RHIVkDevice* device):
-    m_pDevice(device)
+    RHIDescriptorPool(device), m_pDevice(device)
 {
+}
+
+bool ArisenEngine::RHI::RHIVkDescriptorPool::IsPoolAlive(UInt32 poolId) const
+{
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    return poolId < m_DescriptorSetsHolder.size() &&
+        m_DescriptorSetsHolder[poolId].RHIDescriptorPool != VK_NULL_HANDLE;
+}
+
+bool ArisenEngine::RHI::RHIVkDescriptorPool::IsDescriptorSetAlive(UInt32 poolId, UInt32 setIndex) const
+{
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    return poolId < m_DescriptorSetsHolder.size() &&
+        poolId < m_PoolResetInProgress.size() &&
+        m_PoolResetInProgress[poolId] == 0 &&
+        m_DescriptorSetsHolder[poolId].RHIDescriptorPool != VK_NULL_HANDLE &&
+        setIndex < m_DescriptorSetsHolder[poolId].sets.size() &&
+        m_DescriptorSetsHolder[poolId].sets[setIndex] != nullptr;
 }
 
 ArisenEngine::RHI::RHIVkDescriptorPool::~RHIVkDescriptorPool()
@@ -70,130 +89,176 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDescriptorPool::AddPool(Containers:
             descriptorSetsHolder.poolSizes.size(),
             descriptorSetsHolder.poolSizes.data(), maxSets);
 
-    if (vkCreateDescriptorPool(static_cast<VkDevice>(m_pDevice->GetHandle()),
-                               &poolInfo, nullptr, &descriptorSetsHolder.RHIDescriptorPool) != VK_SUCCESS)
+    const VkDevice device = static_cast<VkDevice>(m_pDevice->GetHandle());
+    auto pendingPool = std::make_unique<DeferredVkDescriptorPool>();
+    pendingPool->device = device;
+    CheckVkResult(vkCreateDescriptorPool(device, &poolInfo, nullptr, &pendingPool->pool),
+                  "vkCreateDescriptorPool", "VkDevice", GetVkObjectIdentity(device));
+    descriptorSetsHolder.RHIDescriptorPool = pendingPool->pool;
+
+    const size_t holderCount = m_DescriptorSetsHolder.size();
+    const size_t ticketCount = m_PoolLatestTicket.size();
+    const size_t rotationCount = m_PoolOutstandingRotations.size();
+    const size_t pendingUseCount = m_PoolPendingUses.size();
+    const size_t resetStateCount = m_PoolResetInProgress.size();
+    try
     {
-        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::AddPool] failed to create descriptor pool!");
+        m_DescriptorSetsHolder.emplace_back(descriptorSetsHolder);
+        m_PoolLatestTicket.emplace_back(RHIDeletionDependencies{});
+        m_PoolOutstandingRotations.emplace_back(0);
+        m_PoolPendingUses.emplace_back(0);
+        m_PoolResetInProgress.emplace_back(0);
+    }
+    catch (...)
+    {
+        if (m_PoolResetInProgress.size() > resetStateCount) m_PoolResetInProgress.pop_back();
+        if (m_PoolPendingUses.size() > pendingUseCount) m_PoolPendingUses.pop_back();
+        if (m_PoolOutstandingRotations.size() > rotationCount) m_PoolOutstandingRotations.pop_back();
+        if (m_PoolLatestTicket.size() > ticketCount) m_PoolLatestTicket.pop_back();
+        if (m_DescriptorSetsHolder.size() > holderCount) m_DescriptorSetsHolder.pop_back();
+        throw;
     }
 
-    m_DescriptorSetsHolder.emplace_back(descriptorSetsHolder);
-    m_PoolLatestTicket.emplace_back(RHIDeletionDependencies{});
-    m_PoolOutstandingRotations.emplace_back(0);
+    pendingPool->pool = VK_NULL_HANDLE;
 
     return m_DescriptorSetsHolder.size() - 1;
 }
 
 bool ArisenEngine::RHI::RHIVkDescriptorPool::ResetPool(UInt32 poolId)
 {
-    // We intentionally avoid holding m_Mutex while calling queue->Update(),
-    // because Update() may flush deferred deletions which can call back into this pool.
     std::unique_lock<std::mutex> lock(m_Mutex);
-    if (poolId >= m_DescriptorSetsHolder.size())
-    {
-        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::ResetPool] poolId out of range: " + std::to_string(poolId));
-    }
-    auto& holder = m_DescriptorSetsHolder[poolId];
-    VkDescriptorPool pool = holder.RHIDescriptorPool;
-    if (pool == VK_NULL_HANDLE)
-    {
-        LOG_FATAL_AND_THROW(
-            "[RHIVkDescriptorPool::ResetPool] RHIDescriptorPool is VK_NULL_HANDLE for poolId: " + std::to_string(poolId
-            ));
-    }
+    constexpr UInt32 MaxOutstandingRotations = 8;
 
-    // Non-blocking, GPU-safe reset strategy:
-    // - If GPU has finished using this poolId (completed >= latestTicket), we can vkResetDescriptorPool immediately.
-    // - Otherwise, rotate to a fresh VkDescriptorPool for this poolId and defer-destroy the old pool at latestTicket.
-    const auto& latestDeps = (poolId < m_PoolLatestTicket.size()) ? m_PoolLatestTicket[poolId] : RHIDeletionDependencies{};
-    
-    bool canResetNow = true;
-    for (int i = 0; i < 4; ++i)
+    for (;;)
     {
-        if (latestDeps.tickets[i] == 0) continue;
-        auto* queue = m_pDevice->GetQueue((RHIQueueType)i);
-        if (!queue || queue->GetCompletedTicket() < latestDeps.tickets[i])
+        if (poolId >= m_DescriptorSetsHolder.size())
         {
-            canResetNow = false;
-            break;
+            LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::ResetPool] poolId out of range: " +
+                                std::to_string(poolId));
         }
-    }
-
-    if (!canResetNow)
-    {
-        // Cap the number of outstanding rotated pools to avoid unbounded growth when GPU is far behind.
-        // When the cap is reached, we fall back to a bounded wait (rare).
-        const UInt32 outstanding = (poolId < m_PoolOutstandingRotations.size())
-                                       ? m_PoolOutstandingRotations[poolId]
-                                       : 0;
-        const UInt32 maxOutstanding = 8; // heuristic; future: tie to maxFramesInFlight
-
-        if (outstanding >= maxOutstanding)
+        if (poolId >= m_PoolLatestTicket.size() ||
+            poolId >= m_PoolOutstandingRotations.size() ||
+            poolId >= m_PoolPendingUses.size() ||
+            poolId >= m_PoolResetInProgress.size())
         {
+            ThrowInvalidState("RHIVkDescriptorPool::ResetPool", "RHIDescriptorPool", poolId,
+                              "Logical descriptor-pool ownership state is incomplete");
+        }
+
+        auto& holder = m_DescriptorSetsHolder[poolId];
+        if (holder.RHIDescriptorPool == VK_NULL_HANDLE)
+        {
+            LOG_FATAL_AND_THROW(
+                "[RHIVkDescriptorPool::ResetPool] RHIDescriptorPool is VK_NULL_HANDLE for poolId: " +
+                std::to_string(poolId));
+        }
+        if (m_PoolResetInProgress[poolId] != 0 || m_PoolPendingUses[poolId] != 0)
+            return false;
+
+        const RHIDeletionDependencies latestDeps = m_PoolLatestTicket[poolId];
+        bool canResetNow = true;
+        for (int i = 0; i < 4; ++i)
+        {
+            if (latestDeps.tickets[i] == 0) continue;
+            auto* queue = m_pDevice->GetQueue(static_cast<RHIQueueType>(i));
+            if (!queue || queue->GetCompletedTicket() < latestDeps.tickets[i])
+            {
+                canResetNow = false;
+                break;
+            }
+        }
+
+        if (!canResetNow && m_PoolOutstandingRotations[poolId] >= MaxOutstandingRotations)
+        {
+            m_PoolResetInProgress[poolId] = 1;
+            const BeforeResetWaitHook beforeWaitHook = m_BeforeResetWaitHook;
+            void* const beforeWaitContext = m_BeforeResetWaitHookContext;
             lock.unlock();
-            for (int i = 0; i < 4; ++i)
+
+            try
             {
-                if (latestDeps.tickets[i] == 0) continue;
-                auto* queue = m_pDevice->GetQueue((RHIQueueType)i);
-                if (queue) queue->WaitForTicket(latestDeps.tickets[i]);
+                if (beforeWaitHook)
+                    beforeWaitHook(beforeWaitContext);
+
+                for (int i = 0; i < 4; ++i)
+                {
+                    if (latestDeps.tickets[i] == 0) continue;
+                    auto* queue = m_pDevice->GetQueue(static_cast<RHIQueueType>(i));
+                    if (!queue)
+                    {
+                        ThrowInvalidState("RHIVkDescriptorPool::ResetPool", "RHIDescriptorPool", poolId,
+                                          "Queue dependency disappeared while reset was waiting");
+                    }
+                    queue->WaitForTicket(latestDeps.tickets[i]);
+                }
             }
+            catch (...)
+            {
+                lock.lock();
+                if (poolId < m_PoolResetInProgress.size())
+                    m_PoolResetInProgress[poolId] = 0;
+                throw;
+            }
+
             lock.lock();
-            pool = holder.RHIDescriptorPool;
+            if (poolId >= m_PoolResetInProgress.size())
+            {
+                ThrowInvalidState("RHIVkDescriptorPool::ResetPool", "RHIDescriptorPool", poolId,
+                                  "Logical descriptor-pool reset state disappeared while waiting");
+            }
+            m_PoolResetInProgress[poolId] = 0;
+            continue;
         }
-        else
+
+        if (!canResetNow)
         {
-            // Create a new pool with the same sizes/maxSets for continued allocations this frame.
-            VkDescriptorPoolCreateInfo poolInfo =
-                DescriptorPoolCreateInfo(
-                    holder.poolSizes.size(),
-                    holder.poolSizes.data(),
-                    holder.maxSets);
+            VkDescriptorPoolCreateInfo poolInfo = DescriptorPoolCreateInfo(
+                holder.poolSizes.size(), holder.poolSizes.data(), holder.maxSets);
 
-            VkDescriptorPool newPool = VK_NULL_HANDLE;
-            if (vkCreateDescriptorPool(static_cast<VkDevice>(m_pDevice->GetHandle()),
-                                       &poolInfo, nullptr, &newPool) != VK_SUCCESS)
-            {
-                LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::ResetPool] failed to create replacement descriptor pool!");
-            }
+            const VkDevice device = static_cast<VkDevice>(m_pDevice->GetHandle());
+            auto newPool = std::make_unique<DeferredVkDescriptorPool>();
+            newPool->device = device;
+            CheckVkResult(vkCreateDescriptorPool(device, &poolInfo, nullptr, &newPool->pool),
+                          "vkCreateDescriptorPool", "VkDevice", GetVkObjectIdentity(device),
+                          UINT32_MAX, 0, "Descriptor pool rotation");
 
-            // Defer destruction of the old pool at the last-used ticket.
-            if (m_pDevice)
+            auto oldPool = std::make_unique<DeferredVkDescriptorPoolWithCallback>();
+            oldPool->device = device;
+            oldPool->pool = holder.RHIDescriptorPool;
+            oldPool->owner = this;
+            oldPool->poolId = poolId;
+            ++m_PoolOutstandingRotations[poolId];
+            try
             {
-                auto* deferred = new DeferredVkDescriptorPoolWithCallback{
-                    static_cast<VkDevice>(m_pDevice->GetHandle()),
-                    pool,
-                    this,
-                    poolId,
-                };
-                if (poolId < m_PoolOutstandingRotations.size()) m_PoolOutstandingRotations[poolId] += 1;
-                m_pDevice->DeferredDelete(latestDeps, MakeDeferredDeleteItem(deferred));
+                m_pDevice->DeferredDelete(latestDeps, MakeDeferredDeleteItem(oldPool.get()));
             }
-            else
+            catch (...)
             {
-                vkDestroyDescriptorPool(static_cast<VkDevice>(m_pDevice->GetHandle()), pool, nullptr);
+                --m_PoolOutstandingRotations[poolId];
+                oldPool->pool = VK_NULL_HANDLE;
+                oldPool->owner = nullptr;
+                throw;
             }
+            oldPool.release();
 
-            holder.RHIDescriptorPool = newPool;
+            holder.RHIDescriptorPool = newPool->pool;
+            newPool->pool = VK_NULL_HANDLE;
             m_PoolLatestTicket[poolId] = RHIDeletionDependencies{};
             holder.sets.clear();
-            holder.freeSets.clear(); // Clear free sets derived from old pool
+            holder.freeSets.clear();
             return true;
         }
+
+        CheckVkResult(vkResetDescriptorPool(static_cast<VkDevice>(m_pDevice->GetHandle()),
+                                            holder.RHIDescriptorPool, 0),
+                      "vkResetDescriptorPool", "VkDescriptorPool",
+                      GetVkObjectIdentity(holder.RHIDescriptorPool));
+
+        m_PoolLatestTicket[poolId] = RHIDeletionDependencies{};
+        holder.sets.clear();
+        holder.freeSets.clear();
+        return true;
     }
-
-    VkResult result = vkResetDescriptorPool(static_cast<VkDevice>(m_pDevice->GetHandle()), holder.RHIDescriptorPool, 0);
-    if (result != VK_SUCCESS)
-    {
-        LOG_ERROR(
-            "[RHIVkDescriptorPool::ResetPool] Failed to reset descriptor pool, VkResult: " + std::to_string(static_cast<
-                int>(result)));
-        return false;
-    }
-
-    m_PoolLatestTicket[poolId] = RHIDeletionDependencies{};
-    holder.sets.clear();
-    holder.freeSets.clear();
-
-    return true;
 }
 
 void ArisenEngine::RHI::RHIVkDescriptorPool::OnDeferredPoolDestroyed(UInt32 poolId)
@@ -203,18 +268,123 @@ void ArisenEngine::RHI::RHIVkDescriptorPool::OnDeferredPoolDestroyed(UInt32 pool
     if (m_PoolOutstandingRotations[poolId] > 0) m_PoolOutstandingRotations[poolId] -= 1;
 }
 
-void ArisenEngine::RHI::RHIVkDescriptorPool::MarkPoolUsed(UInt32 poolId, RHIQueueType queue, RHIGpuTicket ticket)
+bool ArisenEngine::RHI::RHIVkDescriptorPool::CaptureDescriptorSets(
+    UInt32 poolId,
+    UInt32 setIndex,
+    bool singleSet,
+    Containers::Vector<VkDescriptorSet>& descriptorSets,
+    bool acquirePendingUse)
 {
     std::lock_guard<std::mutex> lock(m_Mutex);
-    if (poolId >= m_PoolLatestTicket.size()) return;
-    auto& deps = m_PoolLatestTicket[poolId];
-    int queueIdx = (int)queue;
-    if (queueIdx >= 0 && queueIdx < 4)
+    if (poolId >= m_DescriptorSetsHolder.size() ||
+        poolId >= m_PoolPendingUses.size() ||
+        poolId >= m_PoolResetInProgress.size() ||
+        m_DescriptorSetsHolder[poolId].RHIDescriptorPool == VK_NULL_HANDLE)
     {
-        if (ticket > deps.tickets[queueIdx])
+        ThrowInvalidHandle("RHIVkDescriptorPool::CaptureDescriptorSets", "RHIDescriptorPool",
+                           poolId, 0, "Logical descriptor pool is not live");
+    }
+    if (m_PoolResetInProgress[poolId] != 0)
+    {
+        ThrowInvalidState("RHIVkDescriptorPool::CaptureDescriptorSets", "RHIDescriptorPool",
+                          poolId, "Logical descriptor pool reset is in progress");
+    }
+
+    const auto& sets = m_DescriptorSetsHolder[poolId].sets;
+    descriptorSets.clear();
+    if (singleSet)
+    {
+        if (setIndex >= sets.size() || !sets[setIndex])
         {
-            deps.tickets[queueIdx] = ticket;
+            ThrowInvalidHandle("RHIVkDescriptorPool::CaptureDescriptorSets", "RHIDescriptorSet",
+                               setIndex, 0, "Descriptor set is not live");
         }
+        descriptorSets.reserve(1);
+        descriptorSets.emplace_back(static_cast<VkDescriptorSet>(sets[setIndex]->GetHandle()));
+    }
+    else
+    {
+        descriptorSets.reserve(sets.size());
+        for (const auto& set : sets)
+        {
+            if (!set)
+            {
+                ThrowInvalidState("RHIVkDescriptorPool::CaptureDescriptorSets", "RHIDescriptorSet",
+                                  setIndex, "Descriptor pool contains a null descriptor set");
+            }
+            descriptorSets.emplace_back(static_cast<VkDescriptorSet>(set->GetHandle()));
+        }
+    }
+
+    if (descriptorSets.empty())
+        return false;
+
+    if (acquirePendingUse)
+        ++m_PoolPendingUses[poolId];
+    return true;
+}
+
+void ArisenEngine::RHI::RHIVkDescriptorPool::AcquirePoolUse(UInt32 poolId)
+{
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    if (poolId >= m_DescriptorSetsHolder.size() ||
+        poolId >= m_PoolPendingUses.size() ||
+        poolId >= m_PoolResetInProgress.size() ||
+        m_DescriptorSetsHolder[poolId].RHIDescriptorPool == VK_NULL_HANDLE)
+    {
+        ThrowInvalidHandle("RHIVkDescriptorPool::AcquirePoolUse", "RHIDescriptorPool",
+                           poolId, 0, "Logical descriptor pool is not live");
+    }
+    if (m_PoolResetInProgress[poolId] != 0)
+    {
+        ThrowInvalidState("RHIVkDescriptorPool::AcquirePoolUse", "RHIDescriptorPool",
+                          poolId, "Logical descriptor pool reset is in progress");
+    }
+    ++m_PoolPendingUses[poolId];
+}
+
+bool ArisenEngine::RHI::RHIVkDescriptorPool::ReleasePoolUse(UInt32 poolId) noexcept
+{
+    try
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        if (poolId >= m_PoolPendingUses.size() || m_PoolPendingUses[poolId] == 0)
+            return false;
+        --m_PoolPendingUses[poolId];
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+bool ArisenEngine::RHI::RHIVkDescriptorPool::CommitPoolUse(
+    UInt32 poolId,
+    RHIQueueType queue,
+    RHIGpuTicket ticket) noexcept
+{
+    try
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        const int queueIndex = static_cast<int>(queue);
+        if (poolId >= m_PoolLatestTicket.size() ||
+            poolId >= m_PoolPendingUses.size() ||
+            m_PoolPendingUses[poolId] == 0 ||
+            queueIndex < 0 || queueIndex >= 4 ||
+            ticket == 0)
+        {
+            return false;
+        }
+        auto& latestTicket = m_PoolLatestTicket[poolId].tickets[queueIndex];
+        if (ticket > latestTicket)
+            latestTicket = ticket;
+        --m_PoolPendingUses[poolId];
+        return true;
+    }
+    catch (...)
+    {
+        return false;
     }
 }
 
@@ -233,9 +403,23 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDescriptorPool::AllocDescriptorSet(
             "[RHIVkDescriptorPool::AllocDescriptorSet] RHIDescriptorPool is VK_NULL_HANDLE for poolId: " + std::
             to_string(poolId));
     }
+    if (poolId >= m_PoolResetInProgress.size() || m_PoolResetInProgress[poolId] != 0)
+    {
+        ThrowInvalidState("RHIVkDescriptorPool::AllocDescriptorSet", "RHIDescriptorPool",
+                          poolId, "Logical descriptor pool reset is in progress");
+    }
     if (pso == nullptr)
     {
         LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::AllocDescriptorSet] pso is null");
+    }
+    if (pso->GetOwnerDevice() != GetOwnerDevice())
+    {
+        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::AllocDescriptorSet] pso belongs to another device");
+    }
+    if (!pso->IsDescriptorSetLayoutAlive(layoutIndex))
+    {
+        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::AllocDescriptorSet] layoutIndex is not live: " +
+                            std::to_string(layoutIndex));
     }
 
     RHIVkGPUPipelineStateObject* vkPipelineStateObject = static_cast<RHIVkGPUPipelineStateObject*>(pso);
@@ -266,7 +450,14 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDescriptorPool::AllocDescriptorSet(
 
         if (res != VK_SUCCESS)
         {
-            // Fallback to single allocation to see if it works (often due to pool fragmentation or reaching exact limit)
+            if (res != VK_ERROR_OUT_OF_POOL_MEMORY && res != VK_ERROR_FRAGMENTED_POOL)
+            {
+                CheckVkResult(res, "vkAllocateDescriptorSets", "VkDescriptorPool",
+                              GetVkObjectIdentity(holder.RHIDescriptorPool), UINT32_MAX, 0,
+                              "Batch descriptor-set allocation failed");
+            }
+
+            // Pool capacity/fragmentation may still permit one final set.
             VkDescriptorSetAllocateInfo singleAllocInfo = descriptorSetAllocateInfo;
             singleAllocInfo.descriptorSetCount = 1;
 
@@ -276,9 +467,9 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDescriptorPool::AllocDescriptorSet(
 
             if (res != VK_SUCCESS)
             {
-                LOG_FATAL_AND_THROW(
-                    "[RHIVkDescriptorPool::AllocDescriptorSet] failed to allocate descriptor sets (batch and single fallback)! VkResult: "
-                    + std::to_string(static_cast<int>(res)));
+                CheckVkResult(res, "vkAllocateDescriptorSets", "VkDescriptorPool",
+                              GetVkObjectIdentity(holder.RHIDescriptorPool), UINT32_MAX, 0,
+                              "Single-set fallback after batch allocation failed");
             }
 
             freeList.push_back(singleSet);
@@ -303,17 +494,35 @@ ArisenEngine::UInt32 ArisenEngine::RHI::RHIVkDescriptorPool::AllocDescriptorSet(
 ArisenEngine::RHI::RHIDescriptorSet* ArisenEngine::RHI::RHIVkDescriptorPool::GetDescriptorSet(UInt32 poolId,
     UInt32 setIndex)
 {
-    ASSERT(poolId < m_DescriptorSetsHolder.size());
-    ASSERT(setIndex < m_DescriptorSetsHolder[poolId].sets.size());
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    if (poolId >= m_DescriptorSetsHolder.size())
+        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::GetDescriptorSet] poolId out of range: " +
+                            std::to_string(poolId));
+    if (poolId >= m_PoolResetInProgress.size() || m_PoolResetInProgress[poolId] != 0)
+    {
+        ThrowInvalidState("RHIVkDescriptorPool::GetDescriptorSet", "RHIDescriptorPool",
+                          poolId, "Logical descriptor pool reset is in progress");
+    }
+    if (setIndex >= m_DescriptorSetsHolder[poolId].sets.size())
+        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::GetDescriptorSet] setIndex out of range: " +
+                            std::to_string(setIndex));
 
     return m_DescriptorSetsHolder[poolId].sets[setIndex].get();
 }
 
-const ArisenEngine::Containers::Vector<std::shared_ptr<ArisenEngine::RHI::RHIDescriptorSet>>&
+ArisenEngine::Containers::Vector<std::shared_ptr<ArisenEngine::RHI::RHIDescriptorSet>>
 ArisenEngine::RHI::RHIVkDescriptorPool::
 GetDescriptorSets(UInt32 poolId)
 {
-    ASSERT(poolId < m_DescriptorSetsHolder.size());
+    std::lock_guard<std::mutex> lock(m_Mutex);
+    if (poolId >= m_DescriptorSetsHolder.size())
+        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::GetDescriptorSets] poolId out of range: " +
+                            std::to_string(poolId));
+    if (poolId >= m_PoolResetInProgress.size() || m_PoolResetInProgress[poolId] != 0)
+    {
+        ThrowInvalidState("RHIVkDescriptorPool::GetDescriptorSets", "RHIDescriptorPool",
+                          poolId, "Logical descriptor pool reset is in progress");
+    }
     return m_DescriptorSetsHolder[poolId].sets;
 }
 
@@ -486,6 +695,7 @@ const VkAccelerationStructureKHR* ArisenEngine::RHI::RHIVkDescriptorPool::GetAcc
 
 void ArisenEngine::RHI::RHIVkDescriptorPool::UpdateDescriptorSets(UInt32 poolId, RHIPipelineState* pso)
 {
+    std::lock_guard<std::mutex> lock(m_Mutex);
     if (poolId >= m_DescriptorSetsHolder.size())
     {
         LOG_FATAL_AND_THROW(
@@ -497,9 +707,18 @@ void ArisenEngine::RHI::RHIVkDescriptorPool::UpdateDescriptorSets(UInt32 poolId,
             "[RHIVkDescriptorPool::UpdateDescriptorSets] RHIDescriptorPool is VK_NULL_HANDLE for poolId: " + std::
             to_string(poolId));
     }
+    if (poolId >= m_PoolResetInProgress.size() || m_PoolResetInProgress[poolId] != 0)
+    {
+        ThrowInvalidState("RHIVkDescriptorPool::UpdateDescriptorSets", "RHIDescriptorPool",
+                          poolId, "Logical descriptor pool reset is in progress");
+    }
     if (pso == nullptr)
     {
         LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::UpdateDescriptorSets] pso is null");
+    }
+    if (pso->GetOwnerDevice() != GetOwnerDevice())
+    {
+        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::UpdateDescriptorSets] pso belongs to another device");
     }
 
     auto descriptorSets = m_DescriptorSetsHolder[poolId].sets;
@@ -593,17 +812,29 @@ void ArisenEngine::RHI::RHIVkDescriptorPool::UpdateDescriptorSets(UInt32 poolId,
 void ArisenEngine::RHI::RHIVkDescriptorPool::UpdateDescriptorSet(UInt32 poolId, UInt32 setIndex,
                                                                  RHIPipelineState* pso)
 {
-    // Use m_Mutex to protect shared_ptr access if Alloc is concurrent
+    if (pso == nullptr)
+        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::UpdateDescriptorSet] pso is null");
+    if (pso->GetOwnerDevice() != GetOwnerDevice())
+        LOG_FATAL_AND_THROW("[RHIVkDescriptorPool::UpdateDescriptorSet] pso belongs to another device");
+
+    std::lock_guard<std::mutex> lock(m_Mutex);
     std::shared_ptr<RHIDescriptorSet> descriptorSetPtr;
+    if (poolId >= m_DescriptorSetsHolder.size())
     {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        if (setIndex >= m_DescriptorSetsHolder[poolId].sets.size())
-        {
-            LOG_FATAL_AND_THROW(
-                "[RHIVkDescriptorPool::UpdateDescriptorSet] setIndex out of range: " + std::to_string(setIndex));
-        }
-        descriptorSetPtr = m_DescriptorSetsHolder[poolId].sets[setIndex];
+        LOG_FATAL_AND_THROW(
+            "[RHIVkDescriptorPool::UpdateDescriptorSet] poolId out of range: " + std::to_string(poolId));
     }
+    if (poolId >= m_PoolResetInProgress.size() || m_PoolResetInProgress[poolId] != 0)
+    {
+        ThrowInvalidState("RHIVkDescriptorPool::UpdateDescriptorSet", "RHIDescriptorPool",
+                          poolId, "Logical descriptor pool reset is in progress");
+    }
+    if (setIndex >= m_DescriptorSetsHolder[poolId].sets.size())
+    {
+        LOG_FATAL_AND_THROW(
+            "[RHIVkDescriptorPool::UpdateDescriptorSet] setIndex out of range: " + std::to_string(setIndex));
+    }
+    descriptorSetPtr = m_DescriptorSetsHolder[poolId].sets[setIndex];
 
     auto descriptorSet = descriptorSetPtr.get();
     if (descriptorSet == nullptr)

@@ -54,6 +54,9 @@ namespace ArisenEngine::RHI
         void UpdateDescriptorSet(UInt32 layoutIndex, UInt32 binding,
                                  const Containers::Vector<RHIAccelerationStructureHandle>&&
                                  accelerationStructureHandles) override;
+        bool TryGetDescriptorBinding(UInt32 layoutIndex, UInt32 binding,
+                                     EDescriptorType& type, UInt32& count) const override;
+        bool IsDescriptorSetLayoutAlive(UInt32 layoutIndex) const override;
 
         void BuildDescriptorSetLayout() override;
 
@@ -80,7 +83,9 @@ namespace ArisenEngine::RHI
         void ClearDescriptorSetLayoutBindings() override;
 
         VkDescriptorUpdateTemplate GetVkDescriptorUpdateTemplate(UInt32 layoutIndex) const;
-        void BuildDescriptorUpdateTemplate(UInt32 layoutIndex);
+        VkDescriptorUpdateTemplate CreateDescriptorUpdateTemplate(
+            UInt32 layoutIndex,
+            VkDescriptorSetLayout descriptorSetLayout);
 
     private:
         RHIVkDevice* m_Device;

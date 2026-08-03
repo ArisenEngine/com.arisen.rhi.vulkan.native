@@ -24,9 +24,9 @@ namespace ArisenEngine::RHI
         UInt32 RegisterBuffer(RHIBufferHandle buffer);
         UInt32 RegisterSampler(RHISamplerHandle sampler);
 
-        void UnregisterImage(UInt32 index);
-        void UnregisterBuffer(UInt32 index);
-        void UnregisterSampler(UInt32 index);
+        bool UnregisterImage(UInt32 index);
+        bool UnregisterBuffer(UInt32 index);
+        bool UnregisterSampler(UInt32 index);
 
         VkDescriptorSetLayout GetDescriptorSetLayout() const { return m_DescriptorSetLayout; }
         VkDescriptorSet GetDescriptorSet() const { return m_DescriptorSet; }
@@ -40,6 +40,7 @@ namespace ArisenEngine::RHI
         struct FreeList
         {
             Containers::Vector<UInt32> freeIndices;
+            Containers::Vector<UInt8> allocated;
             UInt32 nextIndex = 0;
             UInt32 capacity = 0;
             std::mutex mutex;
@@ -50,7 +51,7 @@ namespace ArisenEngine::RHI
         FreeList m_BufferFreeList;
 
         UInt32 AcquireIndex(FreeList& list);
-        void ReleaseIndex(FreeList& list, UInt32 index);
+        bool ReleaseIndex(FreeList& list, UInt32 index);
 
         static constexpr UInt32 MAX_BINDLESS_IMAGES = 65536;
         static constexpr UInt32 MAX_BINDLESS_SAMPLERS = 2048;

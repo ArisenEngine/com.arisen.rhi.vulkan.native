@@ -29,6 +29,8 @@ namespace ArisenEngine::RHI
     class RHIVkDescriptorPool final : public RHI::RHIDescriptorPool
     {
     public:
+        using BeforeResetWaitHook = void (*)(void*) noexcept;
+
         NO_COPY_NO_MOVE_NO_DEFAULT(RHIVkDescriptorPool)
         RHIVkDescriptorPool(RHIVkDevice* device);
         virtual ~RHIVkDescriptorPool() override;
@@ -42,14 +44,28 @@ namespace ArisenEngine::RHI
         bool ResetPool(UInt32 poolId) override;
         UInt32 AllocDescriptorSet(UInt32 poolId, UInt32 layoutIndex, RHIPipelineState* pso) override;
         RHIDescriptorSet* GetDescriptorSet(UInt32 poolId, UInt32 setIndex) override;
-        const Containers::Vector<std::shared_ptr<RHIDescriptorSet>>& GetDescriptorSets(UInt32 poolId) override;
+        Containers::Vector<std::shared_ptr<RHIDescriptorSet>> GetDescriptorSets(UInt32 poolId) override;
         void UpdateDescriptorSets(UInt32 poolId, RHIPipelineState* pso) override;
         void UpdateDescriptorSet(UInt32 poolId, UInt32 setIndex, RHIPipelineState* pso) override;
+        bool IsPoolAlive(UInt32 poolId) const override;
+        bool IsDescriptorSetAlive(UInt32 poolId, UInt32 setIndex) const override;
 
-        // Called by queue submit to mark that a poolId's descriptor sets were used by a given submit ticket.
-        void MarkPoolUsed(UInt32 poolId, RHIQueueType queue, RHIGpuTicket ticket);
+        bool CaptureDescriptorSets(UInt32 poolId, UInt32 setIndex, bool singleSet,
+                                   Containers::Vector<VkDescriptorSet>& descriptorSets,
+                                   bool acquirePendingUse);
+        void AcquirePoolUse(UInt32 poolId);
+        bool ReleasePoolUse(UInt32 poolId) noexcept;
+        bool CommitPoolUse(UInt32 poolId, RHIQueueType queue, RHIGpuTicket ticket) noexcept;
         // Internal: called by deferred descriptor-pool destructor to decrement rotation counters.
         void OnDeferredPoolDestroyed(UInt32 poolId);
+
+        void SetBeforeResetWaitHookForTesting(BeforeResetWaitHook hook, void* context)
+        {
+            std::lock_guard<std::mutex> lock(m_Mutex);
+            m_BeforeResetWaitHook = hook;
+            m_BeforeResetWaitHookContext = context;
+        }
+
         // Internal helpers for descriptor updates (moved from global scope to access Device internals via friendship)
         static const VkDescriptorImageInfo* GetImageInfos(RHIVkDevice* device,
                                                           const RHIDescriptorUpdateInfo& updateInfo,
@@ -71,6 +87,10 @@ namespace ArisenEngine::RHI
         ArisenEngine::Containers::Vector<RHIVkDescriptorSetsHolder> m_DescriptorSetsHolder{};
         ArisenEngine::Containers::Vector<RHIDeletionDependencies> m_PoolLatestTicket{};
         ArisenEngine::Containers::Vector<UInt32> m_PoolOutstandingRotations{};
-        std::mutex m_Mutex;
+        ArisenEngine::Containers::Vector<UInt32> m_PoolPendingUses{};
+        ArisenEngine::Containers::Vector<UInt8> m_PoolResetInProgress{};
+        BeforeResetWaitHook m_BeforeResetWaitHook{nullptr};
+        void* m_BeforeResetWaitHookContext{nullptr};
+        mutable std::mutex m_Mutex;
     };
 }
