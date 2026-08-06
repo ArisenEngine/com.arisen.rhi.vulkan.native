@@ -15,6 +15,7 @@
 #include "Descriptors/RHIVkBindlessManager.h"
 #include "RenderPass/RHIVkGPURenderPass.h"
 #include "Commands/RHIVkCommandBuffer.h"
+#include "Commands/RHIVkCommandBufferPool.h"
 #include "Pipeline/RHIVkGPUPipeline.h"
 #include "Pipeline/RHIVkGPUPipelineStateObject.h"
 #include "Commands/RHIVkCommandBuffer.h"
@@ -26,6 +27,9 @@
 #include <vulkan/vulkan_win32.h>
 #include "Presentation/RHIVkSurface.h"
 #include "Definitions/RHIVkError.h"
+
+#include <exception>
+#include <unordered_map>
 
 using namespace ArisenEngine::RHI;
 
@@ -262,25 +266,39 @@ ArisenEngine::RHI::RHIVkDevice::RHIVkDevice(RHIInstance* instance, RHISurface* s
         item->name = "DefaultDescriptorPool";
     });
     m_MemoryPoolPool = std::make_unique<RHIResourcePool<RHIMemoryPoolHandle, RHIVkMemoryPoolPoolItem>>();
+
+    std::unordered_map<VkQueue, std::shared_ptr<std::mutex>> rawQueueMutexes;
+    const auto getRawQueueMutex = [&](VkQueue queue)
+    {
+        auto& queueMutex = rawQueueMutexes[queue];
+        if (!queueMutex)
+            queueMutex = std::make_shared<std::mutex>();
+        return queueMutex;
+    };
+
     m_GraphicsQueue = std::make_unique<RHIVkQueue>(this, m_VkDevice, m_VkGraphicQueue, RHIQueueType::Graphics,
-                                                   m_DeferredDeletion.get(), m_ResourceRegistry.get());
+                                                   m_DeferredDeletion.get(), m_ResourceRegistry.get(),
+                                                   getRawQueueMutex(m_VkGraphicQueue));
 
     if (m_VkComputeQueue != VK_NULL_HANDLE)
     {
         m_ComputeQueue = std::make_unique<RHIVkQueue>(this, m_VkDevice, m_VkComputeQueue, RHIQueueType::Compute,
-                                                      m_DeferredDeletion.get(), m_ResourceRegistry.get());
+                                                      m_DeferredDeletion.get(), m_ResourceRegistry.get(),
+                                                      getRawQueueMutex(m_VkComputeQueue));
     }
 
     if (m_VkTransferQueue != VK_NULL_HANDLE)
     {
         m_TransferQueue = std::make_unique<RHIVkQueue>(this, m_VkDevice, m_VkTransferQueue, RHIQueueType::Transfer,
-                                                       m_DeferredDeletion.get(), m_ResourceRegistry.get());
+                                                       m_DeferredDeletion.get(), m_ResourceRegistry.get(),
+                                                       getRawQueueMutex(m_VkTransferQueue));
     }
 
     if (m_VkPresentQueue != VK_NULL_HANDLE)
     {
         m_PresentQueue = std::make_unique<RHIVkQueue>(this, m_VkDevice, m_VkPresentQueue, RHIQueueType::Present,
-                                                      m_DeferredDeletion.get(), m_ResourceRegistry.get());
+                                                      m_DeferredDeletion.get(), m_ResourceRegistry.get(),
+                                                      getRawQueueMutex(m_VkPresentQueue));
     }
 
     const UInt32 maxFramesInFlight = m_Instance->GetMaxFramesInFlight();
@@ -314,6 +332,28 @@ void ArisenEngine::RHI::RHIVkDevice::DeviceWaitIdle() const
     CheckVkResult(vkDeviceWaitIdle(m_VkDevice), "vkDeviceWaitIdle", "RHIVkDevice",
                   reinterpret_cast<uint64_t>(m_VkDevice));
 }
+
+bool ArisenEngine::RHI::RHIVkDevice::EnsureTerminalCompletion() noexcept
+{
+    if (m_TerminalCompletionEstablished)
+        return true;
+
+    const VkResult result = m_VkDevice == VK_NULL_HANDLE
+        ? VK_SUCCESS
+        : vkDeviceWaitIdle(m_VkDevice);
+    if (result == VK_SUCCESS)
+    {
+        m_TerminalCompletionEstablished = true;
+        return true;
+    }
+
+    LOG_ERRORF(
+        "[RHIVkDevice::EnsureTerminalCompletion]: vkDeviceWaitIdle failed with {0} ({1}).",
+        GetVkResultName(result),
+        static_cast<int>(result));
+    return false;
+}
+
 void ArisenEngine::RHI::RHIVkDevice::GraphicQueueWaitIdle() const
 {
     if (m_GraphicsQueue) m_GraphicsQueue->WaitIdle();
@@ -407,6 +447,21 @@ RHIQueue* ArisenEngine::RHI::RHIVkDevice::GetQueue(RHIQueueType type)
         return m_PresentQueue.get();
     }
     return nullptr;
+}
+
+ArisenEngine::RHI::RHIVkQueue*
+ArisenEngine::RHI::RHIVkDevice::GetQueueForVkHandle(VkQueue queue) const noexcept
+{
+    const auto matches = [queue](const std::unique_ptr<RHIQueue>& candidate)
+    {
+        auto* vkQueue = static_cast<RHIVkQueue*>(candidate.get());
+        return vkQueue && vkQueue->GetVkQueue() == queue ? vkQueue : nullptr;
+    };
+
+    if (auto* owner = matches(m_GraphicsQueue)) return owner;
+    if (auto* owner = matches(m_PresentQueue)) return owner;
+    if (auto* owner = matches(m_ComputeQueue)) return owner;
+    return matches(m_TransferQueue);
 }
 
 RHIQueue* ArisenEngine::RHI::RHIVkDevice::GetQueueByFamilyIndex(UInt32 familyIndex)
@@ -1180,18 +1235,14 @@ bool ArisenEngine::RHI::RHIVkDevice::ReleasePipeline(RHIPipelineHandle handle)
 ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
 {
     LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: Start destruction");
-    // 1. Wait for GPU to be idle
-    const VkResult deviceIdleResult = m_VkDevice == VK_NULL_HANDLE
-                                          ? VK_SUCCESS
-                                          : vkDeviceWaitIdle(m_VkDevice);
-    if (deviceIdleResult != VK_SUCCESS)
+    if (!HasTerminalCompletion() && !EnsureTerminalCompletion())
     {
-        LOG_ERRORF("[RHIVkDevice::~RHIVkDevice]: vkDeviceWaitIdle failed with {0} ({1}).",
-                   GetVkResultName(deviceIdleResult), static_cast<int>(deviceIdleResult));
+        LOG_ERROR(
+            "[RHIVkDevice::~RHIVkDevice]: Refusing teardown without successful terminal device completion.");
+        std::terminate();
     }
 
-    // 2. Drain FrameSync to ensure all submitted work is tracked as completed
-    // 2. Drain FrameSync to ensure all submitted work is tracked as completed
+    // 1. Drain FrameSync to ensure all submitted work is tracked as completed
     // (Note: In a multi-queue world, we might want to drain all available queues or rely on DeviceWaitIdle)
     if (m_FrameSync)
     {
@@ -1199,7 +1250,7 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
         m_FrameSync->OnSubmit(0, 0); 
     }
 
-    // 3. Destroy managers that might rely on the device still being alive.
+    // 2. Destroy managers that might rely on the device still being alive.
     // This may explicitly release some resources.
     LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: Deleting managers");
     if (m_GPUPipelineManager)
@@ -1219,22 +1270,6 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
         LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: m_TransferManager reset");
     }
 
-    // Wait for queues to be idle before destroying anything
-    const auto waitQueueNoThrow = [](RHIQueue* queue, const char* queueName)
-    {
-        if (!queue) return;
-        const VkResult result = static_cast<RHIVkQueue*>(queue)->WaitIdleNoThrow();
-        if (result != VK_SUCCESS)
-        {
-            LOG_ERRORF("[RHIVkDevice::~RHIVkDevice]: {0} vkQueueWaitIdle failed with {1} ({2}).",
-                       queueName, GetVkResultName(result), static_cast<int>(result));
-        }
-    };
-    waitQueueNoThrow(m_GraphicsQueue.get(), "graphics");
-    waitQueueNoThrow(m_ComputeQueue.get(), "compute");
-    waitQueueNoThrow(m_TransferQueue.get(), "transfer");
-    waitQueueNoThrow(m_PresentQueue.get(), "present");
-
     m_FrameSync.reset();
 
     // Destroy transfer manager before queues (as it depends on queues and command pools)
@@ -1248,7 +1283,7 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
     m_PresentQueue.reset();
     LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: TransferManager, Sync and Queue objects reset");
 
-    // 4. Shut down the Resource Registry to enqueue all remaining resources for deferred destruction.
+    // 3. Shut down the Resource Registry to enqueue all remaining resources for deferred destruction.
     if (m_ResourceRegistry)
     {
         try
@@ -1271,7 +1306,7 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
         }
     }
 
-    // 5. Flush all deferred deletions now that we know the GPU is idle and all tickets are completed.
+    // 4. Flush all deferred deletions now that terminal completion proves every ticket is complete.
     if (m_DeferredDeletion)
     {
         LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: Flushing deferred deletions");
@@ -1283,13 +1318,13 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
         m_DeferredDeletion->Flush(RHIQueueType::Present, kAll);
     }
 
-    // 6. Now safe to destroy DescriptorPool (after deferred callbacks have completed)
+    // 5. Now safe to destroy DescriptorPool (after deferred callbacks have completed)
     if (m_DescriptorPool)
     {
         m_DescriptorPool.reset();
     }
 
-    // 7. Now safe to destroy the registry object and memory allocator
+    // 6. Now safe to destroy the registry object and memory allocator
     m_ResourceRegistry.reset();
     LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: Resource Registry reset");
 
@@ -1306,7 +1341,7 @@ ArisenEngine::RHI::RHIVkDevice::~RHIVkDevice() noexcept
         LOG_DEBUG("[RHIVkDevice::~RHIVkDevice]: m_Factory deleted");
     }
 
-    // 8. Finally destroy the Vulkan device
+    // 7. Finally destroy the Vulkan device
     if (m_VkDevice != VK_NULL_HANDLE)
     {
         vkDestroyDevice(m_VkDevice, nullptr);
@@ -1396,6 +1431,29 @@ bool ArisenEngine::RHI::RHIVkDevice::ReleaseCommandBufferPool(RHICommandBufferPo
         handle,
         [this, handle](RHIVkCommandBufferPoolItem* item)
         {
+            auto* pool = static_cast<RHIVkCommandBufferPool*>(item->pool);
+            if (!pool)
+            {
+                ThrowInvalidState("RHIVkDevice::ReleaseCommandBufferPool",
+                                  "RHICommandBufferPool", 0,
+                                  "Command buffer pool ownership is unavailable",
+                                  handle.index, handle.generation);
+            }
+
+            const RHIDeletionDependencies dependencies =
+                pool->GetAcceptedSubmissionDependencies();
+            UInt32 queueIndex = 0;
+            for (const RHIGpuTicket ticket : dependencies.tickets)
+            {
+                if (ticket != 0)
+                {
+                    m_ResourceRegistry->UpdateTicket(
+                        item->registryHandle,
+                        static_cast<RHIQueueType>(queueIndex),
+                        ticket);
+                }
+                ++queueIndex;
+            }
             ReleaseRegistryOwnership(*m_ResourceRegistry, item->registryHandle,
                                      "RHIVkDevice::ReleaseCommandBufferPool",
                                      "RHICommandBufferPool", handle);

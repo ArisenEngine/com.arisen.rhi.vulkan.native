@@ -41,6 +41,26 @@ ArisenEngine::RHI::RHIVkCommandBufferPool::~RHIVkCommandBufferPool() noexcept
     }
 }
 
+void ArisenEngine::RHI::RHIVkCommandBufferPool::RecordAcceptedSubmission(
+    RHIQueueType queueType,
+    RHIGpuTicket ticket) noexcept
+{
+    const size_t index = static_cast<size_t>(queueType);
+    if (index >= QUEUE_TYPE_COUNT || ticket == 0)
+        return;
+
+    auto& latestTicket = m_AcceptedSubmitTickets[index];
+    RHIGpuTicket observed = latestTicket.load(std::memory_order_relaxed);
+    while (observed < ticket &&
+           !latestTicket.compare_exchange_weak(
+               observed,
+               ticket,
+               std::memory_order_release,
+               std::memory_order_relaxed))
+    {
+    }
+}
+
 RHICommandBufferHandle ArisenEngine::RHI::RHIVkCommandBufferPool::GetCommandBuffer(
     UInt32 currentFrameIndex, ECommandBufferLevel level)
 {

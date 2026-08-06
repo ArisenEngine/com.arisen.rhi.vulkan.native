@@ -7,6 +7,8 @@ using namespace ArisenEngine::RHI;
 #include "Windowing/RenderWindowAPI.h"
 #include "Windowing/RenderWindowAPI.h"
 
+#include <exception>
+
 namespace
 {
     const char* ToVkPhysicalDeviceTypeName(VkPhysicalDeviceType type)
@@ -1477,25 +1479,49 @@ ArisenEngine::RHI::RHIVkInstance::~RHIVkInstance() noexcept
 {
     LOG_INFO("[RHIVkInstance::~RHIVkInstance]: Start Destroying Vulkan Instance");
 
-    // Explicitly wait for all devices to be idle before cleanup to avoid hangs
+    // Establish one device-wide completion proof before any child ownership is
+    // released. Only VK_SUCCESS is accepted for this teardown contract.
     for (auto& pair : m_LogicalDevices)
     {
-        if (pair.second)
+        if (pair.second && !pair.second->EnsureTerminalCompletion())
         {
-            LOG_INFO(
-                String::Format("[RHIVkInstance::~RHIVkInstance]: Waiting for Logical Device (surface %d) to idle", pair.
-                    first));
-            auto* vkDevice = static_cast<RHIVkDevice*>(pair.second.get());
-            if (vkDevice->GetHandle())
+            LOG_ERRORF(
+                "[RHIVkInstance::~RHIVkInstance]: Refusing teardown because logical device {0} has no terminal completion proof.",
+                pair.first);
+            std::terminate();
+        }
+    }
+
+    LOG_INFO("[RHIVkInstance::~RHIVkInstance]: Preparing Surfaces");
+    for (auto& pair : m_Surfaces)
+    {
+        if (!pair.second)
+            continue;
+
+        try
+        {
+            if (!pair.second->PrepareForReleaseAfterTerminalCompletion())
             {
-                const VkResult idleResult = vkDeviceWaitIdle(static_cast<VkDevice>(vkDevice->GetHandle()));
-                if (idleResult != VK_SUCCESS)
-                {
-                    LOG_ERRORF("[RHIVkInstance::~RHIVkInstance]: vkDeviceWaitIdle failed for surface {0} "
-                               "with {1} ({2}).",
-                               pair.first, GetVkResultName(idleResult), static_cast<int>(idleResult));
-                }
+                LOG_ERRORF(
+                    "[RHIVkInstance::~RHIVkInstance]: Surface {0} retained GPU or external-consumer ownership after terminal completion.",
+                    pair.first);
+                std::terminate();
             }
+        }
+        catch (const std::exception& error)
+        {
+            LOG_ERRORF(
+                "[RHIVkInstance::~RHIVkInstance]: Preparing surface {0} for terminal release failed: {1}",
+                pair.first,
+                error.what());
+            std::terminate();
+        }
+        catch (...)
+        {
+            LOG_ERRORF(
+                "[RHIVkInstance::~RHIVkInstance]: Preparing surface {0} for terminal release failed with an unknown error.",
+                pair.first);
+            std::terminate();
         }
     }
 

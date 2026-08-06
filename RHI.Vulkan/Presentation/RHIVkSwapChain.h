@@ -61,6 +61,51 @@ namespace ArisenEngine::RHI
                 ? lifecycle.state
                 : RHISwapChainFrameState::Idle;
         }
+        RHIGpuTicket GetImageAvailableSemaphoreTicketForTesting(UInt32 frameIndex) const
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+            return m_ImageAvailableSemaphoreTickets[frameIndex % m_MaxFramesInFlight];
+        }
+        RHI_VULKAN_DLL bool IsImageAvailableSemaphoreReusableForTesting(
+            UInt32 frameIndex) const;
+        UInt32 GetAcquiredImageIndexForTesting(UInt32 frameIndex) const
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+            const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+            const auto& lifecycle = m_FrameLifecycles[currentFrame];
+            if (lifecycle.frameIndex != frameIndex ||
+                (lifecycle.state != RHISwapChainFrameState::Acquired &&
+                 lifecycle.state != RHISwapChainFrameState::Submitted &&
+                 lifecycle.state != RHISwapChainFrameState::Presented))
+            {
+                return UINT32_MAX;
+            }
+            return m_AcquiredImageIndices[currentFrame];
+        }
+        UInt32 GetRealSwapChainImageCountForTesting() const
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+            return m_VkSurface != VK_NULL_HANDLE
+                ? static_cast<UInt32>(m_ImageHandles.size())
+                : 0;
+        }
+        UInt32 GetRealPresentWaitSemaphoreCountForTesting() const
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+            return static_cast<UInt32>(m_RealPresentWaitSemaphores.size());
+        }
+        VkQueue GetVkPresentQueueForTesting() const
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+            return m_VkPresentQueue;
+        }
+        RHISemaphoreHandle GetRealPresentWaitSemaphoreForTesting(UInt32 imageIndex) const
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+            return imageIndex < m_RealPresentWaitSemaphores.size()
+                ? m_RealPresentWaitSemaphores[imageIndex]
+                : RHISemaphoreHandle::Invalid();
+        }
         bool RequiresAcquireSemaphoreWait() const { return m_VkSurface != VK_NULL_HANDLE; }
         RHISemaphoreHandle GetExternalConsumerWaitSemaphore(UInt32 frameIndex) const;
         void* GetSharedWin32Handle(UInt32 index) override;
@@ -71,6 +116,7 @@ namespace ArisenEngine::RHI
         void ReleaseConsumedSemaphoreWin32Handle(void* handle) override;
         bool AcknowledgeExternalConsumerRelease() override;
         bool PrepareForSurfaceRelease();
+        bool PrepareForSurfaceReleaseAfterTerminalCompletion();
         void SetResolution(UInt32 width, UInt32 height) override;
         bool TrySetResolution(UInt32 width, UInt32 height) override;
 
@@ -96,6 +142,7 @@ namespace ArisenEngine::RHI
             VkCommandBuffer commandBuffer{VK_NULL_HANDLE};
             RHIGpuTicket previousTicket{0};
             bool terminal{false};
+            bool waitsForAcquire{false};
             bool requiresQueueSubmit{false};
             bool requiresPresent{false};
         };
@@ -137,8 +184,20 @@ namespace ArisenEngine::RHI
             const FrameRetirementPlan& plan) noexcept;
         void CancelFrameRetirement(UInt32 frameIndex) noexcept;
         VkResult PresentRealFrame(UInt32 currentFrame, VkSemaphore waitSemaphore) noexcept;
+        RHIImageHandle AcquireCurrentImageLocked(
+            UInt32 frameIndex,
+            RHIVkQueue* graphicsQueue);
+        bool TrySetResolutionLocked(UInt32 width, UInt32 height);
+        RHISemaphoreHandle ResolveRenderFinishSemaphoreLocked(UInt32 frameIndex) const;
+        bool IsImageAvailableSemaphoreReusableLocked(
+            UInt32 currentFrame,
+            const RHIVkQueue* graphicsQueue) const;
         VkCommandBuffer PrepareRealRetirementCommandBuffer(UInt32 currentFrame);
+        bool PrepareForSurfaceReleaseLocked(
+            bool terminalCompletionEstablished,
+            RHIVkQueue* graphicsQueue);
         bool HasActiveFrameOwnershipLocked() const noexcept;
+        bool HasPhysicalGenerationOwnershipLocked() const noexcept;
         void PublishPendingRetirement();
         UInt32 RequireConsumedSemaphoreHandleSlotLocked(
             void* handle,
@@ -155,6 +214,7 @@ namespace ArisenEngine::RHI
         Containers::Vector<RHIImageHandle> m_PendingRetiredImages;
         Containers::Vector<RHIImageViewHandle> m_PendingRetiredImageViews;
         Containers::Vector<void*> m_PendingRetiredSharedHandles;
+        Containers::Vector<RHISemaphoreHandle> m_PendingRetiredPresentWaitSemaphores;
         VkSwapchainKHR m_PendingRetiredSwapChain{VK_NULL_HANDLE};
         bool m_PendingRetiredRealGenerationRegistryOwned{false};
         RHIGpuTicket m_PendingRetiredGraphicsTicket{0};
@@ -163,8 +223,10 @@ namespace ArisenEngine::RHI
         Containers::Vector<void*> m_ImageAvailableSemaphoreSharedHandles;
         Containers::Vector<RHISemaphoreHandle> m_RenderFinishSemaphores;
         Containers::Vector<void*> m_RenderFinishSemaphoreSharedHandles;
+        Containers::Vector<RHISemaphoreHandle> m_RealPresentWaitSemaphores;
         Containers::Vector<VirtualFrameSynchronization> m_VirtualFrameSynchronization;
         Containers::Vector<FrameLifecycle> m_FrameLifecycles;
+        Containers::Vector<RHIGpuTicket> m_ImageAvailableSemaphoreTickets;
         Containers::Vector<uint32_t> m_AcquiredImageIndices;
         Containers::Vector<VkResult> m_AcquisitionResults;
         Containers::Vector<VkCommandBuffer> m_RetirementCommandBuffers;
@@ -176,6 +238,7 @@ namespace ArisenEngine::RHI
         bool m_LastCreationSucceeded{false};
         bool m_LastCreationRetiredPrevious{false};
         bool m_RealGenerationRegistryOwned{false};
+        bool m_PhysicalReleasePrepared{false};
         bool m_ExternalConsumerReleaseAcknowledged{false};
         VkResult m_InjectedPresentResult{VK_SUCCESS};
         VkResult m_TerminalPresentResult{VK_SUCCESS};

@@ -3,16 +3,21 @@
 #include "Logger/Logger.h"
 #include "RHI/Commands/RHICommandBuffer.h"
 #include "Commands/RHIVkCommandBuffer.h"
+#include "Commands/RHIVkCommandBufferPool.h"
 #include "Descriptors/RHIVkDescriptorPool.h"
 #include "Profiler.h"
 #include "Definitions/RHIVkError.h"
 
 ArisenEngine::RHI::RHIVkQueue::RHIVkQueue(RHIVkDevice* rhiDevice, VkDevice device, VkQueue queue, RHIQueueType type,
                                           IRHIDeferredDeletionQueue* deferredDeletionQueue,
-                                          RHIResourceRegistry* resourceRegistry)
+                                          RHIResourceRegistry* resourceRegistry,
+                                          std::shared_ptr<std::mutex> rawQueueMutex)
     : m_RHIDevice(rhiDevice), m_Device(device), m_Queue(queue), m_Type(type), m_DeferredDeletion(deferredDeletionQueue),
-      m_ResourceRegistry(resourceRegistry)
+      m_ResourceRegistry(resourceRegistry),
+      m_RawQueueMutex(std::move(rawQueueMutex))
 {
+    if (!m_RawQueueMutex)
+        throw std::invalid_argument("RHIVkQueue requires shared raw-queue synchronization");
     CreateTimelineSemaphore();
 }
 
@@ -21,6 +26,7 @@ ArisenEngine::RHI::RHIVkQueue::~RHIVkQueue() noexcept
     // Ensure GPU finished before destroying the queue semaphore.
     if (m_Queue != VK_NULL_HANDLE)
     {
+        std::lock_guard<std::mutex> rawQueueLock(*m_RawQueueMutex);
         const VkResult result = vkQueueWaitIdle(m_Queue);
         if (result != VK_SUCCESS)
         {
@@ -175,6 +181,13 @@ ArisenEngine::RHI::RHIGpuTicket ArisenEngine::RHI::RHIVkQueue::Submit(RHICommand
     }
 
     RHIVkCommandBuffer* vkCmd = static_cast<RHIVkCommandBuffer*>(commandBuffer);
+    auto* ownerPool = static_cast<RHIVkCommandBufferPool*>(vkCmd->GetOwner());
+    if (!ownerPool)
+    {
+        ThrowInvalidState("vkQueueSubmit", "RHICommandBuffer",
+                          (static_cast<uint64_t>(handle.generation) << 32) | handle.index,
+                          "Command buffer owner pool is unavailable");
+    }
     if (!vkCmd->IsCompiled())
     {
         vkCmd->Compile();
@@ -351,16 +364,24 @@ ArisenEngine::RHI::RHIGpuTicket ArisenEngine::RHI::RHIVkQueue::Submit(RHICommand
 
         const VkResult injectedResult = static_cast<VkResult>(
             m_InjectedSubmitResult.exchange(VK_SUCCESS, std::memory_order_acq_rel));
-        const VkResult submitResult = injectedResult != VK_SUCCESS
-                                          ? injectedResult
-                                          : vkQueueSubmit(m_Queue, 1, &submitInfo, VK_NULL_HANDLE);
-        if (submitResult != VK_SUCCESS)
+        if (injectedResult != VK_SUCCESS)
         {
-            ThrowVkFailure("vkQueueSubmit", submitResult, "RHICommandBuffer",
+            ThrowVkFailure("vkQueueSubmit", injectedResult, "RHICommandBuffer",
                            reinterpret_cast<uint64_t>(m_Queue), handle.index, handle.generation,
-                           injectedResult != VK_SUCCESS ? "deterministic injected failure" : nullptr);
+                           "deterministic injected failure");
+        }
+        {
+            std::lock_guard<std::mutex> rawQueueLock(*m_RawQueueMutex);
+            CheckVkResult(
+                vkQueueSubmit(m_Queue, 1, &submitInfo, VK_NULL_HANDLE),
+                "vkQueueSubmit",
+                "RHICommandBuffer",
+                reinterpret_cast<uint64_t>(m_Queue),
+                handle.index,
+                handle.generation);
         }
 
+        ownerPool->RecordAcceptedSubmission(m_Type, submitTicket);
         m_LatestTicket.store(submitTicket, std::memory_order_release);
 
         if (sharedPrepared)
@@ -482,16 +503,27 @@ ArisenEngine::RHI::RHIGpuTicket ArisenEngine::RHI::RHIVkQueue::RetireSwapChainFr
 
             const VkResult injectedResult = static_cast<VkResult>(
                 m_InjectedSubmitResult.exchange(VK_SUCCESS, std::memory_order_acq_rel));
-            const VkResult submitResult = injectedResult != VK_SUCCESS
-                                              ? injectedResult
-                                              : vkQueueSubmit(m_Queue, 1, &submitInfo, VK_NULL_HANDLE);
-            if (submitResult != VK_SUCCESS)
+            if (injectedResult != VK_SUCCESS)
             {
-                ThrowVkFailure("vkQueueSubmit", submitResult, "RHIVkSwapChain",
-                               reinterpret_cast<uint64_t>(swapChain), UINT32_MAX, 0,
-                               injectedResult != VK_SUCCESS
-                                   ? "deterministic injected frame-retirement failure"
-                                   : "failed to consume swapchain frame synchronization");
+                ThrowVkFailure(
+                    "vkQueueSubmit",
+                    injectedResult,
+                    "RHIVkSwapChain",
+                    reinterpret_cast<uint64_t>(swapChain),
+                    UINT32_MAX,
+                    0,
+                    "deterministic injected frame-retirement failure");
+            }
+            {
+                std::lock_guard<std::mutex> rawQueueLock(*m_RawQueueMutex);
+                CheckVkResult(
+                    vkQueueSubmit(m_Queue, 1, &submitInfo, VK_NULL_HANDLE),
+                    "vkQueueSubmit",
+                    "RHIVkSwapChain",
+                    reinterpret_cast<uint64_t>(swapChain),
+                    UINT32_MAX,
+                    0,
+                    "failed to consume swapchain frame synchronization");
             }
 
             m_LatestTicket.store(submitTicket, std::memory_order_release);
@@ -522,8 +554,13 @@ ArisenEngine::RHI::RHIGpuTicket ArisenEngine::RHI::RHIVkQueue::RetireSwapChainFr
 
 void ArisenEngine::RHI::RHIVkQueue::Update()
 {
-    ARISEN_PROFILE_ZONE("RHI::VulkanQueueUpdate");
     std::lock_guard<std::mutex> lock(m_SubmitMutex);
+    UpdateLocked();
+}
+
+void ArisenEngine::RHI::RHIVkQueue::UpdateLocked()
+{
+    ARISEN_PROFILE_ZONE("RHI::VulkanQueueUpdate");
     const bool resourceReleasesCommitted = RetryPendingResourceReleases();
     const bool descriptorUsesCommitted = RetryPendingDescriptorPoolCommits();
     if (!resourceReleasesCommitted || !descriptorUsesCommitted)
@@ -564,27 +601,56 @@ void ArisenEngine::RHI::RHIVkQueue::WaitIdle()
 
 VkResult ArisenEngine::RHI::RHIVkQueue::WaitIdleNoThrow() noexcept
 {
-    return m_Queue == VK_NULL_HANDLE ? VK_SUCCESS : vkQueueWaitIdle(m_Queue);
+    const VkResult injectedResult = static_cast<VkResult>(
+        m_InjectedWaitIdleResult.exchange(VK_SUCCESS, std::memory_order_acq_rel));
+    if (injectedResult != VK_SUCCESS)
+        return injectedResult;
+
+    if (m_Queue == VK_NULL_HANDLE)
+        return VK_SUCCESS;
+
+    std::lock_guard<std::mutex> rawQueueLock(*m_RawQueueMutex);
+    return vkQueueWaitIdle(m_Queue);
+}
+
+VkResult ArisenEngine::RHI::RHIVkQueue::PresentNoThrow(
+    const VkPresentInfoKHR& presentInfo) noexcept
+{
+    if (m_Queue == VK_NULL_HANDLE)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    std::lock_guard<std::mutex> rawQueueLock(*m_RawQueueMutex);
+    const VkResult result = vkQueuePresentKHR(m_Queue, &presentInfo);
+    if (result != VK_SUCCESS)
+        return result;
+    return VK_SUCCESS;
 }
 
 void ArisenEngine::RHI::RHIVkQueue::WaitForTicket(RHIGpuTicket ticket)
 {
-    ARISEN_PROFILE_ZONE("RHI::VulkanQueueWait");
     if (ticket == 0)
-    {
         return;
-    }
 
     Update();
-
     if (GetCompletedTicket() >= ticket)
-    {
         return;
-    }
 
+    const RHIGpuTicket latestTicket = GetLatestTicket();
+    if (ticket > latestTicket)
+    {
+        ThrowInvalidState(
+            "vkWaitSemaphores",
+            "RHIVkQueue",
+            reinterpret_cast<uint64_t>(m_Queue),
+            "Cannot wait for a ticket that has not been accepted by this queue");
+    }
     if (m_TimelineSemaphore == VK_NULL_HANDLE)
     {
-        return;
+        ThrowInvalidState(
+            "vkWaitSemaphores",
+            "RHIVkQueue",
+            reinterpret_cast<uint64_t>(m_Queue),
+            "Queue timeline semaphore is unavailable");
     }
 
     VkSemaphoreWaitInfo waitInfo{};
@@ -596,4 +662,51 @@ void ArisenEngine::RHI::RHIVkQueue::WaitForTicket(RHIGpuTicket ticket)
     CheckVkResult(vkWaitSemaphores(m_Device, &waitInfo, UINT64_MAX),
                   "vkWaitSemaphores", "RHIVkQueue", reinterpret_cast<uint64_t>(m_Queue));
     Update();
+}
+
+void ArisenEngine::RHI::RHIVkQueue::WaitForTicketUnderSubmitLock(RHIGpuTicket ticket)
+{
+    WaitForTicketLocked(ticket);
+}
+
+void ArisenEngine::RHI::RHIVkQueue::WaitForTicketLocked(RHIGpuTicket ticket)
+{
+    ARISEN_PROFILE_ZONE("RHI::VulkanQueueWait");
+    if (ticket == 0)
+    {
+        return;
+    }
+
+    UpdateLocked();
+
+    if (GetCompletedTicket() >= ticket)
+        return;
+
+    if (ticket > GetLatestTicket())
+    {
+        ThrowInvalidState(
+            "vkWaitSemaphores",
+            "RHIVkQueue",
+            reinterpret_cast<uint64_t>(m_Queue),
+            "Cannot wait for a ticket that has not been accepted by this queue");
+    }
+
+    if (m_TimelineSemaphore == VK_NULL_HANDLE)
+    {
+        ThrowInvalidState(
+            "vkWaitSemaphores",
+            "RHIVkQueue",
+            reinterpret_cast<uint64_t>(m_Queue),
+            "Queue timeline semaphore is unavailable");
+    }
+
+    VkSemaphoreWaitInfo waitInfo{};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    waitInfo.semaphoreCount = 1;
+    waitInfo.pSemaphores = &m_TimelineSemaphore;
+    waitInfo.pValues = &ticket;
+
+    CheckVkResult(vkWaitSemaphores(m_Device, &waitInfo, UINT64_MAX),
+                  "vkWaitSemaphores", "RHIVkQueue", reinterpret_cast<uint64_t>(m_Queue));
+    UpdateLocked();
 }

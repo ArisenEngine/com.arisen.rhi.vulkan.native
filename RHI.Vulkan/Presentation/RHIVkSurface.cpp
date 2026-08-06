@@ -149,6 +149,12 @@ bool RHI::RHIVkSurface::PrepareForRelease()
     return m_SwapChain == nullptr || m_SwapChain->PrepareForSurfaceRelease();
 }
 
+bool RHI::RHIVkSurface::PrepareForReleaseAfterTerminalCompletion()
+{
+    return m_SwapChain == nullptr ||
+        m_SwapChain->PrepareForSurfaceReleaseAfterTerminalCompletion();
+}
+
 void RHI::RHIVkSurface::SetResolution(UInt32 width, UInt32 height)
 {
     (void)TrySetResolution(width, height);

@@ -11,6 +11,8 @@ using namespace ArisenEngine;
 #include "Definitions/RHIVkError.h"
 #include "Queues/RHIVkQueue.h"
 
+#include <exception>
+
 namespace
 {
     struct RHIVkSwapChainGenerationState final
@@ -146,6 +148,7 @@ ArisenEngine::RHI::RHIVkSwapChain::RHIVkSwapChain(RHIDevice* device, const RHIVk
     auto* factory = m_Device->GetFactory();
     m_VirtualFrameSynchronization.resize(m_MaxFramesInFlight);
     m_FrameLifecycles.resize(m_MaxFramesInFlight);
+    m_ImageAvailableSemaphoreTickets.resize(m_MaxFramesInFlight, 0);
     m_RetirementCommandBuffers.resize(m_MaxFramesInFlight, VK_NULL_HANDLE);
     m_RetirementCommandBufferTickets.resize(m_MaxFramesInFlight, 0);
     for (int i = 0; i < (int)m_MaxFramesInFlight; ++i)
@@ -179,59 +182,62 @@ ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
     LOG_INFO("[RHIVkSwapChain::~RHIVkSwapChain]: ~RHIVkSwapChain");
 
     m_Surface = nullptr;
+    const bool isPhysical = m_VkSurface != VK_NULL_HANDLE;
 
-    // Wait only for graphics work owned by this swapchain. Real presentation has
-    // no core Vulkan ticket, so its queue requires an explicit completion boundary.
-    if (m_Device)
+    if (isPhysical)
     {
-        auto* graphicsQueue = static_cast<RHIVkQueue*>(
-            m_Device->GetQueue(RHIQueueType::Graphics));
-        if (graphicsQueue && m_LastOwnedGraphicsTicket != 0)
+        std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+        if (!m_PhysicalReleasePrepared ||
+            HasActiveFrameOwnershipLocked() ||
+            HasPhysicalGenerationOwnershipLocked())
         {
-            try
+            LOG_ERROR(
+                "[RHIVkSwapChain::~RHIVkSwapChain]: Refusing physical destruction without a committed surface release and empty active/pending generation ownership.");
+            std::terminate();
+        }
+    }
+    else
+    {
+        // Virtual swapchains have no parent VkSurfaceKHR. Preserve their owned
+        // ticket boundary unless instance teardown already established device-wide
+        // completion, then publish their wrapper resources before local cleanup.
+        if (m_Device)
+        {
+            auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+            auto* graphicsQueue = static_cast<RHIVkQueue*>(
+                m_Device->GetQueue(RHIQueueType::Graphics));
+            if (!vkDevice->HasTerminalCompletion() &&
+                graphicsQueue && m_LastOwnedGraphicsTicket != 0)
             {
-                graphicsQueue->WaitForTicket(m_LastOwnedGraphicsTicket);
-            }
-            catch (const std::exception& error)
-            {
-                LOG_ERRORF(
-                    "[RHIVkSwapChain::~RHIVkSwapChain]: Waiting for graphics ticket {0} failed: {1}",
-                    m_LastOwnedGraphicsTicket,
-                    error.what());
+                try
+                {
+                    graphicsQueue->WaitForTicket(m_LastOwnedGraphicsTicket);
+                }
+                catch (const std::exception& error)
+                {
+                    LOG_ERRORF(
+                        "[RHIVkSwapChain::~RHIVkSwapChain]: Waiting for virtual graphics ticket {0} failed: {1}",
+                        m_LastOwnedGraphicsTicket,
+                        error.what());
+                }
             }
         }
 
-        if (m_VkSurface != VK_NULL_HANDLE)
+        try
         {
-            auto* presentQueue = static_cast<RHIVkQueue*>(
-                m_Device->GetQueue(RHIQueueType::Present));
-            const VkResult result = presentQueue
-                ? presentQueue->WaitIdleNoThrow()
-                : VK_ERROR_INITIALIZATION_FAILED;
-            if (result != VK_SUCCESS)
-            {
-                LOG_ERRORF(
-                    "[RHIVkSwapChain::~RHIVkSwapChain]: Present completion failed with {0} ({1}).",
-                    GetVkResultName(result),
-                    static_cast<int>(result));
-            }
+            PublishPendingRetirement();
         }
-    }
-
-    try
-    {
-        PublishPendingRetirement();
-    }
-    catch (const std::exception& error)
-    {
-        LOG_ERRORF(
-            "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to publish retained virtual resources: {0}",
-            error.what());
-    }
-    catch (...)
-    {
-        LOG_ERROR(
-            "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to publish retained virtual resources with an unknown error.");
+        catch (const std::exception& error)
+        {
+            LOG_ERRORF(
+                "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to publish retained virtual resources: {0}",
+                error.what());
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to publish retained virtual resources with an unknown error.");
+        }
     }
 
     if (m_RetirementCommandPool != VK_NULL_HANDLE && m_VkDevice != VK_NULL_HANDLE)
@@ -241,9 +247,62 @@ ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
         std::fill(m_RetirementCommandBuffers.begin(), m_RetirementCommandBuffers.end(), VK_NULL_HANDLE);
     }
 
+    if (!isPhysical)
+    {
+        try
+        {
+            Cleanup();
+        }
+        catch (const std::exception& error)
+        {
+            LOG_ERRORF(
+                "[RHIVkSwapChain::~RHIVkSwapChain]: Virtual generation cleanup failed: {0}",
+                error.what());
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[RHIVkSwapChain::~RHIVkSwapChain]: Virtual generation cleanup failed with an unknown error.");
+        }
+    }
+
     auto* factory = m_Device->GetFactory();
-    for (auto h : m_ImageAvailableSemaphores) factory->ReleaseSemaphore(h);
-    for (auto h : m_RenderFinishSemaphores) factory->ReleaseSemaphore(h);
+    const auto releaseFrameSemaphore = [&](RHISemaphoreHandle semaphore,
+                                           const char* purpose) noexcept
+    {
+        try
+        {
+            if (!factory->ReleaseSemaphore(semaphore))
+            {
+                LOG_ERRORF(
+                    "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to release {0} semaphore {1}:{2}.",
+                    purpose,
+                    semaphore.index,
+                    semaphore.generation);
+            }
+        }
+        catch (const std::exception& error)
+        {
+            LOG_ERRORF(
+                "[RHIVkSwapChain::~RHIVkSwapChain]: Releasing {0} semaphore {1}:{2} failed: {3}",
+                purpose,
+                semaphore.index,
+                semaphore.generation,
+                error.what());
+        }
+        catch (...)
+        {
+            LOG_ERRORF(
+                "[RHIVkSwapChain::~RHIVkSwapChain]: Releasing {0} semaphore {1}:{2} failed with an unknown error.",
+                purpose,
+                semaphore.index,
+                semaphore.generation);
+        }
+    };
+    for (auto h : m_ImageAvailableSemaphores)
+        releaseFrameSemaphore(h, "image-available");
+    for (auto h : m_RenderFinishSemaphores)
+        releaseFrameSemaphore(h, "virtual producer");
     for (auto h : m_ImageAvailableSemaphoreSharedHandles) { if (h) CloseHandle((HANDLE)h); }
     for (auto h : m_RenderFinishSemaphoreSharedHandles) { if (h) CloseHandle((HANDLE)h); }
     m_ImageAvailableSemaphores.clear();
@@ -252,40 +311,14 @@ ArisenEngine::RHI::RHIVkSwapChain::~RHIVkSwapChain() noexcept
     m_RenderFinishSemaphoreSharedHandles.clear();
     m_VirtualFrameSynchronization.clear();
     m_FrameLifecycles.clear();
-
-    Cleanup();
-
-    // Cleanup publishes the physical generation only after its wrapper owners
-    // are released. Completion was established above, so flush that publication
-    // before RHIVkSurface destroys the parent VkSurfaceKHR.
-    if (m_VkSurface != VK_NULL_HANDLE && m_Device)
-    {
-        auto* graphicsQueue = static_cast<RHIVkQueue*>(
-            m_Device->GetQueue(RHIQueueType::Graphics));
-        if (graphicsQueue)
-        {
-            try
-            {
-                graphicsQueue->Update();
-            }
-            catch (const std::exception& error)
-            {
-                LOG_ERRORF(
-                    "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to flush released swapchain ownership: {0}",
-                    error.what());
-            }
-            catch (...)
-            {
-                LOG_ERROR(
-                    "[RHIVkSwapChain::~RHIVkSwapChain]: Failed to flush released swapchain ownership with an unknown error.");
-            }
-        }
-    }
+    m_ImageAvailableSemaphoreTickets.clear();
 }
 
 void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDescriptor desc)
 {
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    if (m_VkSurface != VK_NULL_HANDLE)
+        m_PhysicalReleasePrepared = false;
     m_LastCreationSucceeded = false;
     m_LastCreationRetiredPrevious = false;
 
@@ -303,10 +336,12 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
 
     if (m_VkSwapChain != VK_NULL_HANDLE || !m_ImageHandles.empty() ||
         !m_ImageViewHandles.empty() || !m_SharedHandles.empty() ||
+        !m_RealPresentWaitSemaphores.empty() ||
         m_PendingRetiredSwapChain != VK_NULL_HANDLE ||
         !m_PendingRetiredImages.empty() ||
         !m_PendingRetiredImageViews.empty() ||
-        !m_PendingRetiredSharedHandles.empty())
+        !m_PendingRetiredSharedHandles.empty() ||
+        !m_PendingRetiredPresentWaitSemaphores.empty())
     {
         ThrowInvalidState(
             "RHIVkSwapChain::CreateSwapChainWithDesc",
@@ -415,24 +450,63 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
             Containers::Vector<RHIImageHandle> images;
             Containers::Vector<RHIImageViewHandle> imageViews;
             Containers::Vector<void*> sharedHandles;
+            Containers::Vector<RHISemaphoreHandle> presentWaitSemaphores;
             bool vulkanObjectsRegistryOwned{false};
             bool committed{false};
 
-            ~PendingRealSwapChain()
+            ~PendingRealSwapChain() noexcept
             {
                 if (!committed)
                 {
-                    if (!ReleaseSwapChainResources(
-                            device,
-                            vkDevice,
-                            swapchain,
-                            images,
-                            imageViews,
-                            sharedHandles,
-                            !vulkanObjectsRegistryOwned))
+                    for (const auto semaphore : presentWaitSemaphores)
+                    {
+                        try
+                        {
+                            auto* factory = device->GetFactory();
+                            if (!factory->ReleaseSemaphore(semaphore))
+                            {
+                                LOG_ERROR(
+                                    "[PendingRealSwapChain]: Failed to release an uncommitted presentation semaphore.");
+                            }
+                        }
+                        catch (const std::exception& error)
+                        {
+                            LOG_ERRORF(
+                                "[PendingRealSwapChain]: Presentation semaphore rollback threw: {0}",
+                                error.what());
+                        }
+                        catch (...)
+                        {
+                            LOG_ERROR(
+                                "[PendingRealSwapChain]: Presentation semaphore rollback threw an unknown error.");
+                        }
+                    }
+                    presentWaitSemaphores.clear();
+                    try
+                    {
+                        if (!ReleaseSwapChainResources(
+                                device,
+                                vkDevice,
+                                swapchain,
+                                images,
+                                imageViews,
+                                sharedHandles,
+                                !vulkanObjectsRegistryOwned))
+                        {
+                            LOG_ERROR(
+                                "[PendingRealSwapChain]: Failed to release an uncommitted swapchain generation.");
+                        }
+                    }
+                    catch (const std::exception& error)
+                    {
+                        LOG_ERRORF(
+                            "[PendingRealSwapChain]: Swapchain generation rollback threw: {0}",
+                            error.what());
+                    }
+                    catch (...)
                     {
                         LOG_ERROR(
-                            "[PendingRealSwapChain]: Failed to release an uncommitted swapchain generation.");
+                            "[PendingRealSwapChain]: Swapchain generation rollback threw an unknown error.");
                     }
                 }
             }
@@ -486,6 +560,29 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
             }
             images.resize(writtenImageCount);
             break;
+        }
+
+        pending.presentWaitSemaphores.reserve(images.size());
+        while (pending.presentWaitSemaphores.size() < images.size())
+        {
+            const auto semaphore = factory->CreateSemaphore();
+            if (!semaphore.IsValid())
+            {
+                ThrowInvalidState(
+                    "vkCreateSemaphore",
+                    "RHIVkSwapChain",
+                    GetVkObjectIdentity(pending.swapchain),
+                    "Failed to allocate a real presentation wait semaphore");
+            }
+            try
+            {
+                pending.presentWaitSemaphores.push_back(semaphore);
+            }
+            catch (...)
+            {
+                factory->ReleaseSemaphore(semaphore);
+                throw;
+            }
         }
 
         pending.images.reserve(images.size());
@@ -689,6 +786,7 @@ void ArisenEngine::RHI::RHIVkSwapChain::CreateSwapChainWithDesc(RHISwapChainDesc
         m_ImageHandles = std::move(pending.images);
         m_ImageViewHandles = std::move(pending.imageViews);
         m_SharedHandles = std::move(pending.sharedHandles);
+        m_RealPresentWaitSemaphores = std::move(pending.presentWaitSemaphores);
         m_RealGenerationRegistryOwned = true;
         pending.committed = true;
     }
@@ -830,9 +928,43 @@ ArisenEngine::RHI::RHISemaphoreHandle ArisenEngine::RHI::RHIVkSwapChain::GetImag
 }
 
 ArisenEngine::RHI::RHISemaphoreHandle ArisenEngine::RHI::RHIVkSwapChain::GetRenderFinishSemaphore(
-    UInt32 currentFrame) const
+    UInt32 frameIndex) const
 {
-    return m_RenderFinishSemaphores[currentFrame % m_MaxFramesInFlight];
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    return ResolveRenderFinishSemaphoreLocked(frameIndex);
+}
+
+ArisenEngine::RHI::RHISemaphoreHandle
+ArisenEngine::RHI::RHIVkSwapChain::ResolveRenderFinishSemaphoreLocked(
+    UInt32 frameIndex) const
+{
+    const UInt32 currentFrame = frameIndex % m_MaxFramesInFlight;
+    if (m_VkSurface == VK_NULL_HANDLE)
+        return m_RenderFinishSemaphores[currentFrame];
+
+    const auto& lifecycle = m_FrameLifecycles[currentFrame];
+    if (lifecycle.frameIndex != frameIndex ||
+        (lifecycle.state != RHISwapChainFrameState::Acquired &&
+         lifecycle.state != RHISwapChainFrameState::Submitted &&
+         lifecycle.state != RHISwapChainFrameState::Presented))
+    {
+        ThrowInvalidState(
+            "RHIVkSwapChain::ResolveRenderFinishSemaphoreLocked",
+            "RHIVkSwapChain",
+            reinterpret_cast<uint64_t>(this),
+            "Real presentation semaphore requires an owned swapchain frame");
+    }
+
+    const UInt32 imageIndex = m_AcquiredImageIndices[currentFrame];
+    if (imageIndex >= m_RealPresentWaitSemaphores.size())
+    {
+        ThrowInvalidState(
+            "RHIVkSwapChain::ResolveRenderFinishSemaphoreLocked",
+            "VkSwapchainKHR",
+            GetVkObjectIdentity(m_VkSwapChain),
+            "Acquired image has no presentation wait semaphore");
+    }
+    return m_RealPresentWaitSemaphores[imageIndex];
 }
 
 ArisenEngine::RHI::RHIImageViewHandle ArisenEngine::RHI::RHIVkSwapChain::GetImageView(UInt32 frameIndex) const
@@ -848,9 +980,71 @@ ArisenEngine::RHI::RHIImageViewHandle ArisenEngine::RHI::RHIVkSwapChain::GetImag
     return m_ImageViewHandles[m_AcquiredImageIndices[currentFrame]];
 }
 
+bool ArisenEngine::RHI::RHIVkSwapChain::IsImageAvailableSemaphoreReusableForTesting(
+    UInt32 frameIndex) const
+{
+    auto* graphicsQueue = static_cast<RHIVkQueue*>(
+        m_Device->GetQueue(RHIQueueType::Graphics));
+    if (!graphicsQueue)
+    {
+        ThrowInvalidState("vkAcquireNextImageKHR", "RHIQueue", 0,
+                          "Graphics queue is unavailable for acquire-semaphore reuse");
+    }
+
+    std::unique_lock<std::mutex> queueLock(graphicsQueue->m_SubmitMutex);
+    graphicsQueue->UpdateLocked();
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    return IsImageAvailableSemaphoreReusableLocked(
+        frameIndex % m_MaxFramesInFlight,
+        graphicsQueue);
+}
+
+bool ArisenEngine::RHI::RHIVkSwapChain::IsImageAvailableSemaphoreReusableLocked(
+    UInt32 currentFrame,
+    const RHIVkQueue* graphicsQueue) const
+{
+    const RHIGpuTicket acquireSemaphoreTicket =
+        m_ImageAvailableSemaphoreTickets[currentFrame];
+    if (acquireSemaphoreTicket == 0)
+        return true;
+
+    if (!graphicsQueue)
+    {
+        ThrowInvalidState("vkAcquireNextImageKHR", "RHIQueue", 0,
+                          "Graphics queue is unavailable for acquire-semaphore reuse");
+    }
+
+    return graphicsQueue->GetCompletedTicket() >= acquireSemaphoreTicket;
+}
+
 ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurrentImage(UInt32 frameIndex)
 {
+    auto* graphicsQueue = static_cast<RHIVkQueue*>(
+        m_Device->GetQueue(RHIQueueType::Graphics));
+    if (!graphicsQueue)
+    {
+        ThrowInvalidState("vkAcquireNextImageKHR", "RHIQueue", 0,
+                          "Graphics queue is unavailable for swapchain acquisition");
+    }
+
+    if (m_VkSurface != VK_NULL_HANDLE)
+    {
+        std::lock_guard<std::mutex> queueLock(graphicsQueue->m_SubmitMutex);
+        graphicsQueue->UpdateLocked();
+        std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+        return AcquireCurrentImageLocked(frameIndex, graphicsQueue);
+    }
+
+    graphicsQueue->Update();
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    return AcquireCurrentImageLocked(frameIndex, graphicsQueue);
+}
+
+ArisenEngine::RHI::RHIImageHandle
+ArisenEngine::RHI::RHIVkSwapChain::AcquireCurrentImageLocked(
+    UInt32 frameIndex,
+    RHIVkQueue* graphicsQueue)
+{
     ARISEN_PROFILE_ZONE("RHI::VulkanAcquireImage");
     PublishPendingRetirement();
     if (m_TerminalPresentResult != VK_SUCCESS)
@@ -883,15 +1077,6 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
     {
         if (lifecycle.state == RHISwapChainFrameState::Retired && lifecycle.submitTicket != 0)
         {
-            auto* graphicsQueue = static_cast<RHIVkQueue*>(
-                m_Device->GetQueue(RHIQueueType::Graphics));
-            if (!graphicsQueue)
-            {
-                ThrowInvalidState("vkAcquireNextImageKHR", "RHIQueue", 0,
-                                  "Graphics queue is unavailable for retired-frame reuse");
-            }
-
-            graphicsQueue->Update();
             if (graphicsQueue->GetCompletedTicket() < lifecycle.submitTicket)
             {
                 m_AcquisitionResults[currentFrame] = VK_NOT_READY;
@@ -934,6 +1119,13 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
         
         return m_ImageHandles[imageIndex];
     }
+
+    if (!IsImageAvailableSemaphoreReusableLocked(currentFrame, graphicsQueue))
+    {
+        m_AcquisitionResults[currentFrame] = VK_NOT_READY;
+        return RHIImageHandle::Invalid();
+    }
+    m_ImageAvailableSemaphoreTickets[currentFrame] = 0;
 
     // Bulletproof Guard: If the window is minimized or collapsed, don't even try to talk to Vulkan.
     if (m_Desc.width == 0 || m_Desc.height == 0)
@@ -1024,9 +1216,66 @@ ArisenEngine::RHI::RHIImageHandle ArisenEngine::RHI::RHIVkSwapChain::AcquireCurr
 void ArisenEngine::RHI::RHIVkSwapChain::Cleanup()
 {
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    if (m_VkSurface != VK_NULL_HANDLE)
+    {
+        try
+        {
+            PublishPendingRetirement();
+        }
+        catch (const std::exception& error)
+        {
+            LOG_ERRORF(
+                "[RHIVkSwapChain::Cleanup]: Previous physical generation release remains incomplete: {0}",
+                error.what());
+            return;
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[RHIVkSwapChain::Cleanup]: Previous physical generation release remains incomplete with an unknown error.");
+            return;
+        }
+
+        if (m_PendingRetiredSwapChain != VK_NULL_HANDLE ||
+            !m_PendingRetiredImages.empty() ||
+            !m_PendingRetiredImageViews.empty() ||
+            !m_PendingRetiredSharedHandles.empty() ||
+            !m_PendingRetiredPresentWaitSemaphores.empty())
+        {
+            LOG_ERROR(
+                "[RHIVkSwapChain::Cleanup]: Cannot replace an incomplete physical generation retirement.");
+            return;
+        }
+
+        m_PendingRetiredSwapChain = std::exchange(m_VkSwapChain, VK_NULL_HANDLE);
+        m_PendingRetiredImages = std::move(m_ImageHandles);
+        m_PendingRetiredImageViews = std::move(m_ImageViewHandles);
+        m_PendingRetiredSharedHandles = std::move(m_SharedHandles);
+        m_PendingRetiredPresentWaitSemaphores =
+            std::move(m_RealPresentWaitSemaphores);
+        m_PendingRetiredRealGenerationRegistryOwned =
+            std::exchange(m_RealGenerationRegistryOwned, false);
+        m_PendingRetiredGraphicsTicket = m_LastOwnedGraphicsTicket;
+
+        try
+        {
+            PublishPendingRetirement();
+        }
+        catch (const std::exception& error)
+        {
+            LOG_ERRORF(
+                "[RHIVkSwapChain::Cleanup]: Physical generation release remains incomplete: {0}",
+                error.what());
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[RHIVkSwapChain::Cleanup]: Physical generation release remains incomplete with an unknown error.");
+        }
+        return;
+    }
+
     auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
-    const bool destroyVulkanObjectsDirectly =
-        m_VkSurface != VK_NULL_HANDLE && !m_RealGenerationRegistryOwned;
     if (ReleaseSwapChainResources(
             vkDevice,
             m_VkDevice,
@@ -1034,7 +1283,7 @@ void ArisenEngine::RHI::RHIVkSwapChain::Cleanup()
             m_ImageHandles,
             m_ImageViewHandles,
             m_SharedHandles,
-            destroyVulkanObjectsDirectly))
+            false))
     {
         m_RealGenerationRegistryOwned = false;
     }
@@ -1117,7 +1366,7 @@ void ArisenEngine::RHI::RHIVkSwapChain::Present(UInt32 frameIndex)
                           "Real swapchain image was not transitioned to PRESENT_SRC_KHR");
     }
 
-    auto hSem = m_RenderFinishSemaphores[currentFrame];
+    auto hSem = ResolveRenderFinishSemaphoreLocked(frameIndex);
     auto* semItem = static_cast<RHIVkDevice*>(m_Device)->GetSemaphorePool()->Get(hSem);
     if (!semItem || semItem->semaphore == VK_NULL_HANDLE)
     {
@@ -1161,9 +1410,13 @@ VkResult ArisenEngine::RHI::RHIVkSwapChain::PresentRealFrame(
     presentInfo.pImageIndices = &m_AcquiredImageIndices[currentFrame];
 
     const VkResult injectedResult = std::exchange(m_InjectedPresentResult, VK_SUCCESS);
+    auto* presentQueue = static_cast<RHIVkDevice*>(m_Device)->GetQueueForVkHandle(
+        m_VkPresentQueue);
     const VkResult result = injectedResult != VK_SUCCESS
                                 ? injectedResult
-                                : vkQueuePresentKHR(m_VkPresentQueue, &presentInfo);
+                                : presentQueue
+                                    ? presentQueue->PresentNoThrow(presentInfo)
+                                    : VK_ERROR_INITIALIZATION_FAILED;
     m_AcquisitionResults[currentFrame] = VK_NOT_READY;
     if (IsVkSwapChainRecreateResult(result))
         m_SwapChainIsOutDate = true;
@@ -1190,7 +1443,32 @@ void ArisenEngine::RHI::RHIVkSwapChain::SetResolution(UInt32 width, UInt32 heigh
 
 bool ArisenEngine::RHI::RHIVkSwapChain::TrySetResolution(UInt32 width, UInt32 height)
 {
+    if (m_VkSurface != VK_NULL_HANDLE)
+    {
+        auto* graphicsQueue = static_cast<RHIVkQueue*>(
+            m_Device->GetQueue(RHIQueueType::Graphics));
+        if (!graphicsQueue)
+        {
+            ThrowInvalidState(
+                "RHIVkSwapChain::TrySetResolution",
+                "RHIQueue",
+                reinterpret_cast<uint64_t>(this),
+                "Physical swapchain recreation requires a graphics queue");
+        }
+
+        std::lock_guard<std::mutex> queueLock(graphicsQueue->m_SubmitMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+        return TrySetResolutionLocked(width, height);
+    }
+
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    return TrySetResolutionLocked(width, height);
+}
+
+bool ArisenEngine::RHI::RHIVkSwapChain::TrySetResolutionLocked(
+    UInt32 width,
+    UInt32 height)
+{
     PublishPendingRetirement();
     if (m_TerminalPresentResult != VK_SUCCESS)
     {
@@ -1328,7 +1606,7 @@ ArisenEngine::RHI::RHIVkSwapChain::PrepareFrameSubmission(
         }
     }
     if (signalsFrameComplete)
-        plan.signalSemaphore = m_RenderFinishSemaphores[currentFrame];
+        plan.signalSemaphore = ResolveRenderFinishSemaphoreLocked(frameIndex);
 
     lifecycle.submissionPending = true;
     lifecycle.pendingWaitForAcquire = waitsForAcquire;
@@ -1352,7 +1630,14 @@ void ArisenEngine::RHI::RHIVkSwapChain::CommitFrameSubmission(
     if (lifecycle.pendingWaitForAcquire)
     {
         lifecycle.acquireWaitSubmitted = true;
-        if (m_VkSurface == VK_NULL_HANDLE)
+        if (m_VkSurface != VK_NULL_HANDLE)
+        {
+            auto& acquireSemaphoreTicket =
+                m_ImageAvailableSemaphoreTickets[currentFrame];
+            if (ticket > acquireSemaphoreTicket)
+                acquireSemaphoreTicket = ticket;
+        }
+        else
         {
             auto& synchronization = m_VirtualFrameSynchronization[currentFrame];
             synchronization.preparedForReuse = false;
@@ -1411,7 +1696,11 @@ VkCommandBuffer ArisenEngine::RHI::RHIVkSwapChain::PrepareRealRetirementCommandB
     }
     const RHIGpuTicket previousTicket = m_RetirementCommandBufferTickets[currentFrame];
     if (previousTicket != 0)
-        graphicsQueue->WaitForTicket(previousTicket);
+    {
+        // RetireSwapChainFrame already owns the queue submit lock while this
+        // swapchain-owned command buffer is prepared for reuse.
+        graphicsQueue->WaitForTicketUnderSubmitLock(previousTicket);
+    }
 
     if (m_RetirementCommandPool == VK_NULL_HANDLE)
     {
@@ -1585,7 +1874,7 @@ ArisenEngine::RHI::RHIVkSwapChain::PrepareFrameRetirement(UInt32 frameIndex)
         }
 
         plan.signalSemaphore = resolveSemaphore(
-            m_RenderFinishSemaphores[currentFrame],
+            ResolveRenderFinishSemaphoreLocked(frameIndex),
             "Frame-retirement present semaphore is stale");
         plan.requiresPresent = true;
         if (lifecycle.state == RHISwapChainFrameState::Acquired)
@@ -1597,6 +1886,7 @@ ArisenEngine::RHI::RHIVkSwapChain::PrepareFrameRetirement(UInt32 frameIndex)
                 plan.waitSemaphore = resolveSemaphore(
                     m_ImageAvailableSemaphores[currentFrame],
                     "Frame-retirement acquire semaphore is stale");
+                plan.waitsForAcquire = true;
             }
         }
     }
@@ -1691,6 +1981,13 @@ VkResult ArisenEngine::RHI::RHIVkSwapChain::CommitFrameRetirement(
         lifecycle.submitTicket = ticket;
     if (ticket > m_LastOwnedGraphicsTicket)
         m_LastOwnedGraphicsTicket = ticket;
+    if (m_VkSurface != VK_NULL_HANDLE && plan.waitsForAcquire)
+    {
+        auto& acquireSemaphoreTicket =
+            m_ImageAvailableSemaphoreTickets[currentFrame];
+        if (ticket > acquireSemaphoreTicket)
+            acquireSemaphoreTicket = ticket;
+    }
     lifecycle.acquireWaitSubmitted = false;
     lifecycle.submissionPending = false;
     lifecycle.pendingWaitForAcquire = false;
@@ -2014,7 +2311,62 @@ bool ArisenEngine::RHI::RHIVkSwapChain::AcknowledgeExternalConsumerRelease()
 
 bool ArisenEngine::RHI::RHIVkSwapChain::PrepareForSurfaceRelease()
 {
+    if (m_VkSurface != VK_NULL_HANDLE)
+    {
+        auto* graphicsQueue = static_cast<RHIVkQueue*>(
+            m_Device->GetQueue(RHIQueueType::Graphics));
+        if (!graphicsQueue)
+        {
+            ThrowInvalidState(
+                "RHIVkSwapChain::PrepareForSurfaceRelease",
+                "RHIQueue",
+                reinterpret_cast<uint64_t>(this),
+                "Physical surface release requires a graphics queue");
+        }
+
+        std::lock_guard<std::mutex> queueLock(graphicsQueue->m_SubmitMutex);
+        std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+        return PrepareForSurfaceReleaseLocked(false, graphicsQueue);
+    }
+
     std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    return PrepareForSurfaceReleaseLocked(false, nullptr);
+}
+
+bool ArisenEngine::RHI::RHIVkSwapChain::PrepareForSurfaceReleaseAfterTerminalCompletion()
+{
+    RHIVkQueue* graphicsQueue = nullptr;
+    std::unique_lock<std::mutex> queueLock;
+    if (m_VkSurface != VK_NULL_HANDLE)
+    {
+        graphicsQueue = static_cast<RHIVkQueue*>(
+            m_Device->GetQueue(RHIQueueType::Graphics));
+        if (!graphicsQueue)
+        {
+            ThrowInvalidState(
+                "RHIVkSwapChain::PrepareForSurfaceReleaseAfterTerminalCompletion",
+                "RHIQueue",
+                reinterpret_cast<uint64_t>(this),
+                "Physical surface release requires a graphics queue");
+        }
+        queueLock = std::unique_lock<std::mutex>(graphicsQueue->m_SubmitMutex);
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(m_Mutex);
+    auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
+    if (!vkDevice || !vkDevice->HasTerminalCompletion())
+    {
+        LOG_ERROR(
+            "[RHIVkSwapChain::PrepareForSurfaceReleaseAfterTerminalCompletion]: Terminal device completion has not been established.");
+        return false;
+    }
+    return PrepareForSurfaceReleaseLocked(true, graphicsQueue);
+}
+
+bool ArisenEngine::RHI::RHIVkSwapChain::PrepareForSurfaceReleaseLocked(
+    bool terminalCompletionEstablished,
+    RHIVkQueue* graphicsQueue)
+{
     if (HasActiveFrameOwnershipLocked())
     {
         LOG_ERROR(
@@ -2030,8 +2382,6 @@ bool ArisenEngine::RHI::RHIVkSwapChain::PrepareForSurfaceRelease()
 
     if (m_VkSurface != VK_NULL_HANDLE)
     {
-        auto* graphicsQueue = static_cast<RHIVkQueue*>(
-            m_Device->GetQueue(RHIQueueType::Graphics));
         if (!graphicsQueue)
         {
             ThrowInvalidState(
@@ -2040,24 +2390,26 @@ bool ArisenEngine::RHI::RHIVkSwapChain::PrepareForSurfaceRelease()
                 reinterpret_cast<uint64_t>(this),
                 "Physical surface release requires a graphics queue");
         }
-        if (m_LastOwnedGraphicsTicket != 0)
-            graphicsQueue->WaitForTicket(m_LastOwnedGraphicsTicket);
+        if (!terminalCompletionEstablished)
+        {
+            if (m_LastOwnedGraphicsTicket != 0)
+                graphicsQueue->WaitForTicketUnderSubmitLock(m_LastOwnedGraphicsTicket);
 
-        auto* presentQueue = static_cast<RHIVkQueue*>(
-            m_Device->GetQueue(RHIQueueType::Present));
-        CheckVkResult(
-            presentQueue ? presentQueue->WaitIdleNoThrow() : VK_ERROR_INITIALIZATION_FAILED,
-            "vkQueueWaitIdle",
-            "RHIVkSwapChain",
-            reinterpret_cast<uint64_t>(this),
-            UINT32_MAX,
-            0,
-            "Physical surface release requires completed presentation ownership");
+            auto* presentQueue = static_cast<RHIVkDevice*>(m_Device)->GetQueueForVkHandle(
+                m_VkPresentQueue);
+            CheckVkResult(
+                presentQueue ? presentQueue->WaitIdleNoThrow() : VK_ERROR_INITIALIZATION_FAILED,
+                "vkQueueWaitIdle",
+                "RHIVkSwapChain",
+                reinterpret_cast<uint64_t>(this),
+                UINT32_MAX,
+                0,
+                "Physical surface release requires completed presentation ownership");
+        }
 
         PublishPendingRetirement();
         Cleanup();
-        if (m_VkSwapChain != VK_NULL_HANDLE || !m_ImageHandles.empty() ||
-            !m_ImageViewHandles.empty() || !m_SharedHandles.empty())
+        if (HasPhysicalGenerationOwnershipLocked())
         {
             LOG_ERROR(
                 "[RHIVkSwapChain::PrepareForSurfaceRelease]: Physical generation release remains incomplete.");
@@ -2067,7 +2419,8 @@ bool ArisenEngine::RHI::RHIVkSwapChain::PrepareForSurfaceRelease()
         // Cleanup publishes the shared generation owner with its maximum graphics
         // ticket. Update synchronously runs that completed publication before the
         // parent VkSurfaceKHR is allowed to be destroyed.
-        graphicsQueue->Update();
+        graphicsQueue->UpdateLocked();
+        m_PhysicalReleasePrepared = true;
     }
     return true;
 }
@@ -2087,11 +2440,28 @@ bool ArisenEngine::RHI::RHIVkSwapChain::HasActiveFrameOwnershipLocked() const no
     return false;
 }
 
+bool ArisenEngine::RHI::RHIVkSwapChain::HasPhysicalGenerationOwnershipLocked() const noexcept
+{
+    return m_VkSwapChain != VK_NULL_HANDLE ||
+        !m_ImageHandles.empty() ||
+        !m_ImageViewHandles.empty() ||
+        !m_SharedHandles.empty() ||
+        !m_RealPresentWaitSemaphores.empty() ||
+        m_RealGenerationRegistryOwned ||
+        m_PendingRetiredSwapChain != VK_NULL_HANDLE ||
+        !m_PendingRetiredImages.empty() ||
+        !m_PendingRetiredImageViews.empty() ||
+        !m_PendingRetiredSharedHandles.empty() ||
+        !m_PendingRetiredPresentWaitSemaphores.empty() ||
+        m_PendingRetiredRealGenerationRegistryOwned ||
+        m_PendingRetiredGraphicsTicket != 0;
+}
+
 void ArisenEngine::RHI::RHIVkSwapChain::PublishPendingRetirement()
 {
+    auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
     if (m_PendingRetiredSwapChain != VK_NULL_HANDLE)
     {
-        auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
         if (!ReleaseSwapChainResources(
                 vkDevice,
                 m_VkDevice,
@@ -2110,15 +2480,53 @@ void ArisenEngine::RHI::RHIVkSwapChain::PublishPendingRetirement()
         m_PendingRetiredRealGenerationRegistryOwned = false;
     }
 
+    auto* factory = m_Device->GetFactory();
+    while (!m_PendingRetiredPresentWaitSemaphores.empty())
+    {
+        const auto semaphore = m_PendingRetiredPresentWaitSemaphores.back();
+        auto* semaphoreItem = vkDevice->GetSemaphorePool()->Get(semaphore);
+        if (!semaphoreItem || semaphoreItem->semaphore == VK_NULL_HANDLE)
+        {
+            ThrowInvalidHandle(
+                "RHIVkSwapChain::PublishPendingRetirement",
+                "RHISemaphore",
+                semaphore.index,
+                semaphore.generation,
+                "Physical presentation semaphore is stale");
+        }
+        if (semaphoreItem->registryHandle.IsValid() &&
+            m_PendingRetiredGraphicsTicket != 0)
+        {
+            // This ticket protects the graphics signal operation only. Every
+            // physical staging path establishes present-queue completion before
+            // this generation becomes publishable.
+            vkDevice->GetResourceRegistry()->UpdateTicket(
+                semaphoreItem->registryHandle,
+                RHIQueueType::Graphics,
+                m_PendingRetiredGraphicsTicket);
+        }
+        if (!factory->ReleaseSemaphore(semaphore))
+        {
+            ThrowInvalidState(
+                "RHIVkSwapChain::PublishPendingRetirement",
+                "RHISemaphore",
+                semaphore.index,
+                "Physical presentation semaphore release did not commit",
+                semaphore.index,
+                semaphore.generation);
+        }
+        m_PendingRetiredPresentWaitSemaphores.pop_back();
+    }
+
     if (m_PendingRetiredImages.empty() &&
         m_PendingRetiredImageViews.empty() &&
-        m_PendingRetiredSharedHandles.empty())
+        m_PendingRetiredSharedHandles.empty() &&
+        m_PendingRetiredPresentWaitSemaphores.empty())
     {
         m_PendingRetiredGraphicsTicket = 0;
         return;
     }
 
-    auto* vkDevice = static_cast<RHIVkDevice*>(m_Device);
     RHIDeletionDependencies dependencies;
     dependencies.tickets[static_cast<int>(RHIQueueType::Graphics)] =
         m_PendingRetiredGraphicsTicket;
@@ -2213,8 +2621,8 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
     // queue before replacing its swapchain; virtual surfaces stay ticket-deferred.
     if (m_VkSurface != VK_NULL_HANDLE && m_VkSwapChain != VK_NULL_HANDLE)
     {
-        auto* presentQueue = static_cast<RHIVkQueue*>(
-            m_Device->GetQueue(RHIQueueType::Present));
+        auto* presentQueue = static_cast<RHIVkDevice*>(m_Device)->GetQueueForVkHandle(
+            m_VkPresentQueue);
         const VkResult result = presentQueue
             ? presentQueue->WaitIdleNoThrow()
             : VK_ERROR_INITIALIZATION_FAILED;
@@ -2244,6 +2652,8 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
     Containers::Vector<RHIImageHandle> oldImages = std::move(m_ImageHandles);
     Containers::Vector<RHIImageViewHandle> oldImageViews = std::move(m_ImageViewHandles);
     Containers::Vector<void*> oldSharedHandles = std::move(m_SharedHandles);
+    Containers::Vector<RHISemaphoreHandle> oldPresentWaitSemaphores =
+        std::move(m_RealPresentWaitSemaphores);
 
     const auto restorePreviousGeneration = [&]()
     {
@@ -2251,6 +2661,7 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
         m_ImageHandles = std::move(oldImages);
         m_ImageViewHandles = std::move(oldImageViews);
         m_SharedHandles = std::move(oldSharedHandles);
+        m_RealPresentWaitSemaphores = std::move(oldPresentWaitSemaphores);
         m_RealGenerationRegistryOwned = oldRealGenerationRegistryOwned;
         m_ActiveWidth = oldActiveWidth;
         m_ActiveHeight = oldActiveHeight;
@@ -2278,8 +2689,11 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
             m_PendingRetiredImages = std::move(oldImages);
             m_PendingRetiredImageViews = std::move(oldImageViews);
             m_PendingRetiredSharedHandles = std::move(oldSharedHandles);
+            m_PendingRetiredPresentWaitSemaphores =
+                std::move(oldPresentWaitSemaphores);
             m_PendingRetiredRealGenerationRegistryOwned =
                 oldRealGenerationRegistryOwned;
+            m_PendingRetiredGraphicsTicket = m_LastOwnedGraphicsTicket;
             try
             {
                 PublishPendingRetirement();
@@ -2327,15 +2741,20 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
         m_PendingRetiredImages = std::move(oldImages);
         m_PendingRetiredImageViews = std::move(oldImageViews);
         m_PendingRetiredSharedHandles = std::move(oldSharedHandles);
+        m_PendingRetiredPresentWaitSemaphores =
+            std::move(oldPresentWaitSemaphores);
         m_PendingRetiredRealGenerationRegistryOwned =
             oldRealGenerationRegistryOwned;
+        m_PendingRetiredGraphicsTicket = m_LastOwnedGraphicsTicket;
         PublishPendingRetirement();
     }
-    else if (!oldImages.empty() || !oldImageViews.empty() || !oldSharedHandles.empty())
+    else if (!oldImages.empty() || !oldImageViews.empty() ||
+             !oldSharedHandles.empty() || !oldPresentWaitSemaphores.empty())
     {
         if (!m_PendingRetiredImages.empty() ||
             !m_PendingRetiredImageViews.empty() ||
-            !m_PendingRetiredSharedHandles.empty())
+            !m_PendingRetiredSharedHandles.empty() ||
+            !m_PendingRetiredPresentWaitSemaphores.empty())
         {
             ThrowInvalidState(
                 "RHIVkSwapChain::RecreateSwapChainIfNeeded",
@@ -2347,6 +2766,8 @@ void ArisenEngine::RHI::RHIVkSwapChain::RecreateSwapChainIfNeeded()
         m_PendingRetiredImages = std::move(oldImages);
         m_PendingRetiredImageViews = std::move(oldImageViews);
         m_PendingRetiredSharedHandles = std::move(oldSharedHandles);
+        m_PendingRetiredPresentWaitSemaphores =
+            std::move(oldPresentWaitSemaphores);
         m_PendingRetiredGraphicsTicket = m_LastOwnedGraphicsTicket;
         PublishPendingRetirement();
     }

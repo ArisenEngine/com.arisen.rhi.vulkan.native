@@ -1,9 +1,12 @@
 #pragma once
 #include <vulkan/vulkan_core.h>
 #include "RHI/Commands/RHICommandBufferPool.h"
+#include "RHI/Resources/RHIDeferredDeletionQueue.h"
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include "Threadable/ThreadLocalCache.h"
 #include "Threadable/ThreadRegistry.h"
 #include "Containers/LockFreeStack.h"
@@ -53,6 +56,18 @@ namespace ArisenEngine::RHI
 
         UInt32 GetQueueFamilyIndex() const { return m_QueueFamilyIndex; }
 
+        void RecordAcceptedSubmission(RHIQueueType queueType, RHIGpuTicket ticket) noexcept;
+        RHIDeletionDependencies GetAcceptedSubmissionDependencies() const noexcept
+        {
+            RHIDeletionDependencies dependencies;
+            for (size_t index = 0; index < QUEUE_TYPE_COUNT; ++index)
+            {
+                dependencies.tickets[index] =
+                    m_AcceptedSubmitTickets[index].load(std::memory_order_acquire);
+            }
+            return dependencies;
+        }
+
     private:
         void FlushPendingBuffers(ThreadSlot& slot);
         void ConsumeMailbox(ThreadSlot& slot);
@@ -73,6 +88,13 @@ namespace ArisenEngine::RHI
         Containers::Vector<RHICommandBufferHandle> m_OwnedHandles;
 
         std::mutex m_PoolsMutex;
+
+        static constexpr size_t QUEUE_TYPE_COUNT =
+            static_cast<size_t>(RHIQueueType::Present) + 1;
+        static_assert(
+            std::extent_v<decltype(RHIDeletionDependencies::tickets)> == QUEUE_TYPE_COUNT);
+        static_assert(std::atomic<RHIGpuTicket>::is_always_lock_free);
+        std::atomic<RHIGpuTicket> m_AcceptedSubmitTickets[QUEUE_TYPE_COUNT]{};
 
         friend class RHIVkCommandBuffer;
     };

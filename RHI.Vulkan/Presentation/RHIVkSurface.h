@@ -31,6 +31,7 @@ namespace ArisenEngine::RHI
 
         void InitSwapChain() override;
         bool PrepareForRelease();
+        bool PrepareForReleaseAfterTerminalCompletion();
         const VkQueueFamilyIndices GetQueueFamilyIndices() const { return m_QueueFamilyIndices; }
 
         RHISwapChain* GetSwapChain() override;

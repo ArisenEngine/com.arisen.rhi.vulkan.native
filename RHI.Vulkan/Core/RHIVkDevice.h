@@ -117,6 +117,7 @@ namespace ArisenEngine::RHI
 
         RHIQueue* GetQueue(RHIQueueType type) override;
         RHIQueue* GetQueueByFamilyIndex(UInt32 familyIndex);
+        RHIVkQueue* GetQueueForVkHandle(VkQueue queue) const noexcept;
         RHICommandBufferPool* GetCommandBufferPool(RHICommandBufferPoolHandle handle) override;
         void DeferredDelete(const RHIDeletionDependencies& deps, RHIDeferredDeleteItem item) override;
         UInt32 FindMemoryType(UInt32 typeFilter, UInt32 properties) override;
@@ -146,6 +147,11 @@ namespace ArisenEngine::RHI
 
     private:
         // Internal methods hidden from public interface
+        bool EnsureTerminalCompletion() noexcept;
+        bool HasTerminalCompletion() const noexcept
+        {
+            return m_TerminalCompletionEstablished;
+        }
         void EnqueueDeferredDestroy(const RHIDeletionDependencies& deps, RHIDeferredDeleteItem item);
         void EnqueueDeferredDestroy(const RHIDeletionDependencies& deps, std::function<void()>& fn);
         RHIResourceRegistry* GetResourceRegistry() const { return m_ResourceRegistry.get(); } // Made private
@@ -202,6 +208,7 @@ namespace ArisenEngine::RHI
         std::unique_ptr<RHIResourcePool<RHIAccelerationStructureHandle, RHIVkAccelerationStructurePoolItem>>
         m_AccelerationStructurePool;
         std::unique_ptr<RHIResourcePool<RHIDescriptorPoolHandle, RHIVkDescriptorPoolPoolItem>> m_DescriptorPoolPool;
+        bool m_TerminalCompletionEstablished{false};
         std::atomic<bool> m_RejectNextPooledResourceReleaseForTesting{false};
 
         // TODO(Design-P2): public: immediately follows private: section, causing fuzzy boundaries between internal and external interfaces.
